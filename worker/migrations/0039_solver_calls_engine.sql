@@ -1,0 +1,17 @@
+-- 0039_solver_calls_engine.sql — which engine produced the SERVED answer
+-- (bespoke solver engine, card G).
+--
+-- 'container' = the HTTP solver container (today's only answer); 'worker' =
+-- the in-process bespoke engine (SOLVER_ENGINE="worker", or "fallback" when the
+-- engine certified its answer). A fallback that fell back records 'container':
+-- the column names who was served, not who was tried. NULL on rows written
+-- before this migration (and on backfilled `source='logs'` rows, which predate
+-- the engine entirely) — read NULL as 'container'.
+--
+-- An engine-served row has no HTTP call behind it, so http_status, attempts and
+-- solver_uptime_ms are NULL there. `engine='worker'` is therefore exactly the
+-- set of solves that cost the container nothing — the column exists so cost
+-- tooling CAN separate them once the engine serves live traffic. Nothing reads
+-- it today: bin/container-backtest.py models demand from the container usage
+-- snapshots (runbook §G), not from this table.
+ALTER TABLE solver_calls ADD COLUMN engine TEXT;

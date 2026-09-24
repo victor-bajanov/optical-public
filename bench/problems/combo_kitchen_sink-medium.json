@@ -1,0 +1,1226 @@
+{
+ "id": "combo_kitchen_sink-medium",
+ "meta": {
+  "scenario": "combo_kitchen_sink",
+  "size": "medium",
+  "seed": 1419641579,
+  "generator_version": 2,
+  "description": "",
+  "rules": [
+   "availability_windows",
+   "business_hours",
+   "churn",
+   "churn_multiplier",
+   "deadline_hard",
+   "deadline_soft",
+   "dependency_after_task",
+   "earliest_start",
+   "fit_curve",
+   "group_ordered",
+   "group_same_day",
+   "multi_chunk",
+   "must_include",
+   "pinned_at",
+   "preferred_window_hard",
+   "preferred_window_soft"
+  ],
+  "rules_detected": [
+   "availability_windows",
+   "business_hours",
+   "churn",
+   "churn_multiplier",
+   "daily_cap",
+   "deadline_hard",
+   "deadline_soft",
+   "dependency_after_task",
+   "earliest_start",
+   "external_pinned",
+   "fit_curve",
+   "group_ordered",
+   "group_same_day",
+   "multi_chunk",
+   "must_include",
+   "pinned_at",
+   "preferred_window_hard",
+   "preferred_window_soft",
+   "streak_cap"
+  ],
+  "expected_status": "sat",
+  "expectations": {},
+  "n_tasks": 28,
+  "n_chunks": 35,
+  "n_external": 15,
+  "grid_events": 50,
+  "horizon_slots": 672
+ },
+ "problem": {
+  "window": {
+   "start": "2026-05-18T00:00:00",
+   "end": "2026-05-25T00:00:00",
+   "tz": "Australia/Sydney"
+  },
+  "weights": {
+   "preferred_day_miss": 40,
+   "preferred_time_miss_per_15min": 5,
+   "time_of_day_fit_per_15min": 5,
+   "churn_per_15min_moved": 50,
+   "priority_unit": 1,
+   "base_drop_penalty": 200
+  },
+  "contexts": [
+   {
+    "context": "deep",
+    "fit_curve": {
+     "peak_start": "09:00:00",
+     "peak_end": "12:00:00",
+     "falloff_end": "15:00:00"
+    },
+    "max_minutes_per_day": 240,
+    "max_contiguous_minutes": 90,
+    "over_daily_cap_penalty_per_15min": 25,
+    "over_streak_cap_penalty_per_15min": 25
+   },
+   {
+    "context": "admin",
+    "fit_curve": {
+     "peak_start": "13:00:00",
+     "peak_end": "17:00:00",
+     "falloff_end": "18:00:00"
+    },
+    "max_minutes_per_day": null,
+    "max_contiguous_minutes": null,
+    "over_daily_cap_penalty_per_15min": 25,
+    "over_streak_cap_penalty_per_15min": 25
+   },
+   {
+    "context": "physical",
+    "fit_curve": {
+     "peak_start": "16:00:00",
+     "peak_end": "18:00:00",
+     "falloff_end": "20:00:00"
+    },
+    "max_minutes_per_day": null,
+    "max_contiguous_minutes": null,
+    "over_daily_cap_penalty_per_15min": 25,
+    "over_streak_cap_penalty_per_15min": 25
+   },
+   {
+    "context": "family",
+    "fit_curve": {
+     "peak_start": "17:00:00",
+     "peak_end": "20:00:00",
+     "falloff_end": "21:00:00"
+    },
+    "max_minutes_per_day": null,
+    "max_contiguous_minutes": null,
+    "over_daily_cap_penalty_per_15min": 25,
+    "over_streak_cap_penalty_per_15min": 25
+   },
+   {
+    "context": "meeting",
+    "fit_curve": {
+     "peak_start": "10:00:00",
+     "peak_end": "16:00:00",
+     "falloff_end": "17:00:00"
+    },
+    "max_minutes_per_day": null,
+    "max_contiguous_minutes": null,
+    "over_daily_cap_penalty_per_15min": 25,
+    "over_streak_cap_penalty_per_15min": 25
+   }
+  ],
+  "tasks": [
+   {
+    "id": "task-0",
+    "title": "Task 0 (deep)",
+    "context": "deep",
+    "priority": 73,
+    "chunks": [
+     {
+      "chunk_id": "task-0#0",
+      "duration_minutes": 30
+     },
+     {
+      "chunk_id": "task-0#1",
+      "duration_minutes": 45
+     }
+    ],
+    "group_policy": {
+     "same_day": true,
+     "ordered": true
+    },
+    "deadline": {
+     "at": "2026-05-20T17:00:00",
+     "hard": false,
+     "penalty_per_15min": 4
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-1",
+    "title": "Task 1 (family)",
+    "context": "family",
+    "priority": 50,
+    "chunks": [
+     {
+      "chunk_id": "task-1#0",
+      "duration_minutes": 15
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": "2026-05-24T10:00:00",
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-2",
+    "title": "Task 2 (deep)",
+    "context": "deep",
+    "priority": 64,
+    "chunks": [
+     {
+      "chunk_id": "task-2#0",
+      "duration_minutes": 15
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [
+     {
+      "type": "after_task",
+      "ref": "task-1",
+      "hard": true
+     }
+    ],
+    "pinned_at": null,
+    "previous_placement": [
+     {
+      "chunk_id": "task-2#0",
+      "start": "2026-05-21T17:00:00"
+     }
+    ],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-3",
+    "title": "Task 3 (family)",
+    "context": "family",
+    "priority": 20,
+    "chunks": [
+     {
+      "chunk_id": "task-3#0",
+      "duration_minutes": 45
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": {
+     "at": "2026-05-22T17:00:00",
+     "hard": true,
+     "penalty_per_15min": 0
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [
+     {
+      "days": [
+       "wed",
+       "tue"
+      ],
+      "start": "09:00:00",
+      "end": "13:00:00",
+      "hard": true
+     }
+    ],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-4",
+    "title": "Task 4 (meeting)",
+    "context": "meeting",
+    "priority": 57,
+    "chunks": [
+     {
+      "chunk_id": "task-4#0",
+      "duration_minutes": 60
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [
+     {
+      "chunk_id": "task-4#0",
+      "start": "2026-05-23T09:00:00"
+     }
+    ],
+    "must_include": true,
+    "availability_windows": [
+     {
+      "start": "2026-05-23T09:00:00",
+      "end": "2026-05-23T10:00:00"
+     },
+     {
+      "start": "2026-05-20T10:00:00",
+      "end": "2026-05-20T12:00:00"
+     },
+     {
+      "start": "2026-05-21T10:00:00",
+      "end": "2026-05-21T12:00:00"
+     }
+    ],
+    "churn_multiplier": 7
+   },
+   {
+    "id": "task-5",
+    "title": "Task 5 (meeting)",
+    "context": "meeting",
+    "priority": 70,
+    "chunks": [
+     {
+      "chunk_id": "task-5#0",
+      "duration_minutes": 90
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-20T09:00:00",
+    "preferred_windows": [
+     {
+      "days": [
+       "thu",
+       "fri"
+      ],
+      "start": "12:00:00",
+      "end": "15:00:00",
+      "hard": false
+     }
+    ],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-6",
+    "title": "Task 6 (meeting)",
+    "context": "meeting",
+    "priority": 20,
+    "chunks": [
+     {
+      "chunk_id": "task-6#0",
+      "duration_minutes": 30
+     },
+     {
+      "chunk_id": "task-6#1",
+      "duration_minutes": 30
+     }
+    ],
+    "group_policy": {
+     "same_day": true,
+     "ordered": true
+    },
+    "deadline": {
+     "at": "2026-05-21T17:00:00",
+     "hard": false,
+     "penalty_per_15min": 4
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-7",
+    "title": "Task 7 (meeting)",
+    "context": "meeting",
+    "priority": 85,
+    "chunks": [
+     {
+      "chunk_id": "task-7#0",
+      "duration_minutes": 60
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": "2026-05-18T18:00:00",
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-8",
+    "title": "Task 8 (deep)",
+    "context": "deep",
+    "priority": 33,
+    "chunks": [
+     {
+      "chunk_id": "task-8#0",
+      "duration_minutes": 45
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [
+     {
+      "chunk_id": "task-8#0",
+      "start": "2026-05-21T08:00:00"
+     }
+    ],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-9",
+    "title": "Task 9 (admin)",
+    "context": "admin",
+    "priority": 42,
+    "chunks": [
+     {
+      "chunk_id": "task-9#0",
+      "duration_minutes": 15
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": {
+     "at": "2026-05-22T17:00:00",
+     "hard": true,
+     "penalty_per_15min": 0
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [
+     {
+      "days": [
+       "fri",
+       "thu"
+      ],
+      "start": "12:00:00",
+      "end": "16:00:00",
+      "hard": true
+     }
+    ],
+    "dependencies": [
+     {
+      "type": "after_task",
+      "ref": "task-8",
+      "hard": true
+     }
+    ],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-10",
+    "title": "Task 10 (meeting)",
+    "context": "meeting",
+    "priority": 26,
+    "chunks": [
+     {
+      "chunk_id": "task-10#0",
+      "duration_minutes": 30
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [
+     {
+      "chunk_id": "task-10#0",
+      "start": "2026-05-21T09:00:00"
+     }
+    ],
+    "must_include": true,
+    "availability_windows": [
+     {
+      "start": "2026-05-21T09:00:00",
+      "end": "2026-05-21T10:00:00"
+     },
+     {
+      "start": "2026-05-20T12:00:00",
+      "end": "2026-05-20T14:00:00"
+     },
+     {
+      "start": "2026-05-18T14:00:00",
+      "end": "2026-05-18T16:00:00"
+     }
+    ],
+    "churn_multiplier": 9
+   },
+   {
+    "id": "task-11",
+    "title": "Task 11 (physical)",
+    "context": "physical",
+    "priority": 49,
+    "chunks": [
+     {
+      "chunk_id": "task-11#0",
+      "duration_minutes": 60
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-19T09:00:00",
+    "preferred_windows": [
+     {
+      "days": [
+       "wed",
+       "thu"
+      ],
+      "start": "10:00:00",
+      "end": "13:00:00",
+      "hard": false
+     }
+    ],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-12",
+    "title": "Task 12 (family)",
+    "context": "family",
+    "priority": 70,
+    "chunks": [
+     {
+      "chunk_id": "task-12#0",
+      "duration_minutes": 45
+     },
+     {
+      "chunk_id": "task-12#1",
+      "duration_minutes": 30
+     },
+     {
+      "chunk_id": "task-12#2",
+      "duration_minutes": 30
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": true
+    },
+    "deadline": {
+     "at": "2026-05-21T17:00:00",
+     "hard": false,
+     "penalty_per_15min": 4
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-13",
+    "title": "Task 13 (family)",
+    "context": "family",
+    "priority": 62,
+    "chunks": [
+     {
+      "chunk_id": "task-13#0",
+      "duration_minutes": 15
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": "2026-05-24T13:00:00",
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-14",
+    "title": "Task 14 (physical)",
+    "context": "physical",
+    "priority": 89,
+    "chunks": [
+     {
+      "chunk_id": "task-14#0",
+      "duration_minutes": 60
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [
+     {
+      "chunk_id": "task-14#0",
+      "start": "2026-05-20T09:00:00"
+     }
+    ],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-15",
+    "title": "Task 15 (physical)",
+    "context": "physical",
+    "priority": 21,
+    "chunks": [
+     {
+      "chunk_id": "task-15#0",
+      "duration_minutes": 30
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": {
+     "at": "2026-05-22T17:00:00",
+     "hard": true,
+     "penalty_per_15min": 0
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [
+     {
+      "days": [
+       "thu",
+       "fri"
+      ],
+      "start": "09:00:00",
+      "end": "13:00:00",
+      "hard": true
+     }
+    ],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-16",
+    "title": "Task 16 (meeting)",
+    "context": "meeting",
+    "priority": 79,
+    "chunks": [
+     {
+      "chunk_id": "task-16#0",
+      "duration_minutes": 60
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [
+     {
+      "type": "after_task",
+      "ref": "task-15",
+      "hard": true
+     }
+    ],
+    "pinned_at": null,
+    "previous_placement": [
+     {
+      "chunk_id": "task-16#0",
+      "start": "2026-05-21T10:00:00"
+     }
+    ],
+    "must_include": true,
+    "availability_windows": [
+     {
+      "start": "2026-05-21T10:00:00",
+      "end": "2026-05-21T11:00:00"
+     },
+     {
+      "start": "2026-05-19T09:00:00",
+      "end": "2026-05-19T11:00:00"
+     },
+     {
+      "start": "2026-05-20T12:00:00",
+      "end": "2026-05-20T14:00:00"
+     }
+    ],
+    "churn_multiplier": 8
+   },
+   {
+    "id": "task-17",
+    "title": "Task 17 (family)",
+    "context": "family",
+    "priority": 60,
+    "chunks": [
+     {
+      "chunk_id": "task-17#0",
+      "duration_minutes": 60
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-21T09:00:00",
+    "preferred_windows": [
+     {
+      "days": [
+       "tue",
+       "fri"
+      ],
+      "start": "13:00:00",
+      "end": "16:00:00",
+      "hard": false
+     }
+    ],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-18",
+    "title": "Task 18 (deep)",
+    "context": "deep",
+    "priority": 24,
+    "chunks": [
+     {
+      "chunk_id": "task-18#0",
+      "duration_minutes": 30
+     },
+     {
+      "chunk_id": "task-18#1",
+      "duration_minutes": 45
+     },
+     {
+      "chunk_id": "task-18#2",
+      "duration_minutes": 30
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": true
+    },
+    "deadline": {
+     "at": "2026-05-22T17:00:00",
+     "hard": false,
+     "penalty_per_15min": 4
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-19",
+    "title": "Task 19 (family)",
+    "context": "family",
+    "priority": 37,
+    "chunks": [
+     {
+      "chunk_id": "task-19#0",
+      "duration_minutes": 45
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": "2026-05-23T14:00:00",
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-20",
+    "title": "Task 20 (deep)",
+    "context": "deep",
+    "priority": 61,
+    "chunks": [
+     {
+      "chunk_id": "task-20#0",
+      "duration_minutes": 15
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [
+     {
+      "chunk_id": "task-20#0",
+      "start": "2026-05-18T18:00:00"
+     }
+    ],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-21",
+    "title": "Task 21 (deep)",
+    "context": "deep",
+    "priority": 74,
+    "chunks": [
+     {
+      "chunk_id": "task-21#0",
+      "duration_minutes": 30
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": {
+     "at": "2026-05-22T17:00:00",
+     "hard": true,
+     "penalty_per_15min": 0
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [
+     {
+      "days": [
+       "thu",
+       "mon"
+      ],
+      "start": "10:00:00",
+      "end": "14:00:00",
+      "hard": true
+     }
+    ],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-22",
+    "title": "Task 22 (meeting)",
+    "context": "meeting",
+    "priority": 46,
+    "chunks": [
+     {
+      "chunk_id": "task-22#0",
+      "duration_minutes": 60
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [
+     {
+      "chunk_id": "task-22#0",
+      "start": "2026-05-22T17:00:00"
+     }
+    ],
+    "must_include": true,
+    "availability_windows": [
+     {
+      "start": "2026-05-22T17:00:00",
+      "end": "2026-05-22T18:00:00"
+     },
+     {
+      "start": "2026-05-22T15:00:00",
+      "end": "2026-05-22T17:00:00"
+     },
+     {
+      "start": "2026-05-22T10:00:00",
+      "end": "2026-05-22T12:00:00"
+     }
+    ],
+    "churn_multiplier": 6
+   },
+   {
+    "id": "task-23",
+    "title": "Task 23 (admin)",
+    "context": "admin",
+    "priority": 84,
+    "chunks": [
+     {
+      "chunk_id": "task-23#0",
+      "duration_minutes": 30
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-20T09:00:00",
+    "preferred_windows": [
+     {
+      "days": [
+       "wed",
+       "tue"
+      ],
+      "start": "10:00:00",
+      "end": "13:00:00",
+      "hard": false
+     }
+    ],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-24",
+    "title": "Task 24 (physical)",
+    "context": "physical",
+    "priority": 71,
+    "chunks": [
+     {
+      "chunk_id": "task-24#0",
+      "duration_minutes": 45
+     },
+     {
+      "chunk_id": "task-24#1",
+      "duration_minutes": 30
+     }
+    ],
+    "group_policy": {
+     "same_day": true,
+     "ordered": true
+    },
+    "deadline": {
+     "at": "2026-05-21T17:00:00",
+     "hard": false,
+     "penalty_per_15min": 4
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-25",
+    "title": "Task 25 (deep)",
+    "context": "deep",
+    "priority": 24,
+    "chunks": [
+     {
+      "chunk_id": "task-25#0",
+      "duration_minutes": 15
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": "2026-05-23T12:00:00",
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-26",
+    "title": "Task 26 (deep)",
+    "context": "deep",
+    "priority": 21,
+    "chunks": [
+     {
+      "chunk_id": "task-26#0",
+      "duration_minutes": 60
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": null,
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [
+     {
+      "chunk_id": "task-26#0",
+      "start": "2026-05-19T09:00:00"
+     }
+    ],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-27",
+    "title": "Task 27 (meeting)",
+    "context": "meeting",
+    "priority": 58,
+    "chunks": [
+     {
+      "chunk_id": "task-27#0",
+      "duration_minutes": 15
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": false
+    },
+    "deadline": {
+     "at": "2026-05-22T17:00:00",
+     "hard": true,
+     "penalty_per_15min": 0
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [
+     {
+      "days": [
+       "tue",
+       "wed"
+      ],
+      "start": "09:00:00",
+      "end": "13:00:00",
+      "hard": true
+     }
+    ],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   }
+  ],
+  "external_pinned": [
+   {
+    "id": "ext-0",
+    "title": "External 0",
+    "start": "2026-05-18T09:00:00",
+    "duration_minutes": 30,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-1",
+    "title": "External 1",
+    "start": "2026-05-21T14:00:00",
+    "duration_minutes": 60,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-2",
+    "title": "External 2",
+    "start": "2026-05-24T19:00:00",
+    "duration_minutes": 45,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-3",
+    "title": "External 3",
+    "start": "2026-05-19T09:00:00",
+    "duration_minutes": 45,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-4",
+    "title": "External 4",
+    "start": "2026-05-20T19:00:00",
+    "duration_minutes": 60,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-5",
+    "title": "External 5",
+    "start": "2026-05-24T14:00:00",
+    "duration_minutes": 45,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-6",
+    "title": "External 6",
+    "start": "2026-05-22T19:00:00",
+    "duration_minutes": 60,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-7",
+    "title": "External 7",
+    "start": "2026-05-21T17:00:00",
+    "duration_minutes": 45,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-8",
+    "title": "External 8",
+    "start": "2026-05-18T13:00:00",
+    "duration_minutes": 30,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-9",
+    "title": "External 9",
+    "start": "2026-05-21T16:00:00",
+    "duration_minutes": 45,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-10",
+    "title": "External 10",
+    "start": "2026-05-20T12:00:00",
+    "duration_minutes": 30,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-11",
+    "title": "External 11",
+    "start": "2026-05-19T15:00:00",
+    "duration_minutes": 30,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-12",
+    "title": "External 12",
+    "start": "2026-05-20T15:00:00",
+    "duration_minutes": 60,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-13",
+    "title": "External 13",
+    "start": "2026-05-21T15:00:00",
+    "duration_minutes": 45,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-14",
+    "title": "External 14",
+    "start": "2026-05-22T16:00:00",
+    "duration_minutes": 45,
+    "context": "meeting"
+   }
+  ],
+  "business_hours": {
+   "days": [
+    "mon",
+    "tue",
+    "wed",
+    "thu",
+    "fri"
+   ],
+   "start": "09:00:00",
+   "end": "17:00:00"
+  }
+ }
+}

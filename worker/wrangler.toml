@@ -1,0 +1,396 @@
+name = "weekly-scheduling-assistant"
+main = "src/index.ts"
+compatibility_date = "2025-03-28"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# Card G: the bespoke solver engine runs SYNCHRONOUSLY inside the isolate, and
+# its own budgets allow up to 60 s of CPU (pass1 + pass2 + mus at 20 s each) —
+# well past the 30 s Workers default, which would kill the isolate before the
+# fallback wall guard (default 120 s, SOLVER_ENGINE_WALL_GUARD_MS) could ever
+# refuse a slow answer. Worse, in shadow mode a CPU kill would take down the
+# CONTAINER-served response, breaking "shadow never affects the response". 300 s
+# (the standard-usage-model maximum) puts the guard back in charge and leaves
+# headroom for the webhook path's multi-week loop. Billing is per CPU-ms
+# actually consumed, so raising the ceiling costs nothing unless it is used.
+# Must be repeated per environment — limits do not inherit.
+[limits]
+cpu_ms = 300000
+
+[[routes]]
+pattern = "scheduler.example.com"
+custom_domain = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "scheduler"
+database_id = "REPLACE_WITH_YOUR_PROD_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[kv_namespaces]]
+binding = "GOOGLE_TOKEN_CACHE"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+[[durable_objects.bindings]]
+name = "RESOLVE_COORDINATOR"
+class_name = "ResolveCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["ResolveCoordinator"]
+
+# Service binding to the solver Worker. The solver is implemented separately
+# (see weekly-scheduling-assistant/solver/) and deployed under its own name.
+[[services]]
+binding = "SOLVER"
+service = "weekly-scheduling-solver"
+
+# Card E: the engine's fan-out leaf — a service binding back to THIS worker's
+# own `EngineRpc` entrypoint, so a neighbourhood sub-solve spends its own CPU
+# budget instead of the master resolve's. (A separate ISOLATE, and so separate
+# memory, is a hypothesis rather than a documented guarantee for same-worker
+# RPC — see the comment on EngineRpc in src/index.ts.)
+#
+# Self-referential on purpose: the leaf is the same pure engine module, so
+# there is no second Worker to deploy. That narrows version skew to the
+# rollout window of a single deploy rather than removing it — mid-rollout a
+# master on the new code can reach a leaf still on the old, which is one more
+# thing the degrade path covers.
+#
+# `service` must name the per-environment worker (named envs get the `-<env>`
+# suffix and do NOT inherit [[services]]). Inert until SOLVER_ENGINE_FANOUT is
+# "true" — the binding existing costs nothing.
+[[services]]
+binding = "ENGINE_RPC"
+service = "weekly-scheduling-assistant"
+entrypoint = "EngineRpc"
+
+# Card 3.0: R2 bucket for captured live solver problems (Stage 3 parity
+# corpus). One shared account-level bucket across prod/dev — env is labelled
+# inside the stored JSON envelope (DEPLOY_ENV below), so keys stay flat
+# (problems/<solver_calls.id>.json). Created once via
+# `npx wrangler r2 bucket create optical-solver-capture`.
+[[r2_buckets]]
+binding = "SOLVER_CAPTURE"
+bucket_name = "optical-solver-capture"
+
+[vars]
+ACCESS_TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
+ACCESS_POLICY_AUD = "REPLACE_WITH_YOUR_ACCESS_AUD"
+OAUTH_ISSUER = "https://scheduler.example.com"
+GOOGLE_OAUTH_REDIRECT_URI = "https://scheduler.example.com/auth/callback"
+GOOGLE_OAUTH_CLIENT_ID = "REPLACE_WITH_YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
+SCHEDULER_TZ = "Australia/Sydney"
+# Microsoft 365 (Outlook) provider feature flag. Default OFF; per-user provider
+# selection lives in identity_tokens.provider once a user signs in via Microsoft,
+# but sign-in itself only offers Microsoft when this is "true".
+MS_PROVIDER_ENABLED = "false"
+# Entra app registration not yet created for prod — placeholder until the app
+# exists and its client ID is copied in (see docs/runbook.md, M365 provider).
+MICROSOFT_OAUTH_CLIENT_ID = "<set after Entra app registration>"
+MICROSOFT_TENANT = "common"
+# Comma-separated allowlist of identities permitted to complete federated login.
+# Includes the sandbox account used by the regression smoke harness.
+OPERATOR_EMAIL = "operator@example.com,operator.alt@example.com"
+# Weekly Monday cron master switch. Default OFF; flip to "true" to enable the
+# per-user fan-out resolve. Any value other than "true" leaves the cron inert.
+WEEKLY_CRON_ENABLED = "false"
+# Decision D (Plan 5): tentative-events-block master switch. Default OFF; flip to
+# "true" so events the user is only tentatively attending block solver time.
+TENTATIVE_IS_BUSY = "false"
+# Inactive-user retention (Plan 6). Empty = OFF (never sweep). Set to a positive
+# integer number of days to enable the daily offboard of users idle that long.
+RETENTION_DAYS = ""
+# Task done-marking: Google Calendar colorId for events of tasks marked done.
+# MUST differ from the scheduler create color "5" — getDoneColorId() enforces this.
+DONE_COLOR_ID = "11"
+# Diagnostic logging master switch (src/log.ts). "true" emits verbose dbg_* lines
+# to Workers Observability. Off in prod by default; flip to "true" only to capture
+# a specific trace, then flip back.
+DEBUG_LOG = "false"
+# Per-user busy .ics feed. Rolled out 2026-07-24; enables the public
+# /cal/<token>/busy.ics feed + /v1/calendar-feeds management endpoints.
+CALENDAR_FEED_ENABLED = "true"
+# Public booking page. Default OFF; "true" enables /book/<slug> and the
+# /v1/booking-page management endpoints. Requires TURNSTILE_SITE_KEY (var) and
+# TURNSTILE_SECRET (secret) — without a verifiable challenge the claim endpoint
+# refuses every request, since it can send calendar invitations as the owner.
+BOOKING_PAGE_ENABLED = "true"
+# Real widget, bound to scheduler.example.com (minted 2026-07-27 via
+# bin/create-turnstile-widget.py). Public by design — it ships in the page HTML.
+# Its secret half is the TURNSTILE_SECRET Worker secret; the two are a pair, so
+# rotating one means rotating the other.
+TURNSTILE_SITE_KEY = "REPLACE_WITH_YOUR_TURNSTILE_SITE_KEY"
+# Owned meetings feature flag. Default OFF; set to "true" to enable.
+OWNED_MEETINGS_ENABLED = "true"
+# Minimum notice period in minutes before an owned meeting can be scheduled.
+# Default 1440 (24 hours).
+MEETING_MIN_NOTICE_MINUTES = "60"
+# Cap on the churn multiplier for owned meetings. Default 20.
+MEETING_CHURN_MULTIPLIER_CAP = "20"
+# Minutes after Optical commits a meeting move during which that meeting is held
+# at its slot (cascade stability): the commit's own webhook re-resolve must not
+# re-move a meeting before attendee RSVPs recover. Default 60.
+MEETING_COMMIT_STABILITY_MINUTES = "60"
+# Meeting polls feature flag. Default off/unset; "true" enables organiser poll
+# creation, the public invitee grid, and the hourly auto-book/nudge sweep.
+MEETING_POLL_ENABLED = "true"
+# Card 3.0: capture every live solver Problem JSON to R2 (SOLVER_CAPTURE) for
+# the Stage 3 engine-parity corpus. Puts are fire-and-forget, before the
+# solve, so 422s/solver errors are captured too. Default "false"; payloads
+# carry calendar event titles, so only enable it with your users' consent.
+SOLVER_CAPTURE_PROBLEMS = "false"
+# Labels captured envelopes so they're separable by deployment without a D1
+# join. See SOLVER_CAPTURE_PROBLEMS above and env.ts.
+DEPLOY_ENV = "prod"
+# Card G: which solver answers a resolve — "container" | "worker" | "shadow" |
+# "fallback" (env.ts documents each). Prod shadow soak ran 2026-08-24 →
+# 2026-08-27 on the pre-strengthening engine; promoted to "fallback"
+# 2026-08-27 with the search-strengthening merge (an internal PR) after the full dev
+# regression ladder passed on the strengthened engine — the engine now serves
+# when it certifies OPTIMAL, and everything else (uncertified, crash, wall
+# guard, 422) re-solves via the container, which stays the authority on
+# user-visible errors. Promotion path is shadow → fallback → worker; rollback
+# at any stage is a flip back to "container" plus a redeploy.
+SOLVER_ENGINE = "fallback"
+# Card E: fan-out escape hatch. Flipped ON 2026-08-27 together with the
+# fallback promotion. Gating also requires the engine's improvement phase to
+# be running and the instance to be at/above SOLVER_ENGINE_FANOUT_MIN_CHUNKS
+# (default 24, unset here — so a typical small prod resolve never fans out).
+# Rollback is a flip back to "false" plus a redeploy; an RPC failure already
+# degrades to the in-process path on its own (`engine_fanout_degraded`).
+SOLVER_ENGINE_FANOUT = "true"
+
+# Secrets pushed via bin/bootstrap-secrets.sh:
+#   GOOGLE_OAUTH_CLIENT_SECRET
+#   MICROSOFT_OAUTH_CLIENT_SECRET  # Entra app client secret, injected via op run like the Google pair; expires <=24mo, rotate before then
+#   TOKEN_HASH_PEPPER         # random 32-byte hex used when hashing opaque tokens
+#   WEBHOOK_CHANNEL_TOKEN     # random 32-byte hex for Google webhook channel auth
+#
+# Secret pushed via bin/create-turnstile-widget.py (NOT bootstrap-secrets.sh — a
+# Turnstile pair is issued by Cloudflare against a hostname, not generated
+# locally, so there is no `openssl rand` equivalent):
+#   TURNSTILE_SECRET          # Turnstile siteverify secret for the booking page claim
+#                             # endpoint, paired with the TURNSTILE_SITE_KEY var
+#                             # above. Dev's always-passes test secret is
+#                             # 1x0000000000000000000000000000000AA — never use it in prod.
+
+[triggers]
+crons = [
+  "0 15 * * SUN",   # Monday-morning resolve: 15:00 UTC Sunday = 01:00 AEST Monday
+  "0 4 * * *",      # Daily cleanup of expired proposed_plans at 04:00 UTC
+  "0 * * * *",      # Hourly meeting-poll sweep (books/nudges); inert unless MEETING_POLL_ENABLED="true"
+  "*/5 * * * *",    # Booking-page decline auto-cancel sweep; inert unless BOOKING_PAGE_ENABLED="true"
+]
+
+# ---------------------------------------------------------------------------
+# Dev deployment target  (deploy with:  npx wrangler deploy --env dev)
+#
+# Fully isolated from prod: its own D1 (`scheduler-dev`), its own KV namespace,
+# and its own Durable Object namespace (auto-separated because the worker name
+# becomes `weekly-scheduling-assistant-dev`). Serves on its own custom domain
+# scheduler-dev.example.com; workers.dev stays enabled for the smoke
+# harness's bearer API calls. Three crons run here — daily cleanup/renewal,
+# the hourly meeting-poll sweep, and the 5-minute booking-decline sweep (see
+# [env.dev.triggers] below; the latter two are inert unless their own feature
+# flag is "true"). The Monday resolve cron is absent — trigger resolves
+# manually while rehearsing.
+#
+# Purpose: rehearse the multi-user cutover (migrations 0013-0018, owner_subject
+# backfill, calendar_sync re-subscribe, split secrets) before touching prod.
+#
+# Named environments do NOT inherit top-level bindings/vars/triggers — every
+# block below is redeclared deliberately. `main`, compatibility_*, [observability]
+# and [[migrations]] ARE inherited from the top level.
+#
+# One-time setup before first deploy:
+#   1. Push dev secrets (separate from prod):
+#        op run --env-file=../.env -- npx wrangler secret put GOOGLE_OAUTH_CLIENT_SECRET --env dev
+#        npx wrangler secret put TOKEN_HASH_PEPPER     --env dev   # openssl rand -hex 32
+#        npx wrangler secret put WEBHOOK_CHANNEL_TOKEN --env dev   # openssl rand -hex 32
+#      (HASHING_KEY/ENCRYPTION_KEY/HMAC_KEY are optional — they fall back to
+#       TOKEN_HASH_PEPPER, so the dev split-secrets rehearsal is opt-in.)
+#   2. Apply migrations to the dev DB:
+#        op run --env-file=../.env -- npx wrangler d1 migrations apply scheduler-dev --remote
+#   3. Register GOOGLE_OAUTH_REDIRECT_URI below as an authorised redirect URI
+#      in the Google OAuth console (same client as prod).
+[env.dev]
+workers_dev = true
+
+# CRITICAL: `routes` is an INHERITABLE wrangler key — without an explicit dev
+# override, [env.dev] inherits the top-level custom-domain route and the dev
+# deploy hijacks scheduler.example.com away from prod. The block
+# below IS that override: dev gets its own custom domain.
+#
+# Why a custom domain at all: Cloudflare refuses worker→worker fetches to
+# *.workers.dev hostnames on the same account (HTTP 404, body `error code:
+# 1042`). codemode-mcp's optical-dev worker performs the OAuth code/refresh
+# token exchange against this worker server-side, which only works across a
+# Workers Custom Domain — the same mechanism prod relies on via
+# scheduler.example.com. The DNS placeholder record for this
+# hostname is owned by infra/main.tf (cloudflare_dns_record.scheduler_dev);
+# `wrangler deploy --env dev` attaches the Custom Domain on top of it, exactly
+# like prod.
+# Card G: same CPU ceiling as prod — limits are per-environment and do NOT
+# inherit from the top-level block, and dev is where the engine soak starts.
+# See the [limits] comment at the top of this file.
+[env.dev.limits]
+cpu_ms = 300000
+
+[[env.dev.routes]]
+pattern = "scheduler-dev.example.com"
+custom_domain = true
+
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "scheduler-dev"
+database_id = "REPLACE_WITH_YOUR_DEV_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[env.dev.kv_namespaces]]
+binding = "GOOGLE_TOKEN_CACHE"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+[[env.dev.durable_objects.bindings]]
+name = "RESOLVE_COORDINATOR"
+class_name = "ResolveCoordinator"
+
+# Dev reuses the prod solver (stateless — solves a problem, holds no user data).
+[[env.dev.services]]
+binding = "SOLVER"
+service = "weekly-scheduling-solver"
+
+# Card E: fan-out leaf, pointed at DEV's own worker (services do not inherit,
+# and a dev master must never fan out into the prod isolate). See the
+# top-level ENGINE_RPC block.
+[[env.dev.services]]
+binding = "ENGINE_RPC"
+service = "weekly-scheduling-assistant-dev"
+entrypoint = "EngineRpc"
+
+# Card 3.0: same shared account-level bucket as prod — env is labelled inside
+# the stored JSON (DEPLOY_ENV below), so dev and prod captures coexist under
+# the same flat key prefix without colliding (call ids are UUIDs).
+[[env.dev.r2_buckets]]
+binding = "SOLVER_CAPTURE"
+bucket_name = "optical-solver-capture"
+
+[env.dev.vars]
+ACCESS_TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
+# Dev verifies the ISOLATED dev Access app's AUD (infra: cloudflare_zero_trust_
+# access_application.scheduler_dev), NOT prod's. Cookies are minted by SSO to
+# scheduler-dev.<zone>/admin. Source of truth: `tofu output access_application_dev_aud`.
+ACCESS_POLICY_AUD = "REPLACE_WITH_YOUR_ACCESS_AUD"
+# All dev OAuth URLs live on the custom domain (not workers.dev): the federated
+# login sets a __Host- nonce cookie at /oauth/authorize that must come back to
+# /auth/callback on the SAME host, and /auth/callback's host is derived from
+# OAUTH_ISSUER. Start OAuth flows (mint-token, codemode authorize) on this host;
+# a flow started on the workers.dev URL now fails "Login session mismatch".
+# GOOGLE_OAUTH_REDIRECT_URI must be registered in the Google OAuth console.
+OAUTH_ISSUER = "https://scheduler-dev.example.com"
+GOOGLE_OAUTH_REDIRECT_URI = "https://scheduler-dev.example.com/auth/callback"
+GOOGLE_OAUTH_CLIENT_ID = "REPLACE_WITH_YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
+SCHEDULER_TZ = "Australia/Sydney"
+# Microsoft 365 (Outlook) provider feature flag. Temporarily OFF: MS-provider
+# invites from a personal Microsoft account send from an outlook.com proxy
+# alias, not the primary address (MSA-with-third-party-domain quirk, see
+# docs/runbook.md §O). Off in
+# dev while that's investigated/documented; normally ON to exercise the
+# feature end-to-end. Prod ships OFF until dev smoke passes and a prod Entra
+# app exists.
+MS_PROVIDER_ENABLED = "false"
+# Placeholder until the dev Entra app registration exists — copy the client ID
+# in after registering (portal -> App registrations -> New; see runbook).
+MICROSOFT_OAUTH_CLIENT_ID = "<set after Entra app registration>"
+MICROSOFT_TENANT = "common"
+OPERATOR_EMAIL = "operator@example.com,operator.alt@example.com,tester1@example.com,tester2@example.com"
+# Multi-user enablement knob (Plan 4). Set a wildcard/allowlist here to authorise
+# a 2nd org user in dev and exercise owner-scoped isolation end-to-end.
+MEMBERSHIP_ALLOWLIST = "*@example.com,operator.alt@example.com,tester1@example.com"
+WEEKLY_CRON_ENABLED = "false"
+TENTATIVE_IS_BUSY = "false"
+RETENTION_DAYS = ""
+# Task done-marking: MUST differ from the scheduler create color "5".
+DONE_COLOR_ID = "11"
+# Diagnostic logging master switch (src/log.ts). Off in dev by default.
+DEBUG_LOG = "false"
+# Per-user busy .ics feed. ON in dev (own DB, own hostname, noindex) and in
+# prod — rolled out 2026-07-24.
+CALENDAR_FEED_ENABLED = "true"
+# Public booking page. ON in dev so /book/<slug> can be exercised end-to-end.
+# Real widget bound to scheduler-dev.example.com (minted via
+# bin/create-turnstile-widget.py, 2026-07-28) — TURNSTILE_SECRET is its paired
+# Worker secret. Never share this pair with prod.
+BOOKING_PAGE_ENABLED = "true"
+TURNSTILE_SITE_KEY = "REPLACE_WITH_YOUR_TURNSTILE_SITE_KEY"
+# Owned meetings feature flag. ON in dev so the feature can be exercised end-to-end
+# once the organiser's dev account re-consents.
+OWNED_MEETINGS_ENABLED = "true"
+# Minimum notice period in minutes before an owned meeting can be scheduled.
+# Dev: 15 (prod default 1440) so near-term meetings can be exercised manually
+# without waiting a day for the horizon to clear.
+MEETING_MIN_NOTICE_MINUTES = "15"
+# Cap on the churn multiplier for owned meetings.
+MEETING_CHURN_MULTIPLIER_CAP = "20"
+# Minutes after Optical commits a meeting move during which that meeting is held
+# at its slot (cascade stability): the commit's own webhook re-resolve must not
+# re-move a meeting before attendee RSVPs recover. Default 60.
+MEETING_COMMIT_STABILITY_MINUTES = "60"
+# Dev only: append the calendar.acls OAuth scope so bin/meeting-smoke.py can set
+# free/busy sharing topology with the raw token. NEVER set under the top-level
+# (prod) vars — prod tokens must never carry ACL write capability.
+GOOGLE_ACL_SCOPE_ENABLED = "true"
+# Dev only: append the gmail.readonly OAuth scope so bin/poll-smoke.py can read
+# the organiser's Sent mail with the raw token instead of an operator pasting
+# each invitee link. NEVER set under the top-level (prod) vars — prod tokens
+# must never carry mailbox read capability.
+GOOGLE_GMAIL_READ_SCOPE_ENABLED = "true"
+# Non-prod Microsoft counterpart of GOOGLE_GMAIL_READ_SCOPE_ENABLED above (WP0
+# of internal design notes). Off here — dev doesn't host
+# Microsoft sign-in today (MS_PROVIDER_ENABLED is off), so this is harmless
+# either way; kept false to mirror that. Flip it to "true" alongside
+# MS_PROVIDER_ENABLED to run Microsoft poll-smoke against dev. NEVER set under
+# the top-level (prod) vars.
+MICROSOFT_MAIL_READ_SCOPE_ENABLED = "false"
+MEETING_POLL_ENABLED = "true"
+# Dev-only shortening of the booking-page decline auto-cancel grace period
+# (prod default is 10 minutes — see BOOKING_DECLINE_GRACE_MINUTES in env.ts)
+# so bin/booking-smoke.py's decline mode doesn't have to wait out a realistic
+# grace window before forcing the */5 * * * * sweep. NEVER set this under the
+# top-level (prod) vars.
+BOOKING_DECLINE_GRACE_MINUTES = "1"
+# Card 3.0: capture every live solver Problem JSON to R2 for the Stage 3
+# engine-parity corpus (default "false").
+SOLVER_CAPTURE_PROBLEMS = "false"
+DEPLOY_ENV = "dev"
+# Card G: see env.ts for the four modes; bin/engine-smoke.py drives
+# shadow → fallback → worker against dev.
+# 2026-08-26: flipped to "worker" for the fanout smoke posture.
+# 2026-08-27: back to "fallback" after the full regression ladder passed 9/9
+# on worker+fanout — matching the other envs' fallback promotion (an internal PR
+# merge).
+SOLVER_ENGINE = "fallback"
+# Card E: fan-out ON since the 2026-08-26 smoke, kept ON. The MIN_CHUNKS = "1"
+# override (default 24) stays too: dev problems are tiny, so without it the
+# fan-out path would never run here — with it, every dev resolve that reaches
+# the improvement phase exercises the RPC path. `bin/engine-smoke.py --phase
+# fanout` expects exactly this pair (plus SOLVER_ENGINE = "worker" for that
+# one phase).
+SOLVER_ENGINE_FANOUT = "true"
+SOLVER_ENGINE_FANOUT_MIN_CHUNKS = "1"
+
+# Three crons: daily cleanup (also keeps the dev Google push channel renewed —
+# channels expire silently after ~7 days; cleanup + retention sweep are
+# idempotent no-ops in dev), the hourly meeting-poll sweep, and the 5-minute
+# booking-decline sweep — both gated inert by their own flags below unless
+# explicitly turned on for dev. The Monday resolve cron stays absent — drive
+# resolves manually while rehearsing. WEEKLY_CRON_ENABLED guards it anyway.
+[env.dev.triggers]
+crons = [
+  "0 4 * * *",   # Daily cleanup of expired proposed_plans at 04:00 UTC
+  "0 * * * *",   # Hourly meeting-poll sweep (books/nudges); inert unless MEETING_POLL_ENABLED="true"
+  "*/5 * * * *", # Booking-page decline auto-cancel sweep; inert unless BOOKING_PAGE_ENABLED="true"
+]
+

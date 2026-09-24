@@ -1,0 +1,12 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Optical Poll Test Fixtures//EN
+CALSCALE:GREGORIAN
+begin:vevent
+uid:lowercase-props-1@fixtures.test
+dtstamp:20260701T000000Z
+dtstart:20260812T000000Z
+dtend:20260812T003000Z
+summary:Lower-case property AND block markers
+end:vevent
+END:VCALENDAR

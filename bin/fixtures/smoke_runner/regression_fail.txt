@@ -1,0 +1,8 @@
+active account: a@example.com  home_tz: Australia/Sydney  provider: google  done colour: '11'
+┏━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Level           ┃ Status ┃ HTTP ┃ Scheduled ┃ Dropped ┃ Wall(s) ┃ Notes                              ┃
+┡━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ L6              │ FAIL   │ 200  │         - │       - │     4.8 │ done-marking floor not met         │
+│ Lowned-meetings │ PASS   │ 200  │         1 │       0 │     6.2 │ owned-meetings: meeting task moved │
+└─────────────────┴────────┴──────┴───────────┴─────────┴─────────┴────────────────────────────────────┘
+TOTAL 1/2  wall=11.0s

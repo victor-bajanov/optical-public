@@ -1,0 +1,32 @@
+name = "weekly-scheduling-solver"
+main = "cf-worker.ts"
+compatibility_date = "2026-05-05"
+# No public route: the scheduling worker reaches the solver via its SOLVER
+# service binding, which needs no route. Without this line wrangler enables the
+# *.workers.dev subdomain by default (this worker defines no routes), exposing
+# an unauthenticated /solve that lets anyone occupy the container (~36s per
+# heavy request). For ad-hoc HTTP testing run the solver locally instead:
+# uv run uvicorn solver.server:app
+workers_dev = false
+# Same rationale for version preview URLs (<version>-<name>.workers.dev): the
+# account default is previews_enabled=true, so pin them off. None are served
+# today (deploys use `wrangler deploy`, which mints no preview), but a future
+# `wrangler versions upload` would silently open one.
+preview_urls = false
+
+[[containers]]
+class_name = "SolverContainer"
+image = "./Dockerfile"
+max_instances = 2
+instance_type = { vcpu = 4, memory_mib = 12288, disk_mb = 4000 }
+
+[[durable_objects.bindings]]
+name = "SOLVER_CONTAINER"
+class_name = "SolverContainer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SolverContainer"]
+
+[observability]
+enabled = true

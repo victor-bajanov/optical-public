@@ -1,0 +1,15 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Optical Test Fixtures//EN
+CALSCALE:GREGORIAN
+BEGIN:VEVENT
+UID:folded-lines-1@fixtures.test
+DTSTAMP:20260701T000000Z
+DTSTART;TZID=Australia/Sydney:20260803T090000
+DTEND;TZID=Australia/Sydney:20260803T100000
+SUMMARY:This is a very long summary line that must be folded across
+ multiple physical lines to satisfy RFC 5545's line-length recommendation
+DESCRIPTION:This description line is folded using a TAB continuation
+	instead of a leading space, which RFC 5545 also permits
+END:VEVENT
+END:VCALENDAR

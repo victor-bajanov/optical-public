@@ -1,0 +1,5 @@
+F1 PASS — endpoints created, two-step reveal single-use verified
+F2 FAIL — title never appeared in regex feed
+BEGIN:VCALENDAR
+VERSION:2.0
+END:VCALENDAR

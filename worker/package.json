@@ -1,0 +1,32 @@
+{
+  "name": "weekly-scheduling-assistant-worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ci": "bash scripts/ci-test.sh",
+    "migrate:local": "wrangler d1 migrations apply scheduler --local",
+    "migrate:remote": "wrangler d1 migrations apply scheduler --remote",
+    "openapi:build": "tsx scripts/build-openapi.ts"
+  },
+  "dependencies": {
+    "@hono/zod-openapi": "^0.19.10",
+    "hono": "^4.6.0",
+    "jose": "^6.0.11",
+    "rrule": "^2.8.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.5.0",
+    "@cloudflare/workers-types": "^4.20250327.0",
+    "@fast-check/vitest": "^0.2.1",
+    "tsx": "^4.22.3",
+    "typescript": "^5.8.2",
+    "vitest": "^2.1.0",
+    "wrangler": "^4.6.0"
+  }
+}

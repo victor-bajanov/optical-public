@@ -1,0 +1,7 @@
+active account: a@example.com
+C1 PASS — 5 contexts, all source:default (['deep', 'admin', 'physical', 'family', 'meeting'])
+C2 PASS — weights source:default (churn=8)
+C4 PASS — PATCH /v1/weights applied churn_per_15min_moved=400
+C6 PASS — weights source:custom, churn set, other 5 weights untouched
+C7 PASS — resolve accepted the customised contexts/weights payload (week of 2026-09-07)
+C9 PASS — both resources back to source:default after DELETE

@@ -1,0 +1,21 @@
+SETUP — TURNSTILE_SECRET swapped to Cloudflare's test secret for this run
+D1 PASS — booking page configured (slug=decline-smoke)
+SETUP — waited 6s for the TURNSTILE_SECRET swap to reach the edge
+D3 PASS — claimed 2026-09-03T09:00:00+10:00 as booking bk_dec456 for c@example.com
+D4 PASS — booking confirmed, calendar event evt_789
+D5 PASS — c@example.com declined the invite
+D6 PASS — cancel_pending_at stamped
+D7 PASS — forced the booking-decline sweep
+D8 PASS — booking row cancelled
+D9 PASS — calendar event deleted
+D10a PASS — booker cancellation email found in owner's Sent folder
+D10b PASS — owner heads-up email found in owner's Sent folder
+DECLINE PASS
+A1 PASS — claimed 2026-09-03T10:00:00+10:00 as booking bk_abort1
+A2 PASS — declined and cancel_pending_at stamped
+A3/A4 SKIPPED — the real */5 * * * * cron won the race against the re-accept before cancel_pending_at could clear; this is a documented, harmless race (dev's grace is only 1 minute), not a harness failure — see the module docstring's race note
+ALL PASS
+CLEANUP — cleaned:
+  - booking bk_dec456 deleted
+  - booking bk_abort1 deleted
+CLEANUP — NOT cleaned:

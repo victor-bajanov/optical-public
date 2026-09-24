@@ -1,0 +1,115 @@
+{
+  "tasks": [
+    {
+      "id": "smoke-deep-1",
+      "title": "Review APOLLO quarterly draft",
+      "context": "deep",
+      "priority": 75,
+      "duration_minutes": 90,
+      "earliest_start": "2026-06-01T00:00",
+      "deadline": {"at": "2026-06-04T17:00", "hard": false, "penalty_per_15min": 30},
+      "preferred_windows": [
+        {"days": ["mon","tue","wed","thu","fri"], "start": "09:00", "end": "12:00", "hard": false}
+      ],
+      "dependencies": [],
+      "pinned_at": null,
+      "source": {"kind": "mcp", "external_id": null},
+      "status": "pending"
+    },
+    {
+      "id": "smoke-admin-1",
+      "title": "Process inbox",
+      "context": "admin",
+      "priority": 40,
+      "duration_minutes": 45,
+      "earliest_start": "2026-06-01T00:00",
+      "deadline": null,
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": null,
+      "source": {"kind": "mcp", "external_id": null},
+      "status": "pending"
+    },
+    {
+      "id": "smoke-deep-2",
+      "title": "Write client update memo",
+      "context": "deep",
+      "priority": 60,
+      "chunks": [{"duration_minutes": 60}, {"duration_minutes": 60}],
+      "group_policy": {"same_day": false, "ordered": true},
+      "earliest_start": "2026-06-01T00:00",
+      "deadline": {"at": "2026-06-05T17:00", "hard": false, "penalty_per_15min": 20},
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": null,
+      "source": {"kind": "mcp", "external_id": null},
+      "status": "pending"
+    },
+    {
+      "id": "smoke-physical-1",
+      "title": "Run",
+      "context": "physical",
+      "priority": 50,
+      "duration_minutes": 45,
+      "earliest_start": "2026-06-01T00:00",
+      "deadline": null,
+      "preferred_windows": [
+        {"days": ["mon","wed","fri"], "start": "16:00", "end": "19:00", "hard": false}
+      ],
+      "dependencies": [],
+      "pinned_at": null,
+      "source": {"kind": "mcp", "external_id": null},
+      "status": "pending"
+    },
+    {
+      "id": "smoke-meeting-1",
+      "title": "1:1 with Sam",
+      "context": "meeting",
+      "priority": 80,
+      "duration_minutes": 30,
+      "earliest_start": "2026-06-01T00:00",
+      "deadline": null,
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": "2026-06-02T10:00",
+      "source": {"kind": "mcp", "external_id": null},
+      "status": "pending"
+    }
+  ],
+  "templates": [
+    {
+      "id": "smoke-tmpl-pilates",
+      "title": "Pilates",
+      "context": "physical",
+      "rrule": "FREQ=WEEKLY;BYDAY=FR",
+      "pinned_time": "19:00",
+      "duration_minutes": 90,
+      "task_body": {
+        "context": "physical",
+        "priority": 70,
+        "preferred_windows": [],
+        "dependencies": [],
+        "source": {"kind": "template", "external_id": null}
+      },
+      "active_from": "2026-01-01",
+      "active_until": null
+    },
+    {
+      "id": "smoke-tmpl-standup",
+      "title": "Standup",
+      "context": "meeting",
+      "rrule": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+      "pinned_time": "09:30",
+      "duration_minutes": 15,
+      "task_body": {
+        "context": "meeting",
+        "priority": 50,
+        "preferred_windows": [],
+        "dependencies": [],
+        "source": {"kind": "template", "external_id": null}
+      },
+      "active_from": "2026-01-01",
+      "active_until": null
+    }
+  ]
+}

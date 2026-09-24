@@ -1,0 +1,25 @@
+.env
+.env.*
+!.env.example
+
+# Wrangler local-dev cache
+.wrangler/
+
+# Node deps
+node_modules/
+
+# Local Claude Code scratch: worktrees (SDD), phase briefs, workflow scripts
+.claude/
+
+# superpowers brainstorming visual companion artifacts
+.superpowers/
+
+# pycache
+__pycache__/
+
+# Pulled solver-problem corpus (bin/solver-capture-pull.py); payloads carry
+# calendar event titles, so the whole directory stays local and uncommitted.
+# Re-pull from R2 to regenerate.
+analysis/corpus/
+
+**/.DS_Store

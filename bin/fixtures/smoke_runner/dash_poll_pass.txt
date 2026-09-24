@@ -1,0 +1,25 @@
+P1 PASS — poll poll_abc123 created
+P2 PASS — both invitees registered, unresponded (email CONTENT not verified — see KNOWN GAP)
+P3 PASS — invitee A painted ['2026-09-03T09:00'], aggregate carries freeWho/ifNeededWho
+P4 PASS — invitee B painted the same cells ['2026-09-03T09:00'] (overlapping)
+P5 PASS — poll booked, event evt_555 carries both non-hidden attendees + optical_poll_id, bookings row confirmed
+P6 PASS — imported task task_777 is pinned_at='2026-09-03T09:00', context=meeting
+P7 PASS — cancel on the booked poll correctly refused (409 invalid_status)
+NUDGE-send PASS — nudged 'nudge@example.com' on open poll poll_nudge1
+
+CLEANUP — cleaned:
+  - calendar event evt_555 deleted
+  - 3 poll row(s) + cascaded poll_invitees/poll_responses/bookings wiped from D1
+CLEANUP — NOT cleaned:
+
+=== SUMMARY ===
+PASS  P1  poll poll_abc123 created
+PASS  P2  both invitees registered, unresponded (email CONTENT not verified — see KNOWN GAP)
+PASS  P3  invitee A painted ['2026-09-03T09:00'], aggregate carries freeWho/ifNeededWho
+PASS  P4  invitee B painted the same cells ['2026-09-03T09:00'] (overlapping)
+PASS  P5  poll booked, event evt_555 carries both non-hidden attendees + optical_poll_id, bookings row confirmed
+PASS  P6  imported task task_777 is pinned_at='2026-09-03T09:00', context=meeting
+PASS  P7  cancel on the booked poll correctly refused (409 invalid_status)
+PASS  NUDGE-send  nudged 'nudge@example.com' on open poll poll_nudge1
+
+ALL PASS

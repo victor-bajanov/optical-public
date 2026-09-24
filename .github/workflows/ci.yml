@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    name: worker typecheck + tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Batched: the cloudflare:test pool can't collect the whole suite in one
+      # process, so scripts/ci-test.sh runs each test/ subdirectory separately.
+      # SKIP_SOLVER_CONTRACT skips solver-contract.test.ts, which shells out to
+      # `uv run --project ../solver` (Python + ortools) — not available in this
+      # Node-only job. See the solver-contract job if/when enabled.
+      - name: Test (batched)
+        run: npm run test:ci
+        env:
+          SKIP_SOLVER_CONTRACT: "1"
+
+  solver-contract:
+    name: solver contract (TS↔Pydantic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install worker deps
+        working-directory: worker
+        run: npm ci
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.12.18"
+          enable-cache: true
+
+      # Reproducible solver env from the committed lockfile (provisions Python
+      # 3.11 + pydantic/ortools). validate-problem.py only needs pydantic, but
+      # `uv run --project solver` resolves the whole project.
+      - name: Sync solver env
+        working-directory: solver
+        run: uv sync --frozen
+
+      # Runs solver-contract.test.ts only — it shells out to
+      # `uv run --project ../solver` to validate built problems against the real
+      # Pydantic schema, catching TS↔solver wire drift.
+      - name: Run contract test
+        working-directory: worker
+        run: npx vitest run test/planning/solver-contract.test.ts
+
+  solver:
+    name: solver unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: solver
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.12.18"
+          enable-cache: true
+
+      # tests/perf holds wall-clock budgets tuned to one machine; they are not
+      # a correctness signal on shared CI runners.
+      - name: Test
+        run: uv run --frozen --extra dev pytest -q --ignore=tests/perf

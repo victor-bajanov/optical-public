@@ -1,0 +1,40 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Optical Test Fixtures//EN
+CALSCALE:GREGORIAN
+BEGIN:VEVENT
+UID:malformed-mixed-valid-1@fixtures.test
+DTSTAMP:20260701T000000Z
+DTSTART;TZID=Australia/Sydney:20260825T090000
+DTEND;TZID=Australia/Sydney:20260825T100000
+SUMMARY:Valid event before the broken ones
+END:VEVENT
+BEGIN:VEVENT
+UID:malformed-mixed-no-dtstart@fixtures.test
+DTSTAMP:20260701T000000Z
+DTEND;TZID=Australia/Sydney:20260826T100000
+SUMMARY:Broken: no DTSTART at all
+END:VEVENT
+BEGIN:VEVENT
+UID:malformed-mixed-bad-order@fixtures.test
+DTSTAMP:20260701T000000Z
+DTSTART;TZID=Australia/Sydney:20260826T100000
+DTEND;TZID=Australia/Sydney:20260826T090000
+SUMMARY:Broken: DTEND is before DTSTART
+END:VEVENT
+BEGIN:VEVENT
+UID:malformed-mixed-valid-2@fixtures.test
+DTSTAMP:20260701T000000Z
+DTSTART;TZID=Australia/Sydney:20260827T090000
+THIS LINE HAS NO COLON AND IS NOT A VALID PROPERTY
+DTEND;TZID=Australia/Sydney:20260827T100000
+SUMMARY:Valid event with one garbage property line mixed in
+END:VEVENT
+BEGIN:VEVENT
+UID:malformed-mixed-valid-3@fixtures.test
+DTSTAMP:20260701T000000Z
+DTSTART;TZID=Australia/Sydney:20260828T090000
+DTEND;TZID=Australia/Sydney:20260828T100000
+SUMMARY:Valid event after the broken ones
+END:VEVENT
+END:VCALENDAR

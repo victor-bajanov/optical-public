@@ -1,0 +1,9 @@
+{
+  "schedule_count": 7,
+  "dropped_count": 0,
+  "objective_keys": ["churn", "daily_cap", "drop", "fit", "lateness", "preferred_window", "streak_cap"],
+  "pinned_positions": {
+    "pilates-fri#0": "2026-05-22T19:00:00",
+    "client-meeting#0": "2026-05-19T10:00:00"
+  }
+}

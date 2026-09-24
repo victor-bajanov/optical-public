@@ -1,0 +1,16 @@
+P1 PASS — poll poll_abc123 created
+P2 PASS — both invitees registered, unresponded (email CONTENT not verified — see KNOWN GAP)
+P3 FAIL — aggregate missing freeWho/ifNeededWho (decision D3/M3 contract): None
+P4 PASS — invitee B painted the same cells ['2026-09-03T09:00'] (overlapping)
+
+CLEANUP — cleaned:
+  - 1 poll row(s) + cascaded poll_invitees/poll_responses/bookings wiped from D1
+CLEANUP — NOT cleaned:
+
+=== SUMMARY ===
+PASS  P1  poll poll_abc123 created
+PASS  P2  both invitees registered, unresponded (email CONTENT not verified — see KNOWN GAP)
+FAIL  P3  aggregate missing freeWho/ifNeededWho (decision D3/M3 contract): None
+PASS  P4  invitee B painted the same cells ['2026-09-03T09:00'] (overlapping)
+
+1 step(s) FAILED

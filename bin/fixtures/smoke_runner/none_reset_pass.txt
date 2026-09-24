@@ -1,0 +1,12 @@
+active account: a@example.com
+starting Monday: 2026-09-07
+wiped harness D1: 3 task(s) + 1 template(s)
+wiped harness polls: 2 poll(s) (+ cascaded invitees/responses/bookings)
+existing events in next year: 14
+deleted 14 events
+  seeded week 1/5 (2026-09-07): 22 events
+  seeded week 2/5 (2026-09-14): 22 events
+  seeded week 3/5 (2026-09-21): 22 events
+  seeded week 4/5 (2026-09-28): 22 events
+  seeded week 5/5 (2026-10-05): 22 events
+seeded 110 events across 2026-09-07 → 2026-10-05

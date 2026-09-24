@@ -1,0 +1,16 @@
+[
+  {
+    "id": "g-external-1",
+    "summary": "Client meeting",
+    "start": "2026-05-19T11:00:00Z",
+    "end": "2026-05-19T12:00:00Z",
+    "extendedProperties": {}
+  },
+  {
+    "id": "g-owned-1",
+    "summary": "Old scheduler chunk",
+    "start": "2026-05-19T13:00:00Z",
+    "end": "2026-05-19T14:00:00Z",
+    "extendedProperties": { "private": { "scheduler_chunk_id": "stale-chunk-1" } }
+  }
+]
