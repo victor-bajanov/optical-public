@@ -1,0 +1,22 @@
+B=b@example.com  C=c@example.com
+isolated week: Monday 2026-09-07
+2A starting...
+2A SKIP: feature OFF or B not consented
+  2A: PASS  (0.1s)  SKIP: feature OFF or B not consented
+2B starting...
+2B SKIP: feature OFF or B not consented
+  2B: PASS  (0.1s)  SKIP: feature OFF or B not consented
+2C starting...
+2C SKIP: feature OFF or B not consented
+  2C: PASS  (0.1s)  SKIP: feature OFF or B not consented
+2D starting...
+2D SKIP: feature OFF or B not consented
+  2D: PASS  (0.1s)  SKIP: feature OFF or B not consented
+2E starting...
+2E SKIP: feature OFF or B not consented
+  2E: PASS  (0.1s)  SKIP: feature OFF or B not consented
+2F starting...
+2F SKIP: feature OFF or B not consented
+  2F: PASS  (0.1s)  SKIP: feature OFF or B not consented
+TOTAL pass=0 skipped=6 of 6
+ALL SCENARIOS SKIPPED — the live owned-meetings path was never exercised (feature OFF, or accounts not re-consented to calendar.freebusy / calendar.acls). This is NOT a pass.

@@ -1,0 +1,19 @@
+{
+  "window": {"start": "2026-05-18T00:00:00", "end": "2026-05-25T00:00:00", "tz": "UTC"},
+  "weights": {"time_of_day_fit_per_15min": 0, "churn_per_15min_moved": 0, "priority_unit": 1, "base_drop_penalty": 200},
+  "contexts": [
+    {
+      "context": "meeting",
+      "fit_curve": {"peak_start": "10:00", "peak_end": "11:00", "falloff_end": "17:00"},
+      "max_minutes_per_day": null,
+      "max_contiguous_minutes": null,
+      "over_daily_cap_penalty_per_15min": 0,
+      "over_streak_cap_penalty_per_15min": 0
+    }
+  ],
+  "tasks": [],
+  "external_pinned": [
+    {"id": "ext-a", "title": "Double-booked A", "start": "2026-05-19T11:00:00", "duration_minutes": 60, "context": "meeting"},
+    {"id": "ext-b", "title": "Double-booked B", "start": "2026-05-19T11:00:00", "duration_minutes": 60, "context": "meeting"}
+  ]
+}

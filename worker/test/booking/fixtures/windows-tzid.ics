@@ -1,0 +1,12 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Optical Test Fixtures//EN
+CALSCALE:GREGORIAN
+BEGIN:VEVENT
+UID:windows-tzid-1@fixtures.test
+DTSTAMP:20260701T000000Z
+DTSTART;TZID=AUS Eastern Standard Time:20260820T100000
+DTEND;TZID=AUS Eastern Standard Time:20260820T110000
+SUMMARY:Meeting exported by Outlook/Exchange (Windows zone name)
+END:VEVENT
+END:VCALENDAR

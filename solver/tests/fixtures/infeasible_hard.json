@@ -1,0 +1,45 @@
+{
+  "window": {"start": "2026-05-18T00:00:00", "end": "2026-05-25T00:00:00", "tz": "UTC"},
+  "weights": {"time_of_day_fit_per_15min": 0, "churn_per_15min_moved": 0, "priority_unit": 1, "base_drop_penalty": 200},
+  "contexts": [
+    {
+      "context": "meeting",
+      "fit_curve": {"peak_start": "10:00", "peak_end": "11:00", "falloff_end": "17:00"},
+      "max_minutes_per_day": null,
+      "max_contiguous_minutes": null,
+      "over_daily_cap_penalty_per_15min": 0,
+      "over_streak_cap_penalty_per_15min": 0
+    }
+  ],
+  "tasks": [
+    {
+      "id": "pin-a",
+      "title": "Meeting A",
+      "context": "meeting",
+      "priority": 90,
+      "chunks": [{"chunk_id": "pin-a#0", "duration_minutes": 60}],
+      "group_policy": {"same_day": false, "ordered": false},
+      "deadline": null,
+      "earliest_start": "2026-05-18T00:00:00",
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": "2026-05-19T11:00:00",
+      "previous_placement": []
+    },
+    {
+      "id": "pin-b",
+      "title": "Meeting B",
+      "context": "meeting",
+      "priority": 90,
+      "chunks": [{"chunk_id": "pin-b#0", "duration_minutes": 60}],
+      "group_policy": {"same_day": false, "ordered": false},
+      "deadline": null,
+      "earliest_start": "2026-05-18T00:00:00",
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": "2026-05-19T11:00:00",
+      "previous_placement": []
+    }
+  ],
+  "external_pinned": []
+}

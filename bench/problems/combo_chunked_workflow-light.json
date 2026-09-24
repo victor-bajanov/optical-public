@@ -1,0 +1,258 @@
+{
+ "id": "combo_chunked_workflow-light",
+ "meta": {
+  "scenario": "combo_chunked_workflow",
+  "size": "light",
+  "seed": 154524184,
+  "generator_version": 2,
+  "description": "",
+  "rules": [
+   "deadline_soft",
+   "dependency_after_task",
+   "group_ordered",
+   "group_same_day",
+   "multi_chunk"
+  ],
+  "rules_detected": [
+   "business_hours",
+   "daily_cap",
+   "deadline_soft",
+   "dependency_after_task",
+   "external_pinned",
+   "fit_curve",
+   "group_ordered",
+   "group_same_day",
+   "multi_chunk",
+   "streak_cap"
+  ],
+  "expected_status": "sat",
+  "expectations": {},
+  "n_tasks": 3,
+  "n_chunks": 7,
+  "n_external": 3,
+  "grid_events": 10,
+  "horizon_slots": 672
+ },
+ "problem": {
+  "window": {
+   "start": "2026-05-18T00:00:00",
+   "end": "2026-05-25T00:00:00",
+   "tz": "Australia/Sydney"
+  },
+  "weights": {
+   "preferred_day_miss": 40,
+   "preferred_time_miss_per_15min": 5,
+   "time_of_day_fit_per_15min": 5,
+   "churn_per_15min_moved": 50,
+   "priority_unit": 1,
+   "base_drop_penalty": 200
+  },
+  "contexts": [
+   {
+    "context": "deep",
+    "fit_curve": {
+     "peak_start": "09:00:00",
+     "peak_end": "12:00:00",
+     "falloff_end": "15:00:00"
+    },
+    "max_minutes_per_day": 240,
+    "max_contiguous_minutes": 90,
+    "over_daily_cap_penalty_per_15min": 25,
+    "over_streak_cap_penalty_per_15min": 25
+   },
+   {
+    "context": "admin",
+    "fit_curve": {
+     "peak_start": "13:00:00",
+     "peak_end": "17:00:00",
+     "falloff_end": "18:00:00"
+    },
+    "max_minutes_per_day": null,
+    "max_contiguous_minutes": null,
+    "over_daily_cap_penalty_per_15min": 25,
+    "over_streak_cap_penalty_per_15min": 25
+   },
+   {
+    "context": "physical",
+    "fit_curve": {
+     "peak_start": "16:00:00",
+     "peak_end": "18:00:00",
+     "falloff_end": "20:00:00"
+    },
+    "max_minutes_per_day": null,
+    "max_contiguous_minutes": null,
+    "over_daily_cap_penalty_per_15min": 25,
+    "over_streak_cap_penalty_per_15min": 25
+   },
+   {
+    "context": "family",
+    "fit_curve": {
+     "peak_start": "17:00:00",
+     "peak_end": "20:00:00",
+     "falloff_end": "21:00:00"
+    },
+    "max_minutes_per_day": null,
+    "max_contiguous_minutes": null,
+    "over_daily_cap_penalty_per_15min": 25,
+    "over_streak_cap_penalty_per_15min": 25
+   },
+   {
+    "context": "meeting",
+    "fit_curve": {
+     "peak_start": "10:00:00",
+     "peak_end": "16:00:00",
+     "falloff_end": "17:00:00"
+    },
+    "max_minutes_per_day": null,
+    "max_contiguous_minutes": null,
+    "over_daily_cap_penalty_per_15min": 25,
+    "over_streak_cap_penalty_per_15min": 25
+   }
+  ],
+  "tasks": [
+   {
+    "id": "task-0",
+    "title": "Task 0 (meeting)",
+    "context": "meeting",
+    "priority": 69,
+    "chunks": [
+     {
+      "chunk_id": "task-0#0",
+      "duration_minutes": 30
+     },
+     {
+      "chunk_id": "task-0#1",
+      "duration_minutes": 30
+     },
+     {
+      "chunk_id": "task-0#2",
+      "duration_minutes": 30
+     }
+    ],
+    "group_policy": {
+     "same_day": true,
+     "ordered": true
+    },
+    "deadline": {
+     "at": "2026-05-20T17:00:00",
+     "hard": false,
+     "penalty_per_15min": 3
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-1",
+    "title": "Task 1 (physical)",
+    "context": "physical",
+    "priority": 83,
+    "chunks": [
+     {
+      "chunk_id": "task-1#0",
+      "duration_minutes": 15
+     },
+     {
+      "chunk_id": "task-1#1",
+      "duration_minutes": 45
+     }
+    ],
+    "group_policy": {
+     "same_day": false,
+     "ordered": true
+    },
+    "deadline": {
+     "at": "2026-05-21T17:00:00",
+     "hard": false,
+     "penalty_per_15min": 4
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [
+     {
+      "type": "after_task",
+      "ref": "task-0",
+      "hard": true
+     }
+    ],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   },
+   {
+    "id": "task-2",
+    "title": "Task 2 (deep)",
+    "context": "deep",
+    "priority": 20,
+    "chunks": [
+     {
+      "chunk_id": "task-2#0",
+      "duration_minutes": 15
+     },
+     {
+      "chunk_id": "task-2#1",
+      "duration_minutes": 30
+     }
+    ],
+    "group_policy": {
+     "same_day": true,
+     "ordered": true
+    },
+    "deadline": {
+     "at": "2026-05-20T17:00:00",
+     "hard": false,
+     "penalty_per_15min": 2
+    },
+    "earliest_start": "2026-05-18T00:00:00",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "previous_placement": [],
+    "must_include": false,
+    "availability_windows": [],
+    "churn_multiplier": 1
+   }
+  ],
+  "external_pinned": [
+   {
+    "id": "ext-0",
+    "title": "External 0",
+    "start": "2026-05-22T13:00:00",
+    "duration_minutes": 60,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-1",
+    "title": "External 1",
+    "start": "2026-05-23T13:00:00",
+    "duration_minutes": 60,
+    "context": "meeting"
+   },
+   {
+    "id": "ext-2",
+    "title": "External 2",
+    "start": "2026-05-19T09:00:00",
+    "duration_minutes": 45,
+    "context": "meeting"
+   }
+  ],
+  "business_hours": {
+   "days": [
+    "mon",
+    "tue",
+    "wed",
+    "thu",
+    "fri"
+   ],
+   "start": "09:00:00",
+   "end": "17:00:00"
+  }
+ }
+}

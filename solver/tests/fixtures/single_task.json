@@ -1,0 +1,36 @@
+{
+  "window": {"start": "2026-05-18T00:00:00", "end": "2026-05-25T00:00:00", "tz": "Australia/Sydney"},
+  "weights": {
+    "time_of_day_fit_per_15min": 5,
+    "churn_per_15min_moved": 10,
+    "priority_unit": 1,
+    "base_drop_penalty": 200
+  },
+  "contexts": [
+    {
+      "context": "deep",
+      "fit_curve": {"peak_start": "09:00", "peak_end": "12:00", "falloff_end": "16:00"},
+      "max_minutes_per_day": 240,
+      "max_contiguous_minutes": 90,
+      "over_daily_cap_penalty_per_15min": 25,
+      "over_streak_cap_penalty_per_15min": 25
+    }
+  ],
+  "tasks": [
+    {
+      "id": "task-1",
+      "title": "Review draft",
+      "context": "deep",
+      "priority": 70,
+      "chunks": [{"chunk_id": "task-1#0", "duration_minutes": 60}],
+      "group_policy": {"same_day": false, "ordered": false},
+      "deadline": {"at": "2026-05-21T17:00:00", "hard": false, "penalty_per_15min": 30},
+      "earliest_start": "2026-05-18T00:00:00",
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": null,
+      "previous_placement": []
+    }
+  ],
+  "external_pinned": []
+}

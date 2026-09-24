@@ -1,0 +1,39 @@
+[
+  {
+    "id": "task-deep-1",
+    "title": "APOLLO quarterly draft",
+    "context": "deep",
+    "priority": 80,
+    "duration_minutes": 90,
+    "deadline": { "at": "2026-05-22T17:00:00Z", "hard": false, "penalty_per_15min": 30 },
+    "earliest_start": "2026-05-18T00:00:00Z",
+    "preferred_windows": [
+      { "days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "12:00", "hard": false }
+    ],
+    "dependencies": [],
+    "pinned_at": null,
+    "template_id": null,
+    "project_id": null,
+    "source": { "kind": "mcp", "external_id": null },
+    "status": "pending",
+    "created_at": "2026-05-17T00:00:00Z",
+    "updated_at": "2026-05-17T00:00:00Z"
+  },
+  {
+    "id": "task-admin-1",
+    "title": "Email triage",
+    "context": "admin",
+    "priority": 30,
+    "duration_minutes": 30,
+    "earliest_start": "2026-05-18T00:00:00Z",
+    "preferred_windows": [],
+    "dependencies": [],
+    "pinned_at": null,
+    "template_id": null,
+    "project_id": null,
+    "source": { "kind": "mcp", "external_id": null },
+    "status": "pending",
+    "created_at": "2026-05-17T00:00:00Z",
+    "updated_at": "2026-05-17T00:00:00Z"
+  }
+]

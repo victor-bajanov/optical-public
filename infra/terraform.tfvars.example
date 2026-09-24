@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+
+cloudflare_account_id = "REPLACE_WITH_YOUR_ACCOUNT_ID"
+cloudflare_zone_id    = "REPLACE_WITH_YOUR_ZONE_ID"
+subdomain             = "scheduler"
+zone_name             = "yourdomain.example"
+operator_email        = "you@yourdomain.example"
+# Second identity for the ISOLATED dev Access app only (multi-user smoke harness).
+sandbox_operator_email = "sandbox@gmail.example"

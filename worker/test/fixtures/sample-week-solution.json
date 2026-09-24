@@ -1,0 +1,20 @@
+{
+  "schedule": [
+    {
+      "task_id": "task-deep-1",
+      "chunk_index": 0,
+      "start": "2026-05-19T09:00:00Z",
+      "end": "2026-05-19T10:30:00Z",
+      "context": "deep"
+    },
+    {
+      "task_id": "task-admin-1",
+      "chunk_index": 0,
+      "start": "2026-05-19T14:00:00Z",
+      "end": "2026-05-19T14:30:00Z",
+      "context": "admin"
+    }
+  ],
+  "dropped": [],
+  "objective_value": 120
+}

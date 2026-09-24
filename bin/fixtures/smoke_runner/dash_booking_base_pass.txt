@@ -1,0 +1,8 @@
+SETUP — TURNSTILE_SECRET swapped to Cloudflare's test secret for this run
+B3 PASS — 4 bookable slot(s); first is 2026-09-03T09:00:00+10:00
+SETUP — waited 6s for the TURNSTILE_SECRET swap to reach the edge
+B6 PASS — claimed 2026-09-03T09:00:00+10:00 as booking bk_abc123 (location_kind=phone)
+ALL PASS
+CLEANUP — cleaned:
+  - booking bk_abc123 deleted
+CLEANUP — NOT cleaned:

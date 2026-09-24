@@ -1,0 +1,122 @@
+{
+  "window": {"start": "2026-05-18T00:00:00", "end": "2026-05-25T00:00:00", "tz": "Australia/Sydney"},
+  "weights": {
+    "time_of_day_fit_per_15min": 5,
+    "churn_per_15min_moved": 10,
+    "priority_unit": 1,
+    "base_drop_penalty": 200
+  },
+  "contexts": [
+    {
+      "context": "deep",
+      "fit_curve": {"peak_start": "09:00", "peak_end": "12:00", "falloff_end": "16:00"},
+      "max_minutes_per_day": 240,
+      "max_contiguous_minutes": 90,
+      "over_daily_cap_penalty_per_15min": 25,
+      "over_streak_cap_penalty_per_15min": 25
+    },
+    {
+      "context": "admin",
+      "fit_curve": {"peak_start": "13:00", "peak_end": "17:00", "falloff_end": "17:00"},
+      "max_minutes_per_day": 120,
+      "max_contiguous_minutes": 60,
+      "over_daily_cap_penalty_per_15min": 25,
+      "over_streak_cap_penalty_per_15min": 25
+    },
+    {
+      "context": "physical",
+      "fit_curve": {"peak_start": "16:00", "peak_end": "20:00", "falloff_end": "22:00"},
+      "max_minutes_per_day": null,
+      "max_contiguous_minutes": null,
+      "over_daily_cap_penalty_per_15min": 0,
+      "over_streak_cap_penalty_per_15min": 0
+    },
+    {
+      "context": "meeting",
+      "fit_curve": {"peak_start": "10:00", "peak_end": "11:00", "falloff_end": "17:00"},
+      "max_minutes_per_day": 180,
+      "max_contiguous_minutes": 120,
+      "over_daily_cap_penalty_per_15min": 25,
+      "over_streak_cap_penalty_per_15min": 25
+    }
+  ],
+  "tasks": [
+    {
+      "id": "deep-a",
+      "title": "Review APOLLO draft",
+      "context": "deep",
+      "priority": 80,
+      "chunks": [{"chunk_id": "deep-a#0", "duration_minutes": 90}],
+      "group_policy": {"same_day": false, "ordered": false},
+      "deadline": {"at": "2026-05-20T17:00:00", "hard": false, "penalty_per_15min": 30},
+      "earliest_start": "2026-05-18T00:00:00",
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": null,
+      "previous_placement": []
+    },
+    {
+      "id": "deep-b",
+      "title": "Write specification",
+      "context": "deep",
+      "priority": 70,
+      "chunks": [
+        {"chunk_id": "deep-b#0", "duration_minutes": 90},
+        {"chunk_id": "deep-b#1", "duration_minutes": 90}
+      ],
+      "group_policy": {"same_day": false, "ordered": false},
+      "deadline": {"at": "2026-05-22T17:00:00", "hard": false, "penalty_per_15min": 21},
+      "earliest_start": "2026-05-18T00:00:00",
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": null,
+      "previous_placement": []
+    },
+    {
+      "id": "admin-1",
+      "title": "Email triage",
+      "context": "admin",
+      "priority": 40,
+      "chunks": [
+        {"chunk_id": "admin-1#0", "duration_minutes": 60},
+        {"chunk_id": "admin-1#1", "duration_minutes": 60}
+      ],
+      "group_policy": {"same_day": false, "ordered": false},
+      "deadline": null,
+      "earliest_start": "2026-05-18T00:00:00",
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": null,
+      "previous_placement": []
+    },
+    {
+      "id": "pilates-fri",
+      "title": "Pilates",
+      "context": "physical",
+      "priority": 60,
+      "chunks": [{"chunk_id": "pilates-fri#0", "duration_minutes": 90}],
+      "group_policy": {"same_day": false, "ordered": false},
+      "deadline": null,
+      "earliest_start": "2026-05-18T00:00:00",
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": "2026-05-22T19:00:00",
+      "previous_placement": []
+    },
+    {
+      "id": "client-meeting",
+      "title": "Client review",
+      "context": "meeting",
+      "priority": 90,
+      "chunks": [{"chunk_id": "client-meeting#0", "duration_minutes": 60}],
+      "group_policy": {"same_day": false, "ordered": false},
+      "deadline": null,
+      "earliest_start": "2026-05-18T00:00:00",
+      "preferred_windows": [],
+      "dependencies": [],
+      "pinned_at": "2026-05-19T10:00:00",
+      "previous_placement": []
+    }
+  ],
+  "external_pinned": []
+}

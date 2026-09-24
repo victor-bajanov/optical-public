@@ -1,0 +1,8 @@
+
+CLEANUP — cleaned:
+CLEANUP — NOT cleaned:
+  - manually run the wrangler d1 execute cleanup command from the runbook (D1_DATABASE_ID not set)
+
+=== SUMMARY ===
+
+nothing genuinely exercised

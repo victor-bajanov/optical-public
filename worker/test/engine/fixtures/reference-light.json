@@ -1,0 +1,611 @@
+{
+ "availability_windows-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "baseline-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "business_hours-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "churn-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "combo_chunked_workflow-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "combo_deadline_window-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 150,
+   "lateness": 0,
+   "preferred_window": 40,
+   "streak_cap": 0
+  },
+  "objective_total": 190,
+  "status": "OPTIMAL"
+ },
+ "combo_kitchen_sink-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5"
+  ],
+  "objective_components": {
+   "churn": 9850,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 385,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 10235,
+  "status": "OPTIMAL"
+ },
+ "combo_meeting-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 155,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 155,
+  "status": "OPTIMAL"
+ },
+ "combo_oversubscribed-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 220,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 220,
+  "status": "OPTIMAL"
+ },
+ "combo_replan-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 10150,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 1345,
+   "lateness": 0,
+   "preferred_window": 170,
+   "streak_cap": 0
+  },
+  "objective_total": 11665,
+  "status": "OPTIMAL"
+ },
+ "context_caps-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 50
+  },
+  "objective_total": 50,
+  "status": "OPTIMAL"
+ },
+ "deadline_hard-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "deadline_soft-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "dependencies-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "earliest_start-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "edge_empty_hard_window-light": {
+  "drop_reasons": {
+   "task-0": "drop_was_cheaper_than_alternatives"
+  },
+  "dropped": [
+   "task-0"
+  ],
+  "kept": [
+   "task-1"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 290,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 290,
+  "status": "OPTIMAL"
+ },
+ "edge_must_include_demotion-light": {
+  "drop_reasons": {
+   "task-0": "must_include_unplaceable_in_isolation"
+  },
+  "dropped": [
+   "task-0"
+  ],
+  "kept": [
+   "task-1"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 250,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 250,
+  "status": "OPTIMAL"
+ },
+ "edge_soft_dependency_ignored-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "edge_unsat_must_include-light": {
+  "objective_components": null,
+  "objective_total": null,
+  "status": "UNSAT",
+  "unsat_core": [
+   {
+    "ref": null,
+    "task_id": "task-0",
+    "type": "task_present",
+    "value": null
+   },
+   {
+    "ref": null,
+    "task_id": "task-0",
+    "type": "pinned_at",
+    "value": "2026-05-19T10:00:00"
+   },
+   {
+    "ref": null,
+    "task_id": "task-1",
+    "type": "task_present",
+    "value": null
+   },
+   {
+    "ref": null,
+    "task_id": "task-1",
+    "type": "pinned_at",
+    "value": "2026-05-19T10:00:00"
+   }
+  ]
+ },
+ "fit_curve-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "group_ordered-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "group_same_day-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "must_include-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "pinned_at-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "preferred_window_hard-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ },
+ "preferred_window_soft-light": {
+  "drop_reasons": {},
+  "dropped": [],
+  "kept": [
+   "task-0",
+   "task-1",
+   "task-2",
+   "task-3",
+   "task-4",
+   "task-5",
+   "task-6"
+  ],
+  "objective_components": {
+   "churn": 0,
+   "daily_cap": 0,
+   "drop": 0,
+   "fit": 0,
+   "lateness": 0,
+   "preferred_window": 0,
+   "streak_cap": 0
+  },
+  "objective_total": 0,
+  "status": "OPTIMAL"
+ }
+}

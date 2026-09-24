@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+.pytest_cache
+.venv
+.uv-cache
+tests/
+docs/
+.git
+.gitignore
+README.md
+node_modules/
+cf-worker.ts
+wrangler.toml
+package.json
+package-lock.json
+tsconfig.json
