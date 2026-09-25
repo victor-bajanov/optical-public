@@ -3,6 +3,13 @@
 Curated notes for each public release, newest first. The full commit list for
 a release is in that release's PR on the public repository.
 
+## v1.0.2
+
+- **Licence:** the Licensed Work is now "Optical 1.0.0 or later", so point
+  releases are covered without editing the licence, and each release converts
+  to Apache 2.0 four years after it is published (previously a single Change
+  Date of 2029-09-22 for everything). The Additional Use Grant is unchanged.
+
 ## v1.0.1
 
 - **README:** new "Using it from an AI assistant (MCP)" section. It points
