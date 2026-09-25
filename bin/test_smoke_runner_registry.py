@@ -113,6 +113,13 @@ def expect_blocked(harness_name, mode, target, env, identities, cfg, **kwargs) -
     return ei.value.reason
 
 
+@pytest.fixture(autouse=True)
+def _pin_weekday(monkeypatch):
+    """poll-smoke's advisory Mon-Thu gate reads reg._today(); pin a Thursday so
+    tests composing poll-smoke don't fail Fri-Sun. Day-gate tests re-pin."""
+    monkeypatch.setattr(reg, "_today", lambda: date(2024, 1, 4))  # Thursday
+
+
 @pytest.fixture
 def google_only_target(monkeypatch):
     """A synthetic, Google-only target no registered mode lists — the dev

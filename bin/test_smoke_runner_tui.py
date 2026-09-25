@@ -55,6 +55,13 @@ MICROSOFT_TARGET = "dev"
 
 # =============================================================================
 # Fixtures / helpers
+
+
+@pytest.fixture(autouse=True)
+def _pin_weekday(monkeypatch):
+    """poll-smoke's advisory Mon-Thu gate reads reg._today(); pin a Thursday so
+    tests queueing poll-smoke don't fail Fri-Sun. Day-gate tests re-pin."""
+    monkeypatch.setattr(reg, "_today", lambda: date(2024, 1, 4))  # Thursday
 # =============================================================================
 
 START = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)  # a Tuesday
