@@ -107,5 +107,6 @@ process.
 ## Licence
 
 [Business Source License 1.1](LICENSE). Free for production use by
-organisations with annual revenue up to AUD $10M; converts to Apache 2.0 on
-2029-09-22. For other licensing, contact info@optical-scheduler.com.
+organisations with annual revenue up to AUD $10M. Each release converts to
+Apache 2.0 four years after it is published. For other licensing, contact
+info@optical-scheduler.com.
