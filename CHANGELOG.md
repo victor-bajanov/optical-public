@@ -3,6 +3,13 @@
 Curated notes for each public release, newest first. The full commit list for
 a release is in that release's PR on the public repository.
 
+## v1.0.1
+
+- **README:** new "Using it from an AI assistant (MCP)" section. It points
+  to [codemode-mcp](https://github.com/victor-bajanov/codemode-mcp-public),
+  whose `optical` provider puts a code-mode MCP server in front of the Optical
+  API for Claude and other MCP clients.
+
 ## v1.0.0
 
 First public release of Optical under the Business Source License 1.1.

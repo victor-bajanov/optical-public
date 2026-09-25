@@ -74,6 +74,19 @@ To smoke the Microsoft 365 provider, set `MS_PROVIDER_ENABLED = "true"` and
 the `MICROSOFT_*` vars under `[env.dev]` and run the `bin/` harnesses with
 `--provider microsoft` against dev (runbook §O).
 
+## Using it from an AI assistant (MCP)
+
+Optical is an HTTP API; to drive it from Claude or any other MCP client, put
+[codemode-mcp](https://github.com/victor-bajanov/codemode-mcp-public) in
+front of it. Its `optical` provider (`packages/providers/optical`, deployed
+as the `apps/optical` Worker) exposes the Optical API (tasks, resolve and
+accept, meeting polls, booking pages, cost curves) as a code-mode MCP server,
+signing in to your deployment through an OAuth 2.1 PKCE client registered in
+Optical's `oauth_clients` table. Setup steps are in that repo's
+`apps/optical/README.md`. The provider's OAuth scopes must match the scopes
+your Optical deployment allows, so redeploy both together when either
+changes.
+
 ## Development
 
 ```bash
