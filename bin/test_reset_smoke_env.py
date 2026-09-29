@@ -81,6 +81,13 @@ def test_mu_smoke_template_title_is_harness_row():
     assert rse.is_harness_row(row, rse.HARNESS_TITLE_PREFIXES) is True
 
 
+def test_tzsmoke_task_title_is_harness_row():
+    # bin/timezone-smoke.py's fixtures ("[tzsmoke] task N"); a crashed run
+    # can leave them behind.
+    row = {"title": "[tzsmoke] task 0"}
+    assert rse.is_harness_row(row, rse.HARNESS_TITLE_PREFIXES) is True
+
+
 def test_real_user_row_is_not_harness_row():
     row = {"title": "Write memo"}
     assert rse.is_harness_row(row, rse.HARNESS_TITLE_PREFIXES) is False

@@ -3,6 +3,7 @@ import {
   toLocalNaive,
   fromLocalNaive,
   localWeekWindow,
+  upcomingLocalWeekWindow,
   ceilToQuarter,
   computePlacementFloor,
   isWeekFullyPast,
@@ -154,5 +155,72 @@ describe("localWeekWindow", () => {
       start: "2026-01-11T13:00:00.000Z",
       end: "2026-01-18T13:00:00.000Z",
     });
+  });
+});
+
+describe("upcomingLocalWeekWindow", () => {
+  // The Monday cron fires at Sun 15:00 UTC. That instant is Mon 01:00/02:00 in
+  // Sydney but still Sunday anywhere west of about UTC+9, so "the week
+  // containing now" would re-resolve the ENDING week there. The cron wants the
+  // week starting on each user's nearest local Monday (plan decision 7).
+  const CRON_BST = "2026-05-17T15:00:00.000Z"; // Sun 17 May; Sydney AEST, London BST
+  const CRON_GMT = "2026-01-11T15:00:00.000Z"; // Sun 11 Jan; Sydney AEDT, London GMT
+
+  it("Sydney (AEST): the week just starting, same as localWeekWindow(now)", () => {
+    expect(upcomingLocalWeekWindow(CRON_BST, SYD)).toEqual({
+      start: "2026-05-17T14:00:00.000Z", // Mon 18 May 00:00 AEST
+      end: "2026-05-24T14:00:00.000Z",
+    });
+    expect(upcomingLocalWeekWindow(CRON_BST, SYD)).toEqual(localWeekWindow(CRON_BST, SYD));
+  });
+
+  it("Sydney (AEDT): the week just starting", () => {
+    expect(upcomingLocalWeekWindow(CRON_GMT, SYD)).toEqual({
+      start: "2026-01-11T13:00:00.000Z", // Mon 12 Jan 00:00 AEDT
+      end: "2026-01-18T13:00:00.000Z",
+    });
+  });
+
+  it("London (BST): next Monday's week, not the ending one", () => {
+    // Sun 16:00 BST: localWeekWindow(now) would be the week of Mon 11 May.
+    expect(localWeekWindow(CRON_BST, "Europe/London").start).toBe("2026-05-10T23:00:00.000Z");
+    expect(upcomingLocalWeekWindow(CRON_BST, "Europe/London")).toEqual({
+      start: "2026-05-17T23:00:00.000Z", // Mon 18 May 00:00 BST
+      end: "2026-05-24T23:00:00.000Z",
+    });
+  });
+
+  it("London (GMT): next Monday's week", () => {
+    expect(upcomingLocalWeekWindow(CRON_GMT, "Europe/London")).toEqual({
+      start: "2026-01-12T00:00:00.000Z", // Mon 12 Jan 00:00 GMT
+      end: "2026-01-19T00:00:00.000Z",
+    });
+  });
+
+  it("America/Los_Angeles (PDT): next Monday's week", () => {
+    expect(upcomingLocalWeekWindow(CRON_BST, "America/Los_Angeles")).toEqual({
+      start: "2026-05-18T07:00:00.000Z", // Mon 18 May 00:00 PDT
+      end: "2026-05-25T07:00:00.000Z",
+    });
+  });
+
+  it("Pacific/Kiritimati (UTC+14): the Monday that has just passed", () => {
+    // Mon 18 May 05:00 local at fire time — the easternmost edge.
+    expect(upcomingLocalWeekWindow(CRON_BST, "Pacific/Kiritimati")).toEqual({
+      start: "2026-05-17T10:00:00.000Z", // Mon 18 May 00:00 +14
+      end: "2026-05-24T10:00:00.000Z",
+    });
+  });
+
+  it("Etc/GMT+12 (UTC-12): the coming Monday", () => {
+    // Sun 17 May 03:00 local at fire time — the westernmost edge.
+    expect(upcomingLocalWeekWindow(CRON_BST, "Etc/GMT+12")).toEqual({
+      start: "2026-05-18T12:00:00.000Z", // Mon 18 May 00:00 -12
+      end: "2026-05-25T12:00:00.000Z",
+    });
+  });
+
+  it("throws on an unparseable instant, like localWeekWindow", () => {
+    expect(() => upcomingLocalWeekWindow("not-a-date", SYD)).toThrow(/invalid ISO datetime/);
   });
 });

@@ -119,6 +119,9 @@ HARNESS_TITLE_PREFIXES: tuple[str, ...] = (
     "[mu-smoke]",   # bin/multiuser-smoke.py — defence in depth only: it
                     # never actually POSTs a template today, but cleans up
                     # any "[mu-smoke]"-titled one it finds
+    "[tzsmoke]",    # bin/timezone-smoke.py — its fixture task titles
+                    # ("[tzsmoke] task N"); the harness also sweeps its own
+                    # leftovers at startup
 )
 
 # Tasks identifiable only by source.external_id, not by title — for

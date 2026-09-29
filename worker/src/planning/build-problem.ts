@@ -15,6 +15,7 @@ import type {
 import { toLocalNaive, floorToQuarter, ceilToQuarter } from "./datetime";
 import { chunkIdsOfTask } from "./chunk-ids";
 import { deriveBusyBlocks } from "./busy-blocks";
+import { projectPreferredWindows, intersectMasks, maskFromWire, maskToWire } from "./window-projection";
 
 // Re-export for callers that still import these from build-problem.ts.
 export type { Weights, ContextConfig } from "./solver-contract";
@@ -112,6 +113,7 @@ function projectTask(
   completedChunkIds: Set<string>,
   meetingByTaskId: Map<string, MeetingSolverInput>,
   meetingMinNoticeMinutes: number,
+  horizonEndISO: string,
 ): WireTask {
   const ids = chunkIdsOfTask(t);
   const allChunks: Chunk[] = t.chunks
@@ -126,6 +128,10 @@ function projectTask(
   // rounded up), not the week start — so an undone task is never re-placed onto
   // an already-elapsed slot.
   const earliestStartISO = t.earliest_start ?? placementFloorISO;
+  // Windows carrying their own tz (Card E) are re-expressed in the problem tz;
+  // untimezoned ones pass through as the same array. A foreign hard window that
+  // can't be one problem-tz window comes back as a hard availability mask.
+  const projected = projectPreferredWindows(t.preferred_windows, tz, placementFloorISO, horizonEndISO);
 
   const wire: WireTask = {
     id: t.id,
@@ -138,7 +144,7 @@ function projectTask(
     // Business hours is applied solver-side as a global placement floor
     // (Problem.business_hours), not injected per-task — see solver model.py
     // _add_business_hours. Tasks carry only their own preferred_windows.
-    preferred_windows: t.preferred_windows ?? [],
+    preferred_windows: projected.preferred_windows,
     dependencies: (t.dependencies ?? []).map((d) => ({
       type: d.type,
       ref: d.ref,
@@ -155,6 +161,8 @@ function projectTask(
   if (t.pinned_at && Date.parse(t.pinned_at) >= Date.parse(placementFloorISO)) {
     wire.pinned_at = toLocalNaive(t.pinned_at, tz);
   }
+
+  if (projected.availability_windows) wire.availability_windows = projected.availability_windows;
 
   const meeting = meetingByTaskId.get(t.id);
   if (meeting) {
@@ -176,6 +184,13 @@ function projectTask(
       end: toLocalNaive(roundDownToQuarterHour(w.end), tz),
     }));
     wire.churn_multiplier = meeting.churnMultiplier;
+    if (projected.availability_windows) {
+      const horizonEndNaive = Date.parse(toLocalNaive(horizonEndISO, tz) + "Z");
+      wire.availability_windows = maskToWire(
+        intersectMasks(maskFromWire(wire.availability_windows), maskFromWire(projected.availability_windows)),
+        horizonEndNaive,
+      );
+    }
     // Churn anchor = LIVE calendar position, NOT the committed plan. Overrides
     // any previous_placement derived from previousSchedule (a moved meeting reads
     // back at its new calendar time next resolve → churn 0 → stable; see §5.6).
@@ -202,11 +217,12 @@ export function buildSolverProblem(input: BuildSolverProblemInput): Problem {
     input.placementFloor ?? input.window.start,
   );
 
+  const windowEndRoundedISO = roundUpToQuarterHour(input.window.end);
   const window: Window = {
     // start rounds DOWN, end rounds UP: conservative outer-boundary rounding
     // ensures the solver's window fully contains the real requested span.
     start: toLocalNaive(placementFloorRoundedISO, tz),
-    end: toLocalNaive(roundUpToQuarterHour(input.window.end), tz),
+    end: toLocalNaive(windowEndRoundedISO, tz),
     tz,
   };
 
@@ -246,7 +262,7 @@ export function buildSolverProblem(input: BuildSolverProblemInput): Problem {
     weights: { ...input.weights, ...(input.weightsOverride ?? {}) },
     contexts: input.contexts,
     tasks: input.tasks.map((t) =>
-      projectTask(t, prevByTaskId, tz, placementFloorRoundedISO, completedChunkIds, meetingByTaskId, input.meetingMinNoticeMinutes ?? 0),
+      projectTask(t, prevByTaskId, tz, placementFloorRoundedISO, completedChunkIds, meetingByTaskId, input.meetingMinNoticeMinutes ?? 0, windowEndRoundedISO),
     ),
     external_pinned,
     business_hours: input.businessHours ?? null,

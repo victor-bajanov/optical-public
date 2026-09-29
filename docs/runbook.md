@@ -250,7 +250,7 @@ letters.
    curl -X POST "https://<subdomain>.<zone>/admin/run-cron?subject=<email>" \
      -H "authorization: Bearer $SCHEDULER_BEARER"
    ```
-   Expect HTTP 200 with `{kind:"ok", planHash:"..."}`. The Monday-morning email is sent only when the new plan differs from the currently-committed plan — if you've just committed in Step C.3 with no other changes, you may see a no-op result.
+   Expect HTTP 200 with `{kind:"ok", planHash:"..."}`. The Monday-morning email is sent only when the new plan differs from the currently-committed plan — if you've just committed in Step C.3 with no other changes, you may see a no-op result. The route resolves the subject's **upcoming** local week (`upcomingLocalWeekWindow`, §Q), the week containing now + 3.5 days in their effective tz, exactly as the Sunday fire does. Triggered from about Thursday midday onwards, it therefore plans *next* week, not the current one. Use `POST /v1/replan-now?force=true` for the current week.
 
 - `POST /admin/run-cron?subject=<email>` — runs the Monday resolve for **one
   named subject**. The `subject` query param is **required**; a request without
@@ -362,8 +362,9 @@ bin/reset-smoke-env.py --clear-all
 ### Templates support `pinned_tz`
 
 `POST /v1/templates` accepts an optional `pinned_tz` field (IANA zone, e.g.
-`"America/New_York"`). If absent, `pinned_time` is interpreted in
-`env.SCHEDULER_TZ` (the worker's home zone). Per-template zone is what the
+`"America/New_York"`). If absent, `pinned_time` is interpreted in the
+owner's effective tz (`home_tz`, else `SCHEDULER_TZ`; §Q), so it follows the
+user when they change zone. Per-template zone is what the
 harness uses to verify a "weekly NYC team sync at 09:00 ET" template lands at
 the right wall-clock time on both sides of DST.
 
@@ -385,7 +386,7 @@ running, the DO arms a fresh alarm afterward so that change is not lost.)
 **Which week gets resolved.** The resolve does NOT re-plan a fixed forward
 window. Each changed (human, non-scheduler-owned) event is bucketed into the
 **local calendar week it falls in** — Monday 00:00 to the next Monday 00:00 in
-`SCHEDULER_TZ` (see `localWeekWindow`). The replan re-resolves exactly that week
+the subject's effective tz (see `localWeekWindow`, §Q). The replan re-resolves exactly that week
 (or each distinct week, if a debounced burst spans more than one), so an edit
 weeks ahead re-plans the week it touches — not an empty near-term window. The
 Monday cron uses the same local-Monday anchoring for the week it fires in. A
@@ -614,8 +615,8 @@ what was, or would be, sent.
 **Pending plans are per-week (week-scoped supersede).** `proposed_plans`
 carries `window_start`/`window_end` (migration 0027). Plan identity for
 supersede, accept-page grouping, tab labels, and link-window matching is the
-**local calendar week** — the [Mon 00:00, next Mon) week in `SCHEDULER_TZ`
-containing `window_start` (`localWeekWindow`) — NOT the exact (start,end) pair.
+**local calendar week** — the [Mon 00:00, next Mon) week in the subject's
+effective tz (§Q) containing `window_start` (`localWeekWindow`) — NOT the exact (start,end) pair.
 A mid-week replan legitimately narrows `window_start` to "now" (the solver must
 not place into the past), so the same week can carry differently-anchored
 windows; exact-pair identity left the Monday-anchored sibling pending and the
@@ -1173,9 +1174,9 @@ During the triggered resolve, the revive-scan is the mirror of the done-scan: it
 
 **No-loop note.** After the revive the task is `pending`, so its event no longer fits either pinhole — pinhole (a) needs the done color, pinhole (b) needs a `done` task. Future repaints of that event are therefore dropped by the webhook filter; the revive is one-shot.
 
-**Where the churn anchor comes from.** The baseline a resolve hands the solver (`tasks[].previous_placement`) is sourced in this order. First, the **committed plan for the week being resolved**: week identity is the Mon-anchored local week in `SCHEDULER_TZ`, resolved by a single `getCommittedPlanForWeek` lookup that the drop baseline also uses, so the two baselines always agree on which plan is the reference. The lookup is a SQL range over `window_start` rather than a filter over the newest N commits, so a week's plan is found however deep in the history it sits. Its entries are then filtered to those starting inside `[window.start, window.end)`, and reduced to at most one per `chunk_id` (earliest start wins) since two calendar events can carry the same `scheduler_chunk_id`. Second, if that yields nothing in-window, the **live scheduler-owned events** already fetched for the window. Otherwise the baseline is empty.
+**Where the churn anchor comes from.** The baseline a resolve hands the solver (`tasks[].previous_placement`) is sourced in this order. First, the **committed plan for the week being resolved**: week identity is the Mon-anchored local week in the subject's effective tz (and only plans produced in that tz, `window_tz`), resolved by a single `getCommittedPlanForWeek` lookup that the drop baseline also uses, so the two baselines always agree on which plan is the reference. The lookup is a SQL range over `window_start` rather than a filter over the newest N commits, so a week's plan is found however deep in the history it sits. Its entries are then filtered to those starting inside `[window.start, window.end)`, and reduced to at most one per `chunk_id` (earliest start wins) since two calendar events can carry the same `scheduler_chunk_id`. Second, if that yields nothing in-window, the **live scheduler-owned events** already fetched for the window. Otherwise the baseline is empty.
 
-All week-identity logic buckets in the instance `SCHEDULER_TZ` — the tz that derived the window in the first place (webhook, Monday cron, accept, supersede). This is deliberate and load-bearing, not an oversight about `home_tz`: a Sydney week straddles two UTC weeks, so bucketing a `SCHEDULER_TZ`-anchored window in a user's `home_tz` splits it, and a mid-week resolve then lands in a different week from its own Mon-anchored plan and misses it. `home_tz` has no write path today; see the internal backlog for what a real migration would have to move together.
+All week-identity logic buckets in the subject's **effective tz** (`users.home_tz`, else the instance `SCHEDULER_TZ`): window derivation (webhook, Monday cron), the churn and drop baselines, pending-plan supersede, and the accept page's week grouping. They must agree. A bucket has to use the tz that produced the window, because a Sydney week straddles two UTC weeks, so bucketing a window in any other tz splits it and a mid-week resolve lands in a different week from its own Mon-anchored plan. That's why all the sites moved together when `home_tz` gained its write path (§Q). A user with `home_tz` NULL or equal to `SCHEDULER_TZ` sees no change. For what happens around a tz change, see §Q "Transition".
 
 Source selection is all-or-nothing after the filter: a partially surviving plan (a Mon-anchored plan against a Wed-narrowed window) is used with exactly its surviving entries, never topped up per chunk from the calendar, since the manual-move write-back is what keeps that plan in sync with hand-drags. Before selection was week-scoped, a plan committed for *another* week won on recency and the filter emptied it, so a future week resolved with `churn = 0` (an internal issue, prod 2026-08-25). Meetings are the exception throughout: `build-problem` overrides their anchor with the live calendar slot. Live guard: L8's **anchor sub-leg** (`bin/regression-smoke.py`) re-resolves the drag-patched, non-latest week A and asserts every dragged chunk is proposed at its dragged slot.
 
@@ -1194,7 +1195,7 @@ The done color is identified by Google Calendar's `colorId` string (the same val
 DONE_COLOR_ID = "3"   # "3" = Grape; any value other than "5" is valid
 ```
 
-**Per-user override (SQL):** mirror the same pattern as `home_tz` — there is no write endpoint yet; set it directly in D1:
+**Per-user override (SQL):** there is no write endpoint yet (unlike `home_tz`, §Q); set it directly in D1:
 
 ```bash
 op run --env-file=.env -- npx wrangler d1 execute scheduler --remote \
@@ -1218,7 +1219,7 @@ A `NULL` `done_color_id` means the user inherits the instance `DONE_COLOR_ID`. I
 
 Every resolve separates **selection/fetch** from **placement**:
 
-- **Selection and fetch** use the full local week window `[Mon 00:00, next Mon 00:00)` in `SCHEDULER_TZ` (or the user's `home_tz`). An undone task anchored to Monday is still selected and planned on Wednesday; past-day calendar events (including any done-colored ones) are still fetched for detection and diff.
+- **Selection and fetch** use the full local week window `[Mon 00:00, next Mon 00:00)` in the user's effective tz (`home_tz`, else `SCHEDULER_TZ`; §Q). An undone task anchored to Monday is still selected and planned on Wednesday; past-day calendar events (including any done-colored ones) are still fetched for detection and diff.
 
 - **Placement floor** = `max(weekStart, ceilToQuarter(now))`. This is the earliest instant the solver may place any chunk into. For a mid-week resolve, `ceilToQuarter(now)` exceeds `weekStart`, so the floor advances to the next 15-minute slot from now. For a future week (`now < weekStart`) the floor collapses to `weekStart` — no behavior change for advance planning.
 
@@ -5531,3 +5532,179 @@ and the phase predicates offline (`uv run bin/test_engine_smoke_parse.py`).
   work: `external_pinned` puts an *event* id in `task_id`, `value` is
   local-naive rather than ISO-Z, and `replan-now.ts` double-nests
   `unsat_core` (pre-existing, untested, out of scope here).
+
+## Q. User timezone
+
+**No flag.** It rides `users.home_tz` (migration 0018), plus migration 0040
+(`proposed_plans.window_tz`, see "Transition"), which must be applied
+before deploying. A NULL
+`home_tz` inherits the instance `SCHEDULER_TZ`, as it always has. Plan:
+internal design notes.
+
+### Endpoints (`worker/src/handlers/timezone.ts`, bearer auth)
+
+| Op | Route | Effect |
+|---|---|---|
+| `getTimezone` | `GET /v1/timezone` | `{tz, source, superseded_plans: 0}`. `source` is `"user"` when `home_tz` is set, else `"default"`. |
+| `setTimezone` | `PATCH /v1/timezone` `{tz}` | Validates an IANA zone (`400` otherwise, including a UTC offset like `"+10:00"`, which current Intl accepts but has no DST rules, and a bare legacy name like `"EST"`, which tzdata maps to fixed-offset `America/Panama`; UTC aliases such as `"GMT"` are fine) and stores its canonical spelling (`"europe/london"` → `"Europe/London"`). |
+| `resetTimezone` | `DELETE /v1/timezone` | Sets `home_tz` NULL, so the user inherits `SCHEDULER_TZ` again. |
+
+A subject with no `users` row gets `404 no_user_row` from PATCH and DELETE,
+which never create one: a config write must not admit a subject or add it to
+the cron fan-out. The tz write and the pending-plan delete run in one
+`db.batch`, so a failed delete also leaves the tz unchanged.
+
+`GET /v1/whoami` still reports the effective tz as `home_tz`. There's one tz
+per user, with no "home" vs "current" split: a traveller just sets it.
+
+### What a change does
+
+- **Pending plans are discarded.** When the *effective* tz actually changes
+  (a PATCH to the same zone, or a DELETE that lands on the value already in
+  force, is a no-op), every uncommitted proposed plan for the user is deleted
+  and counted in `superseded_plans`. They were solved against the old business
+  hours, so an old email's Accept link now hits the vanished-hash path (409 or the
+  HTML equivalent) rather than committing old-tz placements. Committed plans are untouched.
+- **Nothing is replanned by the change itself.** The next resolve from any
+  trigger applies the new tz. Call `POST /v1/replan-now?force=true` to replan
+  the current week at once.
+- **What moves on that replan.** Business hours (`config_business_hours` is
+  local wall-clock) are read in the new tz, so free-floating chunks now outside
+  hours move. Chunks still inside the new hours may stay, held by churn.
+  Hard pins (`pinned_at`), deadlines and templates with `pinned_tz` are
+  instants or carry their own tz, so they stay put. Task `preferred_windows`
+  are wall-clock, so they're frozen instead (below).
+  Recurrence instances already materialised keep their instants. Future
+  materialisations of templates without `pinned_tz` use the new tz.
+- **Week windows follow the user.** The resolve window is the user's local
+  `[Mon 00:00, next Mon 00:00)`, and every week-identity site buckets in the same
+  tz (§I "Where the churn anchor comes from"). Booking pages (§K) and poll grids
+  (§L) already used the owner's `home_tz`, so their hours follow the change too.
+
+### Task windows keep their real-world times
+
+A task's `preferred_windows` entry is wall-clock (`days` plus `start`/`end`
+HH:MM), and it may carry an IANA `tz`. With no `tz`, it is read in the user's
+effective tz at solve time. So that windows set before a move keep their
+real-world times, a tz change (PATCH/DELETE `/v1/timezone`) stamps the **old**
+zone onto every untimezoned window of the user's tasks, done ones included,
+since a done task can be revived. This
+runs in the same `db.batch` as the tz write and logs
+`timezone_windows_stamped`.
+
+- **Templates** (`task_templates`) are never stamped, because untimezoned
+  templates follow the user by design. Instances of a `pinned_tz` template
+  carry that zone on their windows. That's a behaviour change for existing
+  `pinned_tz` templates whose zone differs from the user's: their new
+  instances' windows are now read in `pinned_tz`, matching `pinned_time`,
+  where before they were read in the user's zone.
+- **Later edits:** PATCHing a task's windows without a `tz` makes them
+  follow the user again.
+- **Solving:** at solve time (`planning/window-projection.ts`), a
+  foreign-tz window is converted to the planning tz. Soft windows split at
+  local midnight. A hard window that can't stay one equivalent window becomes
+  an exact `availability_windows` mask, because the solver and engine
+  intersect hard windows. Untimezoned windows pass through unchanged.
+- **Known limits:** such a hard window shows up as `availability_window` in
+  unsat cores. A soft window split at midnight penalises chunks that cross
+  it.
+
+### Monday cron across timezones
+
+The cron still fires once for everyone at Sun 15:00 UTC (Mon 01:00/02:00
+Sydney). Each user's window is `upcomingLocalWeekWindow(now, tz)`: the local
+week containing now + 3.5 days. Every zone from UTC−12 to UTC+14 is between
+Sun 03:00 and Mon 05:00 local at fire time, so that is always the week
+starting on the nearest Monday. It's unchanged for Sydney. Users west of Sydney get their
+"Monday" email on their Sunday.
+
+For users west of about UTC+9, that week hasn't started when the cron fires.
+The cron passes `upcomingWeek` to the resolve, so window membership is judged
+as if now were the window start, and undated backlog is kept rather than
+shed. Explicit future-week resolves (`POST /v1/resolve`, webhook replans of
+later weeks) still shed it as §F describes.
+
+### Transition
+
+Every proposed plan records the tz its window was bucketed in
+(`proposed_plans.window_tz`, migration 0040; NULL means a legacy row, read as
+`SCHEDULER_TZ`, which produced every pre-0040 row). The week lookups behind
+the churn and drop baselines and pending-plan supersede only match plans from
+the **same** tz. Without that, a westward change could bucket an old-tz plan
+into the wrong new-tz week, because a Sydney Monday-morning chunk is a Los
+Angeles Sunday. The all-or-nothing churn baseline would then take that plan's
+few surviving chunks and discard the live-calendar fallback.
+
+So after a change:
+
+- **Churn:** the first resolve finds no same-tz committed plan for the week.
+  Churn anchors on the live scheduler-owned calendar events instead, which
+  are the committed placements, so nothing is lost.
+- **Drops:** the drop baseline is empty for that week. A task already
+  dropped can be listed as dropped once more in the first email.
+- **Stale accepts:** accept refuses a plan whose tz is no longer the
+  subject's effective tz, answering as for a vanished plan. That covers the accept link, the accept page and `POST /v1/commit` (404 `not_found`). `GET /v1/plans` and `GET /v1/plans/latest` also omit old-tz pending plans. This closes the
+  race where a PATCH lands while a resolve is in flight, after it read the
+  old tz but before it stored its plan.
+
+**Recurrence after a move west.** Instances are unique per UTC date. After
+moving to a zone behind the old one, a Monday instance of a template without
+`pinned_tz` is only created once a resolve runs for that week. Run
+`replan-now?force=true` after a change, as the `setTimezone` description
+advises.
+
+**Client-supplied windows** (`POST /v1/resolve`) are bucketed by their start
+in the caller's effective tz. Send the local Mon 00:00 of that tz (see
+`whoami.home_tz`). A UTC-midnight Monday is a Sunday in the Americas and
+lands in the previous week. The dev UI builds its windows this way.
+
+### Smoke
+
+`bin/timezone-smoke.py` (smoke-runner `timezone-smoke`, `default`/`microsoft`;
+A_* bearer env, no D1) checks the user-timezone API end to end.
+
+- **Startup:** DELETEs `/v1/timezone` (asserting source `"default"`) and
+  removes leftover `[tzsmoke]` tasks.
+- **Z1** records the default baseline and checks it against whoami.
+- **Z2** checks an unknown zone, a UTC offset (`+10:00`) and a bare legacy name (`EST`) each get 400 and nothing changes.
+- **Z3** resolves about 14 h of free-floating tasks over the user's local
+  week. The placed chunks' local time-of-day range becomes the band.
+- **Z4** PATCHes the zone furthest round the clock, in lower case, and checks
+  the canonical tz, source `"user"`, `superseded_plans ≥ 1` and
+  `whoami.home_tz`.
+- **Z5** fails as "inconclusive" if that gap is narrower than the band.
+  Otherwise it re-resolves over the new zone's local week and checks every
+  chunk falls inside the band in local time while the UTC instants change.
+- **Z6** DELETEs back to the default.
+- **Teardown** always deletes the run's tasks and plans and DELETEs the zone.
+  **Z7** checks the reset took, so the account always ends on the instance
+  default.
+
+Windows are passed explicitly, so week-identity derivation (webhook, cron,
+accept) is covered by vitest rather than this smoke.
+`bin/reset-smoke-env.py` also sweeps `[tzsmoke]` tasks.
+
+### Prod deploy check
+
+Before the first prod deploy of this feature, list the users with a
+SQL-set zone:
+
+```bash
+op run --env-file=.env -- npx wrangler d1 execute scheduler --remote \
+  --command "SELECT subject, home_tz FROM users WHERE home_tz IS NOT NULL"
+```
+
+Their weeks move to that zone immediately. Their legacy (NULL `window_tz`)
+plans, read as `SCHEDULER_TZ`, stop matching unless the zone *is*
+`SCHEDULER_TZ`, so they get the one-off transition in "Transition". Clear
+any stray values (`UPDATE users SET home_tz = NULL …`) first, or accept that.
+
+### Known v1 limitations
+
+- One instance-wide cron time (above). There are no per-user fire times.
+- The tz isn't detected automatically from the calendar or device. The user
+  sets it.
+- The dev UI shows the tz (from whoami) but has no setter.
+- The window stamp is a whole-body task update. A task PATCH or webhook
+  manual move that reads the row before the tz-change batch and writes after
+  it drops the stamp, and those windows then follow the new zone.

@@ -269,10 +269,11 @@ describe("runResolve", () => {
     window: { start: string; end: string },
     committedAt: string,
     schedule: unknown[],
+    windowTz: string | null = null, // NULL = legacy, produced under SCHEDULER_TZ
   ) =>
     env.DB
-      .prepare("INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end) VALUES (?, ?, '2026-05-17T00:00:00Z', '2099-01-01T00:00:00Z', ?, 'primary', ?, ?)")
-      .bind(hash, JSON.stringify({ schedule, dropped: [], window }), committedAt, window.start, window.end)
+      .prepare("INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end, window_tz) VALUES (?, ?, '2026-05-17T00:00:00Z', '2099-01-01T00:00:00Z', ?, 'primary', ?, ?, ?)")
+      .bind(hash, JSON.stringify({ schedule, dropped: [], window }), committedAt, window.start, window.end, windowTz)
       .run();
 
   function capturingSolver(sink: Map<string, Array<{ chunk_id: string; start: string }>>): Fetcher {
@@ -374,36 +375,149 @@ describe("runResolve", () => {
     expect(captured.get("t1")).toEqual([{ chunk_id: "t1#0", start: "2026-05-20T09:00:00" }]);
   });
 
-  it("buckets the baseline week in SCHEDULER_TZ — the tz that produced the window — even for a home_tz user", async () => {
-    // Every windowStart producer (webhook, cron, accept) anchors on
-    // SCHEDULER_TZ, and a Sydney week straddles two UTC weeks. Bucketing the
-    // lookup in a UTC user's home_tz therefore splits the week: this mid-week
-    // resolve lands in the UTC week AFTER its own Mon-anchored plan's, and the
-    // user misses their own baseline.
+  // The failure mode the internal backlog warns a PARTIAL home_tz migration causes: a
+  // mid-week resolve must find its own Mon-anchored plan. With every producer
+  // and consumer on the subject's effective tz, a home_tz user's week is their
+  // own local Mon–Mon, and a Sunday-narrowed resolve (Sunday afternoon in the
+  // user's tz is already Monday of the NEXT week in Sydney) still lands in it.
+  it.each([
+    // [home_tz, Mon-anchored week, Sunday-narrowed window start, chunk instant, chunk local naive]
+    ["UTC", { start: "2026-05-18T00:00:00.000Z", end: "2026-05-25T00:00:00.000Z" }, "2026-05-24T15:00:00.000Z", "2026-05-24T18:00:00.000Z", "2026-05-24T18:00:00"],
+    ["America/New_York", { start: "2026-05-18T04:00:00.000Z", end: "2026-05-25T04:00:00.000Z" }, "2026-05-24T15:00:00.000Z", "2026-05-24T18:00:00.000Z", "2026-05-24T14:00:00"],
+  ] as const)("a %s home_tz user's mid-week resolve finds its own Mon-anchored committed plan", async (tz, week, narrowedStart, chunkStart, chunkNaive) => {
     await env.DB.prepare("DELETE FROM tasks").run();
-    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', 'UTC', '2026-05-01T00:00:00Z')").run();
+    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', ?, '2026-05-01T00:00:00Z')").bind(tz).run();
     await env.DB
       .prepare("INSERT INTO tasks (id, owner_subject, body, status, created_at, updated_at) VALUES ('t1', 'primary', ?, 'pending', '2026-05-17T00:00:00Z', '2026-05-17T00:00:00Z')")
-      .bind(JSON.stringify({ title: "Deep work", context: "deep", priority: 80, duration_minutes: 60, earliest_start: "2026-05-19T23:00:00Z" }))
+      .bind(JSON.stringify({ title: "Deep work", context: "deep", priority: 80, duration_minutes: 60, earliest_start: narrowedStart }))
       .run();
-    // Mon-anchored plan for the Sydney week of Mon 18 May.
+    // The Mon-anchored plan a Monday resolve of the user's week committed.
     await seedCommittedPlan(
-      "sydney-week",
-      { start: "2026-05-17T14:00:00.000Z", end: "2026-05-24T14:00:00.000Z" },
+      "home-week",
+      week,
       "2026-05-17T02:00:00Z",
-      [{ task_id: "t1", chunk_id: "t1#0", start: "2026-05-20T23:00:00.000Z", end: "2026-05-21T00:00:00.000Z", context: "deep" }],
+      [{ task_id: "t1", chunk_id: "t1#0", start: chunkStart, end: new Date(Date.parse(chunkStart) + 3_600_000).toISOString(), context: "deep" }],
+      tz, // produced by a resolve of the user's own week
     );
     const captured = new Map<string, Array<{ chunk_id: string; start: string }>>();
     await runResolve({
       env: { ...env, SOLVER: capturingSolver(captured) },
-      calendar: new MockCalendarProvider(),
-      windowStart: "2026-05-19T23:00:00Z", // Wed 20 May 09:00 Sydney — mid-week narrowing
-      windowEnd: "2026-05-24T14:00:00Z",
+      calendar: new MockCalendarProvider(), // no calendar fallback to hide a miss
+      windowStart: narrowedStart,
+      windowEnd: week.end,
       accountEmail: "primary",
       trigger: "api",
     });
-    // home_tz drives the naive projection, so the anchor renders as its Z-time.
-    expect(captured.get("t1")).toEqual([{ chunk_id: "t1#0", start: "2026-05-20T23:00:00" }]);
+    expect(captured.get("t1")).toEqual([{ chunk_id: "t1#0", start: chunkNaive }]);
+  });
+
+  // After a tz change, a plan committed under the OLD tz can have its start
+  // fall inside the new-tz week (4 Oct 13:00Z is Sydney's Mon 5 Oct but LA's
+  // Sun 4 Oct). Its chunks would then survive the window filter and anchor
+  // churn on the wrong week. window_tz stops that: churn falls back to the
+  // live scheduler-owned events (plan decision 8).
+  it.each([
+    {
+      dir: "Sydney→LA (legacy NULL row)", homeTz: "America/Los_Angeles", planTz: null,
+      plan: { start: "2026-10-04T13:00:00.000Z", end: "2026-10-11T13:00:00.000Z" }, // Sydney Mon 5 Oct (AEDT)
+      planChunk: "2026-10-04T22:00:00.000Z", // Mon 5 Oct 09:00 AEDT = Sun 4 Oct 15:00 PDT
+      window: { start: "2026-09-28T07:00:00.000Z", end: "2026-10-05T07:00:00.000Z" }, // LA Mon 28 Sep
+      calChunk: "2026-10-02T17:00:00.000Z", calNaive: "2026-10-02T10:00:00",
+    },
+    {
+      dir: "LA→Sydney", homeTz: null, planTz: "America/Los_Angeles",
+      plan: { start: "2026-09-28T07:00:00.000Z", end: "2026-10-05T07:00:00.000Z" }, // LA Mon 28 Sep = Sydney Mon 28 Sep 17:00
+      planChunk: "2026-09-28T22:00:00.000Z", // Tue 29 Sep 08:00 AEST
+      window: { start: "2026-09-27T14:00:00.000Z", end: "2026-10-04T13:00:00.000Z" }, // Sydney Mon 28 Sep
+      calChunk: "2026-09-29T23:00:00.000Z", calNaive: "2026-09-30T09:00:00",
+    },
+  ])("$dir: a plan produced in another tz is not the week's baseline; churn falls back to the calendar", async ({ homeTz, planTz, plan, planChunk, window, calChunk, calNaive }) => {
+    await env.DB.prepare("DELETE FROM tasks").run();
+    if (homeTz) await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', ?, '2026-05-01T00:00:00Z')").bind(homeTz).run();
+    await env.DB
+      .prepare("INSERT INTO tasks (id, owner_subject, body, status, created_at, updated_at) VALUES ('t1', 'primary', ?, 'pending', '2026-05-17T00:00:00Z', '2026-05-17T00:00:00Z')")
+      .bind(JSON.stringify({ title: "Deep work", context: "deep", priority: 80, duration_minutes: 60, earliest_start: window.start }))
+      .run();
+    await seedCommittedPlan(
+      "old-tz-plan", plan, "2026-09-20T00:00:00Z",
+      [{ task_id: "t1", chunk_id: "t1#0", start: planChunk, end: new Date(Date.parse(planChunk) + 3_600_000).toISOString(), context: "deep" }],
+      planTz,
+    );
+    const cal = new MockCalendarProvider({
+      events: [{ id: "sch-1", summary: "Deep work", start: calChunk, end: new Date(Date.parse(calChunk) + 3_600_000).toISOString(), extendedProperties: { private: { scheduler_chunk_id: "t1#0" } } }],
+    });
+    const captured = new Map<string, Array<{ chunk_id: string; start: string }>>();
+    await runResolve({
+      env: { ...env, SOLVER: capturingSolver(captured) },
+      calendar: cal,
+      windowStart: window.start,
+      windowEnd: window.end,
+      accountEmail: "primary",
+      trigger: "api",
+    });
+    expect(captured.get("t1")).toEqual([{ chunk_id: "t1#0", start: calNaive }]);
+  });
+
+  it("stores the producing tz on the inserted plan", async () => {
+    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', 'Europe/London', '2026-05-01T00:00:00Z')").run();
+    const r = await runResolve({
+      env: { ...env, SOLVER: capturingSolver(new Map()) },
+      calendar: new MockCalendarProvider(),
+      windowStart: "2026-05-17T23:00:00.000Z",
+      windowEnd: "2026-05-24T23:00:00.000Z",
+      accountEmail: "primary",
+      trigger: "api",
+    });
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
+    const row = await env.DB.prepare("SELECT window_tz FROM proposed_plans WHERE plan_hash = ?").bind(r.planHash).first<{ window_tz: string | null }>();
+    expect(row?.window_tz).toBe("Europe/London");
+  });
+
+  it("a home_tz user's mid-week resolve supersedes their Mon-anchored pending plan for the same week", async () => {
+    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', 'UTC', '2026-05-01T00:00:00Z')").run();
+    const week = { start: "2026-05-18T00:00:00.000Z", end: "2026-05-25T00:00:00.000Z" };
+    await env.DB
+      .prepare("INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end, window_tz) VALUES ('stale-mon', ?, '2026-05-17T00:00:00Z', '2099-01-01T00:00:00Z', NULL, 'primary', ?, ?, 'UTC')")
+      .bind(JSON.stringify({ schedule: [], dropped: [], window: week }), week.start, week.end)
+      .run();
+    const r = await runResolve({
+      env: { ...env, SOLVER: capturingSolver(new Map()) },
+      calendar: new MockCalendarProvider(),
+      windowStart: "2026-05-24T15:00:00.000Z", // Sun 15:00 UTC = Mon 25 May 01:00 AEST
+      windowEnd: week.end,
+      accountEmail: "primary",
+      trigger: "api",
+    });
+    expect(r.kind).toBe("ok");
+    const stale = await env.DB.prepare("SELECT plan_hash FROM proposed_plans WHERE plan_hash = 'stale-mon'").first();
+    expect(stale).toBeNull();
+  });
+
+  describe("pure backlog vs a not-yet-started window", () => {
+    // Clock: 2026-05-18T00:00Z. The week [25 May, 1 Jun) hasn't started.
+    const FUTURE = { start: "2026-05-25T00:00:00.000Z", end: "2026-06-01T00:00:00.000Z" };
+    const run = async (upcomingWeek?: boolean) => {
+      const captured = new Map<string, Array<{ chunk_id: string; start: string }>>();
+      await runResolve({
+        env: { ...env, SOLVER: capturingSolver(captured) },
+        calendar: new MockCalendarProvider(),
+        windowStart: FUTURE.start,
+        windowEnd: FUTURE.end,
+        accountEmail: "primary",
+        trigger: upcomingWeek ? "cron" : "webhook",
+        ...(upcomingWeek === undefined ? {} : { upcomingWeek }),
+      });
+      return captured;
+    };
+
+    it("an explicit future-week resolve still sheds backlog (runbook §F, the 'Gym' incident)", async () => {
+      expect((await run()).has("t1")).toBe(false);
+    });
+
+    it("the Monday cron's upcoming week (upcomingWeek) treats the window as started, so backlog populates it", async () => {
+      expect((await run(true)).has("t1")).toBe(true);
+    });
   });
 
   it("returns unsat result when solver returns 422", async () => {

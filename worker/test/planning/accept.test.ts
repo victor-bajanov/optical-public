@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { env } from "cloudflare:test";
 import { Hono } from "hono";
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -53,12 +53,12 @@ const W2 = { start: "2026-05-25T00:00:00Z", end: "2026-06-01T00:00:00Z" };
 // can't place into the past. Same local week (Mon 18 May, Australia/Sydney) as W1.
 const WMID = { start: "2026-05-20T00:00:00+10:00", end: "2026-05-25T00:00:00+10:00" };
 
-function seedPlan(hash: string, w: { start: string; end: string }, createdAt: string) {
+function seedPlan(hash: string, w: { start: string; end: string }, createdAt: string, windowTz: string | null = null) {
   return env.DB
     .prepare(
-      "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end) VALUES (?, ?, ?, '2099-01-01T00:00:00Z', NULL, 'operator@example.com', ?, ?)",
+      "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end, window_tz) VALUES (?, ?, ?, '2099-01-01T00:00:00Z', NULL, 'operator@example.com', ?, ?, ?)",
     )
-    .bind(hash, JSON.stringify({ ...planBody, window: w }), createdAt, w.start, w.end)
+    .bind(hash, JSON.stringify({ ...planBody, window: w }), createdAt, w.start, w.end, windowTz)
     .run();
 }
 
@@ -590,6 +590,131 @@ describe("POST /v1/plans/:hash/accept", () => {
       expect(html).toContain("Plan accepted");
       expect(html).not.toContain("also have proposed changes");
       expect(html).not.toContain("/v1/plans/h2/accept");
+    });
+  });
+
+  describe("week grouping uses the subject's effective tz (home_tz)", () => {
+    // A Los Angeles user's week of Mon 18 May PDT, and a Sunday-narrowed
+    // re-resolve of the SAME LA week (Sun 24 May 10:00 PDT = Mon 25 May 03:00
+    // AEST). In SCHEDULER_TZ (Sydney) these are two different weeks.
+    const LA_W = { start: "2026-05-18T07:00:00.000Z", end: "2026-05-25T07:00:00.000Z" };
+    const LA_SUN = { start: "2026-05-24T17:00:00.000Z", end: "2026-05-25T07:00:00.000Z" };
+
+    beforeEach(async () => {
+      await env.DB.prepare("DELETE FROM proposed_plans").run();
+      await env.DB.prepare("INSERT OR REPLACE INTO users (subject, home_tz, created_at) VALUES ('operator@example.com', 'America/Los_Angeles', '2026-05-01T00:00:00Z')").run();
+      await seedPlan("hA", LA_W, "2026-05-19T00:00:00Z", "America/Los_Angeles");
+      await seedPlan("hB", LA_SUN, "2026-05-20T00:00:00Z", "America/Los_Angeles");
+      await attachRenderSnapshot(env.DB, "hA", snapshotFor(LA_W, "Monday work"));
+      await attachRenderSnapshot(env.DB, "hB", snapshotFor(LA_SUN, "Sunday work"));
+    });
+    afterEach(async () => {
+      await env.DB.prepare("DELETE FROM users WHERE subject = 'operator@example.com'").run();
+    });
+
+    it("GET groups a Sunday-narrowed plan with the user's own local week", async () => {
+      const t = await signCapability(
+        { planHash: "hA", subject: "operator@example.com", purpose: "accept", ttlSeconds: 300, window: LA_W },
+        env.TOKEN_HASH_PEPPER,
+      );
+      const res = await makeApp(new MockCalendarProvider()).request(`/v1/plans/hA/accept?t=${encodeURIComponent(t)}`, { method: "GET" }, { ...env });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("proposed changes for 2 weeks");
+      expect(html).toContain("Sunday work");               // the week's newest plan
+      expect(html).not.toContain("Monday work");
+      expect(html).toContain("/v1/plans/hB/accept");      // form targets it
+      expect(html).toContain("changed after that email was sent");
+    });
+
+    it("accepted page does not offer the same local week back as another week", async () => {
+      const t = await signCapability(
+        { planHash: "hA", subject: "operator@example.com", purpose: "accept", ttlSeconds: 300 },
+        env.TOKEN_HASH_PEPPER,
+      );
+      const res = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/hA/accept",
+        { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: `t=${encodeURIComponent(t)}` },
+        { ...env, OAUTH_ISSUER: "https://scheduler.example.com" },
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("Plan accepted");
+      expect(html).not.toContain("also have proposed changes");
+      expect(html).not.toContain("/v1/plans/hB/accept");
+    });
+  });
+
+  describe("a plan produced in a tz other than the subject's current one is refused like a vanished hash", () => {
+    // Race: runResolve read the old tz, a PATCH /v1/timezone landed (deleting
+    // pending plans), then the resolve inserted its old-tz plan with a live
+    // accept link. h1 (beforeEach) is a legacy NULL-window_tz row = produced
+    // under SCHEDULER_TZ (Sydney); the subject is now in Los Angeles.
+    beforeEach(async () => {
+      await env.DB.prepare("INSERT OR REPLACE INTO users (subject, home_tz, created_at) VALUES ('operator@example.com', 'America/Los_Angeles', '2026-05-01T00:00:00Z')").run();
+      await attachRenderSnapshot(env.DB, "h1", snapshotFor(W1, "Old tz work"));
+    });
+    afterEach(async () => {
+      await env.DB.prepare("DELETE FROM users WHERE subject = 'operator@example.com'").run();
+    });
+    const committedAt = async (hash: string) =>
+      (await env.DB.prepare("SELECT committed_at FROM proposed_plans WHERE plan_hash = ?").bind(hash).first<{ committed_at: string | null }>())?.committed_at;
+
+    it("POST (JSON) answers 409 plan_superseded and commits nothing", async () => {
+      const t = await signCapability({ planHash: "h1", subject: "operator@example.com", purpose: "accept", ttlSeconds: 300, window: W1 }, env.TOKEN_HASH_PEPPER);
+      const res = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/h1/accept",
+        { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: `t=${encodeURIComponent(t)}` },
+        { ...env, OAUTH_ISSUER: "https://scheduler.example.com" },
+      );
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: "plan_superseded" });
+      expect(await committedAt("h1")).toBeNull();
+    });
+
+    it("POST (bearer) answers 409 plan_superseded and commits nothing", async () => {
+      await seedBearer("tz-bearer", "operator@example.com");
+      const res = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/h1/accept",
+        { method: "POST", headers: { Authorization: "Bearer tz-bearer" } },
+        { ...env, OAUTH_ISSUER: "https://scheduler.example.com" },
+      );
+      expect(res.status).toBe(409);
+      expect(await committedAt("h1")).toBeNull();
+    });
+
+    it("POST (HTML) shows the caught-up notice and commits nothing", async () => {
+      const t = await signCapability({ planHash: "h1", subject: "operator@example.com", purpose: "accept", ttlSeconds: 300, window: W1 }, env.TOKEN_HASH_PEPPER);
+      const res = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/h1/accept",
+        { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: `t=${encodeURIComponent(t)}` },
+        { ...env, OAUTH_ISSUER: "https://scheduler.example.com" },
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("all caught up");
+      expect(html).not.toContain("Plan accepted");
+      expect(await committedAt("h1")).toBeNull();
+    });
+
+    it("GET does not offer the old-tz plan", async () => {
+      const t = await signCapability({ planHash: "h1", subject: "operator@example.com", purpose: "accept", ttlSeconds: 300 }, env.TOKEN_HASH_PEPPER);
+      const res = await makeApp(new MockCalendarProvider()).request(`/v1/plans/h1/accept?t=${encodeURIComponent(t)}`, { method: "GET" }, { ...env });
+      const html = await res.text();
+      expect(html).not.toContain("Old tz work");
+      expect(html).not.toContain("/v1/plans/h1/accept\"");
+    });
+
+    it("a plan produced in the subject's current tz still commits", async () => {
+      await seedPlan("hLA", { start: "2026-05-18T07:00:00.000Z", end: "2026-05-25T07:00:00.000Z" }, "2026-05-19T00:00:00Z", "America/Los_Angeles");
+      const t = await signCapability({ planHash: "hLA", subject: "operator@example.com", purpose: "accept", ttlSeconds: 300 }, env.TOKEN_HASH_PEPPER);
+      const res = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/hLA/accept",
+        { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: `t=${encodeURIComponent(t)}` },
+        { ...env, OAUTH_ISSUER: "https://scheduler.example.com" },
+      );
+      expect(res.status).toBe(200);
+      expect(await committedAt("hLA")).not.toBeNull();
     });
   });
 

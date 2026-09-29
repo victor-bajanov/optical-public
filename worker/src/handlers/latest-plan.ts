@@ -7,6 +7,7 @@ import {
   getLatestProposedPlanForSubject,
   getLatestProposedPlanForSubjectCovering,
 } from "../planning/proposed-plans";
+import { getHomeTz } from "../db/users";
 
 const PlanResponse = z.object({
   plan: z
@@ -33,7 +34,7 @@ export function mountLatestPlanRoute(
     operationId: "getLatestProposedPlan",
     summary: "The caller's latest uncommitted proposed plan.",
     description:
-      "Return the caller's most recent uncommitted proposed plan. With ?covers=<ISO instant>, return the latest plan whose window covers that instant (the week containing it) instead of the global most-recent — used to deterministically read back a webhook-triggered replan.",
+      "Return the caller's most recent uncommitted proposed plan. With ?covers=<ISO instant>, return the latest plan whose window covers that instant (the week containing it) instead of the global most-recent — used to deterministically read back a webhook-triggered replan. Plans produced under a timezone other than the caller's current effective timezone are skipped (they cannot be committed).",
     security: [{ BearerAuth: [] }],
     request: { query: z.object({ covers: z.string().optional().describe("Optional ISO 8601 instant. When given, return the latest plan whose window covers that instant (the week containing it) instead of the global most-recent.") }) },
     responses: {
@@ -57,6 +58,9 @@ export function mountLatestPlanRoute(
     if (owner instanceof Response) return owner as any;
     const covers = c.req.query("covers");
     const coversDate = covers ? new Date(covers) : null;
+    // Only plans produced in the caller's current tz: an old-tz pending plan
+    // (a resolve racing a tz change) is refused on commit, so never offer it.
+    const producedIn = { tz: await getHomeTz(c.env.DB, owner, c.env.SCHEDULER_TZ), schedulerTz: c.env.SCHEDULER_TZ };
     const plan =
       coversDate && !Number.isNaN(coversDate.getTime())
         ? await getLatestProposedPlanForSubjectCovering(
@@ -64,8 +68,9 @@ export function mountLatestPlanRoute(
             owner,
             new Date(),
             coversDate,
+            producedIn,
           )
-        : await getLatestProposedPlanForSubject(c.env.DB, owner, new Date());
+        : await getLatestProposedPlanForSubject(c.env.DB, owner, new Date(), producedIn);
     if (!plan) return c.json({ plan: null }, 200);
     const window = plan.body.window as { start: string; end: string } | undefined;
     return c.json(

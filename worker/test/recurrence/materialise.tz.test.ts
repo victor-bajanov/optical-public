@@ -107,3 +107,40 @@ describe("materialiseTemplate — timezone handling", () => {
     expect(out[0]!.body.earliest_start).toBe("2026-07-12T14:00:00.000Z");
   });
 });
+
+// Card E (internal design notes): a pinned_tz template's windows are in
+// that zone; an untimezoned template's windows follow the user's tz.
+describe("materialiseTemplate — preferred-window tz", () => {
+  const win = { days: ["mon"], start: "09:00", end: "11:00", hard: true };
+  const run = (overrides: Partial<TemplateRow["body"]>) =>
+    materialiseTemplate(
+      template({ pinned_time: null, ...overrides }),
+      "2026-07-12T00:00:00Z",
+      "2026-07-19T00:00:00Z",
+      new Set(),
+      "Australia/Sydney",
+    );
+
+  it("stamps pinned_tz onto untimezoned windows, keeping explicit ones", () => {
+    const out = run({
+      pinned_tz: "America/New_York",
+      task_body: { preferred_windows: [win, { ...win, days: ["tue"], tz: "Asia/Tokyo" }] },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.body.preferred_windows).toEqual([
+      { ...win, tz: "America/New_York" },
+      { ...win, days: ["tue"], tz: "Asia/Tokyo" },
+    ]);
+  });
+
+  it("leaves windows of a template without pinned_tz unstamped", () => {
+    const out = run({ task_body: { preferred_windows: [win] } });
+    expect(out[0]!.body.preferred_windows).toEqual([win]);
+  });
+
+  it("does not mutate the template's own task_body", () => {
+    const task_body = { preferred_windows: [win] };
+    run({ pinned_tz: "America/New_York", task_body });
+    expect(task_body.preferred_windows[0]).not.toHaveProperty("tz");
+  });
+});

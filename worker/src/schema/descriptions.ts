@@ -40,10 +40,11 @@ export const D = {
         "Soft-deadline cost accrued per 15 minutes past `at`. Only meaningful when hard is false.",
     },
     preferred_windows: {
-      $: "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed).",
+      $: "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed). Days and times are read in the window's own `tz` when set, else in your effective timezone (GET /v1/timezone) at solve time. Changing your timezone stamps the OLD zone onto every untimezoned window of your tasks, so existing windows keep their real-world times; recurring-task templates are not stamped and follow your timezone.",
       days: "Weekdays this window applies to; any of 'mon','tue','wed','thu','fri','sat','sun'. At least one.",
       start: "Window start time of day, 'HH:MM'.",
       end: "Window end time of day, 'HH:MM'.",
+      tz: "IANA timezone the window's days and times are read in, e.g. 'Australia/Sydney'; stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine). Omitted: your effective timezone at solve time (so the window follows a timezone change). Set automatically to your previous timezone when you change it; may also be set explicitly. A window in another zone than the one being planned in is converted to the equivalent local times, which can move it to a different weekday or split it at midnight.",
       hard: "If true, the task must land inside one of its windows when scheduled; if no window slot is free it is dropped rather than placed outside (if false, falling outside is a weighed penalty). A hard window also REPLACES the business-hours floor with the window itself — so to keep business hours while pinning days, set the window to your business hours (e.g. 09:00–17:00), not 00:00–23:59.",
     },
     dependencies: {
@@ -89,10 +90,10 @@ export const D = {
       "iCalendar RRULE defining recurrence; must contain 'FREQ=' (e.g. 'FREQ=WEEKLY;BYDAY=MO').",
     pinned_time: "Optional wall-clock time each generated occurrence is pinned to, 'HH:MM'.",
     pinned_tz:
-      "IANA timezone used to interpret pinned_time (e.g. 'Australia/Sydney', 'America/New_York').",
+      "IANA timezone used to interpret pinned_time (e.g. 'Australia/Sydney', 'America/New_York'); stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine).",
     duration_minutes: "Duration in minutes of each generated occurrence.",
     task_body:
-      "Partial Task fields applied to each generated occurrence (priority, deadline, preferred_windows, etc.); validated when the occurrence is materialised.",
+      "Partial Task fields applied to each generated occurrence (priority, deadline, preferred_windows, etc.). preferred_windows is validated on write (same rules as a task's, tz canonicalised); the rest is validated when the occurrence is materialised, and an occurrence that fails is skipped.",
     active_from: "First date (inclusive) the template generates occurrences.",
     active_until:
       "Last date (inclusive) the template generates occurrences; null means open-ended.",
@@ -119,8 +120,8 @@ export const D = {
   },
 
   resolve: {
-    window_start: "Start of the date window to solve (ISO 8601). The solver only places work inside [window_start, window_end). Align both bounds to a 15-minute block boundary (:00/:15/:30/:45) — the solver models time in 15-minute slots and truncates a fractional bound inward, silently shrinking the window.",
-    window_end: "End of the date window to solve (ISO 8601), exclusive. Use a 15-minute-aligned instant: for a whole day, pass the NEXT day's midnight (e.g. 2026-07-10T00:00:00+10:00), NOT 23:59:59 — an unaligned end truncates down to the previous block (23:59:59 → 23:45), dropping the last 15 minutes of the day.",
+    window_start: "Start of the date window to solve (ISO 8601). For a week, pass the caller's LOCAL Monday 00:00 in their effective timezone (home_tz from GET /v1/whoami or tz from GET /v1/timezone), e.g. 2026-05-18T00:00:00-07:00 for America/Los_Angeles — not UTC midnight, which west of UTC falls on the previous local Sunday and so into the previous week. Plans are grouped into weeks (supersede, accept, churn and drop baselines) by the local week containing window_start in that timezone. The solver only places work inside [window_start, window_end). Align both bounds to a 15-minute block boundary (:00/:15/:30/:45) — the solver models time in 15-minute slots and truncates a fractional bound inward, silently shrinking the window.",
+    window_end: "End of the date window to solve (ISO 8601), exclusive. For a week, pass the following local Monday 00:00 in the same effective timezone as window_start. Use a 15-minute-aligned instant: for a whole day, pass the NEXT day's local midnight (e.g. 2026-07-10T00:00:00+10:00), NOT 23:59:59 — an unaligned end truncates down to the previous block (23:59:59 → 23:45), dropping the last 15 minutes of the day.",
     weights_override:
       "Optional per-objective weight overrides for this solve only; keys are solver objective names, values are their relative weights.",
     account_email:
@@ -145,6 +146,16 @@ export const D = {
       "Partially update the caller's solver weights. The body is merged over the caller's current effective weights (their custom row if any, else the instance default) and stored as a complete six-field snapshot — once customised this way, the row stops tracking future instance-default changes until reset via DELETE /v1/weights. Each supplied field must be a non-negative integer (the solver's Weights model types every field int = Field(ge=0); a fractional or infinite value here would poison a later resolve); unknown keys are rejected (400) rather than silently ignored. At least one field is required (400 empty_update otherwise). This never affects a per-resolve weights_override, which still overrides these stored weights for that resolve only.",
     resetWeights:
       "Delete the caller's custom weights row, if any, so they track the instance default weights again. Idempotent: calling this with no custom row still returns 200 with the current (default) weights.",
+  },
+
+  // User-settable timezone (internal design notes, Card A).
+  timezoneConfig: {
+    getTimezone:
+      "Return the caller's effective timezone: their own home_tz if they have set one (source 'user'), else the instance default SCHEDULER_TZ (source 'default'). This is the zone business hours, the solve window and fit-curve times are interpreted in, and the same value GET /v1/whoami reports as home_tz. superseded_plans is always 0 on a read.",
+    setTimezone:
+      "Set the caller's timezone to an IANA zone (e.g. 'Europe/London'). The zone is validated and stored in its canonical spelling ('europe/london' is stored as 'Europe/London'); an unknown zone, a UTC offset such as '+10:00' (not an IANA zone: no daylight-saving rules), or a bare abbreviation such as 'EST' (tzdata maps it to a fixed-offset zone like America/Panama, not US Eastern; use an Area/Location name, 'UTC' is fine) is 400 validation_failed and changes nothing. This only changes config and does not replan: business hours are interpreted in the new timezone from the next resolve, whatever triggers it (calendar webhook, the Monday cron, replanNow or resolve). When the effective timezone actually changes, every pending (uncommitted) proposed plan for the caller is discarded, since it was solved against the old business hours and week, and superseded_plans reports how many; committed plans are untouched, and a write that leaves the effective timezone unchanged discards nothing. Hard pins, deadlines and templates with their own pinned_tz are instants or carry their own zone, so they are unaffected. Task preferred_windows without their own tz are frozen in the zone being left: the change stamps that zone onto them (on every task, done ones included, in the same atomic write), so they keep their real-world times; recurring-task templates are not stamped and follow the new zone for future occurrences; free-floating chunks outside the new business hours move at the next resolve. To see the replanned week now, call POST /v1/replan-now?force=true.",
+    resetTimezone:
+      "Clear the caller's own timezone so they inherit the instance default SCHEDULER_TZ again (source 'default'). As with setTimezone, when this changes the effective timezone every pending (uncommitted) proposed plan for the caller is discarded (reported in superseded_plans), no replan runs until the next resolve, untimezoned task preferred_windows are stamped with the zone being left, and clients should call POST /v1/replan-now?force=true to replan now. Idempotent: calling it when already on the default is a 200 no-op that discards nothing.",
   },
 
   error: {

@@ -424,4 +424,27 @@ describe("PATCH done — per-chunk colour confirmation with past/absent events (
     const rows = await completionsOf("dirt");
     expect(rows).toHaveLength(1); // record survives
   });
+
+  it("anchors the ±28-day scan on the owner's home_tz week, not SCHEDULER_TZ's", async () => {
+    // Fri 26 Jun 03:00Z is Thu 25 Jun 20:00 PDT: a Los Angeles owner's week
+    // starts Mon 22 Jun 00:00 PDT (22T07:00Z), so the scan reaches 20 Jul
+    // 07:00Z. Anchored on the Sydney week (21T14:00Z) it would stop at 19 Jul
+    // 14:00Z and miss this chunk.
+    await env.DB.prepare("INSERT OR REPLACE INTO users (subject, home_tz, created_at) VALUES (?, 'America/Los_Angeles', '2026-01-01T00:00:00Z')").bind(OWNER).run();
+    try {
+      await seedTask("far", "pending", { title: "Far ahead", context: "physical", priority: 50, duration_minutes: 60 });
+      const cal = new MockCalendarProvider({
+        events: [schedulerEvent("e-far-0", "far#0", "2026-07-20T01:00:00.000Z", "2026-07-20T02:00:00.000Z", "5")],
+      });
+      const res = await mount(cal).request(
+        "/far",
+        { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "done" }) },
+        { ...env, DONE_COLOR_ID: "11" },
+      );
+      expect(res.status).toBe(200);
+      expect(cal.getUpdated().map((u) => u.eventId)).toEqual(["e-far-0"]);
+    } finally {
+      await env.DB.prepare("DELETE FROM users WHERE subject = ?").bind(OWNER).run();
+    }
+  });
 });

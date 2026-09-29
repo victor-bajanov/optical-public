@@ -2,8 +2,9 @@ import type { Hono } from "hono";
 import type { Env } from "../env";
 import type { AppVariables } from "../index-providers";
 import { requireAccess } from "../middleware/auth-access";
+import { devUiLocalYmd, devUiMondayYmd, devUiLocalMidnightIso } from "./dev-ui-week";
 
-const HTML = `<!doctype html>
+export const DEV_UI_HTML = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -184,27 +185,15 @@ const HTML = `<!doctype html>
   $("active-account-refresh").addEventListener("click", loadActiveAccount);
 
   // ---- week picker ----
-  function mondayOf(d) {
-    const x = new Date(d);
-    const day = x.getDay(); // 0=Sun, 1=Mon, ...
-    const delta = (day === 0 ? -6 : 1 - day);
-    x.setDate(x.getDate() + delta);
-    x.setHours(0, 0, 0, 0);
-    return x;
-  }
-  function fmtDate(d) {
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, "0");
-    const day = String(d.getDate()).padStart(2, "0");
-    return y + "-" + m + "-" + day;
-  }
+  // Weeks are the caller's local Mon 00:00 in their effective tz (homeTz, from
+  // whoami), the same week the server buckets in — see admin/dev-ui-week.ts.
+  ${devUiLocalYmd.toString()}
+  ${devUiMondayYmd.toString()}
+  ${devUiLocalMidnightIso.toString()}
   function setWeek(weekOffset) {
-    const start = mondayOf(new Date());
-    start.setDate(start.getDate() + weekOffset * 7);
-    const end = new Date(start);
-    end.setDate(end.getDate() + 7);
-    $("win-start").value = fmtDate(start);
-    $("win-end").value = fmtDate(end);
+    const today = devUiLocalYmd(Date.now(), homeTz);
+    $("win-start").value = devUiMondayYmd(today, weekOffset);
+    $("win-end").value = devUiMondayYmd(today, weekOffset + 1);
   }
   $("win-this").addEventListener("click", () => setWeek(0));
   $("win-next").addEventListener("click", () => setWeek(1));
@@ -300,7 +289,7 @@ const HTML = `<!doctype html>
     const ws = $("win-start").value, we = $("win-end").value;
     if (!ws || !we) { alert("pick a window first"); return; }
     const r = await call("POST", "/v1/resolve", {
-      body: { window_start: ws + "T00:00:00Z", window_end: we + "T00:00:00Z" }
+      body: { window_start: devUiLocalMidnightIso(ws, homeTz), window_end: devUiLocalMidnightIso(we, homeTz) }
     });
     show("last-resp", r);
     if (r.body && r.body.plan_hash) $("plan-hash").value = r.body.plan_hash;
@@ -322,8 +311,8 @@ const HTML = `<!doctype html>
   });
 
   // ---- bootstrap ----
-  setWeek(0);
-  loadActiveAccount();
+  // The week picker needs homeTz, so fill it once whoami has answered.
+  loadActiveAccount().finally(() => setWeek(0));
   refreshTasks();
 
   // ---- fit-curve viewer ----
@@ -484,7 +473,7 @@ export function mountDevUiRoute(
   app: Hono<{ Bindings: Env; Variables: AppVariables }>,
 ) {
   app.get("/admin/dev-ui", requireAccess, (c) => {
-    return new Response(HTML, {
+    return new Response(DEV_UI_HTML, {
       status: 200,
       headers: {
         "content-type": "text/html; charset=utf-8",

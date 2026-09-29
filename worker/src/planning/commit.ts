@@ -6,9 +6,10 @@ import { SCHEDULER_CHUNK_ID_KEY } from "../providers/types";
 import { SCHEDULER_HORIZON_MS } from "./scheduler-chunks";
 import { requireOwner } from "../middleware/owner-gate";
 import { defaultCalendarProvider } from "../index-providers";
-import { getProposedPlan, markProposedPlanCommittedStmt } from "./proposed-plans";
+import { getProposedPlan, markProposedPlanCommittedStmt, planProducedInTz } from "./proposed-plans";
 import { syncBookingTime } from "../db/bookings";
 import { D } from "../schema/descriptions";
+import { getHomeTz } from "../db/users";
 
 const CommitBodySchema = z.object({ plan_hash: z.string().describe(D.response.plan_hash) });
 
@@ -68,6 +69,12 @@ export interface CommitOptions {
    *  placement must not keep a stale done-paint). Callers thread
    *  env.CREATE_COLOR_ID; the fallback mirrors the PATCH handler's default. */
   createColorId?: string;
+  /** The subject's CURRENT effective tz (plus SCHEDULER_TZ, the reading of a
+   *  legacy NULL window_tz). A pending plan produced in any other tz is
+   *  answered exactly like a vanished hash (404): its week and business hours
+   *  are the old tz's, e.g. a resolve that read the old tz and inserted after a
+   *  PATCH /v1/timezone had already deleted the pending plans. */
+  currentTz?: { tz: string; schedulerTz: string };
 }
 
 export async function commitPlan(
@@ -86,6 +93,9 @@ export async function commitPlan(
   if (plan.subject !== ownerSubject) return { status: 404, body: { error: "not_found" } };
   if (plan.committed_at) {
     return { status: 200, body: { plan_hash: planHash, already_committed: true } };
+  }
+  if (opts.currentTz && !planProducedInTz(plan, opts.currentTz.tz, opts.currentTz.schedulerTz)) {
+    return { status: 404, body: { error: "not_found" } };
   }
   if (Date.parse(plan.expires_at) < Date.now()) {
     return { status: 410, body: { error: "plan_expired" } };
@@ -327,7 +337,7 @@ export function mountCommitRoute(
     path: "/commit",
     operationId: "commit",
     summary: "Commit a proposed plan to Google Calendar.",
-    description: "Commit a proposed plan (by plan_hash) to Google Calendar, creating/updating the corresponding events. Irreversible from the API's perspective. Tasks listed as dropped in the plan are reset to status 'pending' with their placement stamp cleared, so they re-enter the backlog for future resolves. Schedule entries whose task is no longer live at commit time (deleted, done, or cancelled between resolve and commit) are skipped: no event is created and any existing event for that chunk is removed, releasing its slot. The 'committed' count reflects only the live tasks committed.",
+    description: "Commit a proposed plan (by plan_hash) to Google Calendar, creating/updating the corresponding events. Irreversible from the API's perspective. Tasks listed as dropped in the plan are reset to status 'pending' with their placement stamp cleared, so they re-enter the backlog for future resolves. Schedule entries whose task is no longer live at commit time (deleted, done, or cancelled between resolve and commit) are skipped: no event is created and any existing event for that chunk is removed, releasing its slot. The 'committed' count reflects only the live tasks committed. A pending plan produced under a timezone other than the caller's current effective timezone (a resolve that raced a timezone change) is answered 404 not_found, exactly as if it had vanished; re-resolve to get a plan for the new timezone.",
     security: [{ BearerAuth: [] }],
     request: {
       body: { content: { "application/json": { schema: CommitBodySchema } }, required: true },
@@ -361,7 +371,11 @@ export function mountCommitRoute(
     if (owner instanceof Response) return owner as any;
     const parsed = c.req.valid("json");
     const cal = c.var.calendarProvider ?? await defaultCalendarProvider(c.env, owner);
-    const result = await commitPlan(c.env.DB, cal, parsed.plan_hash, owner, { createColorId: c.env.CREATE_COLOR_ID });
+    const result = await commitPlan(c.env.DB, cal, parsed.plan_hash, owner, {
+      createColorId: c.env.CREATE_COLOR_ID,
+      // Same stale-tz refusal as the accept path (planning/accept.ts).
+      currentTz: { tz: await getHomeTz(c.env.DB, owner, c.env.SCHEDULER_TZ), schedulerTz: c.env.SCHEDULER_TZ },
+    });
     return c.json(result.body as Record<string, unknown>, result.status as 200 | 400 | 404 | 410);
   });
 }

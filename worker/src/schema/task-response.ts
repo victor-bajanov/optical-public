@@ -1,6 +1,6 @@
 // worker/src/schema/task-response.ts
 import { z } from "zod";
-import { ContextEnum, IsoDateTime, TimeOfDay, Uuid } from "./common";
+import { ContextEnum, IanaZone, IsoDateTime, TimeOfDay, Uuid } from "./common";
 import { D } from "./descriptions";
 
 const Chunk = z.object({ duration_minutes: z.number().int().positive().describe(D.task.chunks.duration_minutes) });
@@ -18,6 +18,7 @@ const PreferredWindow = z.object({
   start: TimeOfDay.describe(D.task.preferred_windows.start),
   end: TimeOfDay.describe(D.task.preferred_windows.end),
   hard: z.boolean().describe(D.task.preferred_windows.hard),
+  tz: IanaZone.describe(D.task.preferred_windows.tz).optional(),
 });
 const Dependency = z.discriminatedUnion("type", [
   z.object({ type: z.literal("after_task"), ref: Uuid.describe(D.task.dependencies.ref), hard: z.boolean().describe(D.task.dependencies.hard) }),

@@ -732,32 +732,38 @@ describe("runWebhookReplan", () => {
     expect(notify.sent).toHaveLength(0);
   });
 
-  it("drop-only replan: the drop baseline buckets the week in SCHEDULER_TZ, even for a home_tz user", async () => {
-    // Week identity must use the tz that produced the window — every producer
-    // anchors on SCHEDULER_TZ. A Sydney week straddles two UTC weeks, so
-    // bucketing a UTC user's lookup in home_tz splits it and the mid-week
-    // committed plan below stops matching this Mon-anchored resolve.
-    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', 'UTC', '2026-05-01T00:00:00Z')").run();
-    const week = localWeekWindow(new Date().toISOString(), "Australia/Sydney");
-    // A mid-week-narrowed commit of the same Sydney week (Wed 09:00 local) —
-    // the shape week-identity matching exists for.
-    const midWeek = {
-      start: new Date(Date.parse(week.start) + 2 * 86_400_000 + 9 * 3_600_000).toISOString(),
-      end: week.end,
-    };
+  it.each([
+    // Sun 17 May 10:00 PDT = Mon 18 May 03:00 AEST: in Sydney this is the NEXT
+    // week after the LA window's, so a partial migration (window in home_tz,
+    // baseline in SCHEDULER_TZ) misses it.
+    ["Sunday-narrowed", "2026-05-17T17:00:00.000Z"],
+    // Wed 13 May 00:00Z is mid-week everywhere: it is the LA week, but not the
+    // Sydney week SCHEDULER_TZ would resolve at this instant (Mon 18 May), so
+    // the pre-migration code misses it.
+    ["Wednesday-narrowed", "2026-05-13T00:00:00.000Z"],
+  ])("drop-only replan: the drop baseline buckets the week in the user's home_tz (%s commit)", async (_label, narrowedStart) => {
+    // Every producer and consumer of week identity uses the subject's
+    // effective tz. The clock (2026-05-18T00:00Z) is Sun 17 May 17:00 PDT, so a
+    // Los Angeles user's force-resolve week is [Mon 11 May, Mon 18 May) PDT. The
+    // committed plan is a mid-week-narrowed commit of that same LA week; if
+    // the baseline misses it, the accepted drop re-emails.
+    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', 'America/Los_Angeles', '2026-05-01T00:00:00Z')").run();
+    const laWeek = localWeekWindow(new Date().toISOString(), "America/Los_Angeles");
+    expect(laWeek).toEqual({ start: "2026-05-11T07:00:00.000Z", end: "2026-05-18T07:00:00.000Z" });
+    const narrowed = { start: narrowedStart, end: laWeek.end };
     const drop = { task_id: "t1", title: "Deep work", drop_cost: 5, reason: "drop_was_cheaper_than_alternatives", contributing_constraints: ["preferred_window"] };
     await env.DB.prepare(
-      "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end, window_tz) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'America/Los_Angeles')",
     )
       .bind(
-        "committed-drop-midweek",
-        JSON.stringify({ schedule: [], dropped: [drop], window: midWeek }),
+        "committed-drop-narrowed",
+        JSON.stringify({ schedule: [], dropped: [drop], window: narrowed }),
         "2026-05-17T00:00:00.000Z",
         "2099-01-01T00:00:00.000Z",
         "2026-05-17T01:00:00.000Z",
         "primary",
-        midWeek.start,
-        midWeek.end,
+        narrowed.start,
+        narrowed.end,
       )
       .run();
 
@@ -775,6 +781,28 @@ describe("runWebhookReplan", () => {
     });
     expect(result.kind).toBe("no_diff");
     expect(notify.sent).toHaveLength(0);
+  });
+
+  it("forceResolve for a home_tz user resolves the current week in THEIR tz and emails in it", async () => {
+    // 2026-05-18T00:00Z is Mon 18 May 10:00 in Sydney but Sun 17 May 17:00 in
+    // Los Angeles: the LA user's current week is the one ending tonight.
+    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', 'America/Los_Angeles', '2026-05-01T00:00:00Z')").run();
+    const cal = new MockCalendarProvider();
+    cal.fetchIncrementalChanges = async () => ({ changes: [], nextSyncToken: "tok-fresh", syncTokenInvalidated: false });
+    const notify = new MockNotificationProvider();
+    const result = await runWebhookReplan({
+      env: makeEnv(),
+      calendar: cal,
+      notify,
+      accountEmail: "primary",
+      oauthIssuer: "https://scheduler.example.com",
+      forceResolve: true,
+      triggerInviteTitle: "manual replan",
+    });
+    expect(result.kind).toBe("replanned");
+    if (result.kind !== "replanned") return;
+    expect(result.model.window).toEqual({ start: "2026-05-11T07:00:00.000Z", end: "2026-05-18T07:00:00.000Z" });
+    expect(result.model.tz).toBe("America/Los_Angeles");
   });
 
   it("drop-only replan: a NEWLY dropped task (not dropped in the last accepted plan) → replanned, email sent", async () => {
@@ -913,6 +941,36 @@ describe("runWebhookReplan", () => {
       start: "2026-06-14T14:00:00.000Z",
       end: "2026-06-21T14:00:00.000Z",
     });
+  });
+
+  it("buckets a changed event into the user's home_tz week, not the SCHEDULER_TZ week", async () => {
+    // Sun 14 June 13:00 PDT = Mon 15 June 06:00 AEST: the Sydney week of Mon
+    // 15 June, but the Los Angeles week of Mon 8 June.
+    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', 'America/Los_Angeles', '2026-05-01T00:00:00Z')").run();
+    const cal = new MockCalendarProvider();
+    cal.fetchIncrementalChanges = async () => ({
+      changes: [
+        {
+          kind: "upsert",
+          event: { id: "la-sun", summary: "Sunday lunch", start: "2026-06-14T20:00:00.000Z", end: "2026-06-14T21:00:00.000Z", extendedProperties: {} },
+        },
+      ],
+      nextSyncToken: "tok-new",
+      syncTokenInvalidated: false,
+    });
+    const notify = new MockNotificationProvider();
+    const result = await runWebhookReplan({
+      env: makeEnv(),
+      calendar: cal,
+      notify,
+      accountEmail: "primary",
+      oauthIssuer: "https://scheduler.example.com",
+    });
+    expect(result.kind).toBe("replanned");
+    if (result.kind !== "replanned") return;
+    expect(notify.sent).toHaveLength(1);
+    expect(result.model.window).toEqual({ start: "2026-06-08T07:00:00.000Z", end: "2026-06-15T07:00:00.000Z" });
+    expect(result.model.tz).toBe("America/Los_Angeles");
   });
 
   it("accumulates triggerEventIds for multiple changed events in the SAME week (both render as new-clash)", async () => {

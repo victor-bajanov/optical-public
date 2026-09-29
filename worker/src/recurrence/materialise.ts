@@ -78,6 +78,14 @@ export function materialiseTemplate(
 
     const reservedStripped = { ...(tplBody.task_body ?? {}) };
     for (const k of RESERVED_TASK_BODY_KEYS) delete reservedStripped[k];
+    // Card E: a pinned_tz template's windows are read in that zone, so its
+    // instances carry it on every window without one. Untimezoned templates stay
+    // unstamped (their windows follow the user's tz until a change freezes them).
+    if (tplBody.pinned_tz && Array.isArray(reservedStripped.preferred_windows)) {
+      reservedStripped.preferred_windows = reservedStripped.preferred_windows.map((w: unknown) =>
+        w && typeof w === "object" && !("tz" in w) ? { ...w, tz: tplBody.pinned_tz } : w,
+      );
+    }
 
     const body: Record<string, unknown> & { template_id: string } = {
       title: tplBody.title,

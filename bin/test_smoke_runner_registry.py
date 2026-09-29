@@ -160,16 +160,16 @@ def test_dev_target_matches_smoke_lib_constants():
 
 
 # =============================================================================
-# HARNESSES — sanity: all ten present, with the audited exit/parser/target
+# HARNESSES — sanity: all eleven present, with the audited exit/parser/target
 # facts from the implementation plan.
 # =============================================================================
 
 
-def test_all_ten_harnesses_registered():
+def test_all_eleven_harnesses_registered():
     assert set(reg.HARNESSES) == {
         "regression-smoke", "reset-smoke-env", "multiuser-smoke", "meeting-smoke",
         "booking-smoke", "config-smoke", "engine-smoke", "feed-smoke",
-        "poll-smoke", "ms-smoke",
+        "poll-smoke", "ms-smoke", "timezone-smoke",
     }
 
 
@@ -184,6 +184,7 @@ def test_all_ten_harnesses_registered():
     ("feed-smoke", "pass01", "dash", False),
     ("poll-smoke", "pass012", "dash", False),
     ("ms-smoke", "pass012", "colon", False),
+    ("timezone-smoke", "pass01", "dash", False),
 ])
 def test_harness_exit_convention_parser_interactive(name, exit_convention, parser, interactive):
     h = reg.HARNESSES[name]
@@ -497,6 +498,24 @@ def test_config_smoke_env():
                           full_base_env(), full_identities(cfg), cfg)
     assert run.env["A_BEARER"] == "bearA"
     assert run.env["A_EXPECTED_EMAIL"] == "a@example.com"
+
+
+def test_timezone_smoke_env_mirrors_config_smoke():
+    """timezone-smoke (internal design notes, Card D) is config-smoke's
+    shape: one A identity, API calls plus resolves, the bearer alone selects
+    the calendar — so no --provider and no D1."""
+    cfg = full_config()
+    h = reg.HARNESSES["timezone-smoke"]
+    assert h.provider_flag is None
+    assert h.needs == ()
+    run = reg.compose_env(h, "default", "dev", full_base_env(), full_identities(cfg), cfg)
+    assert run.env["A_BEARER"] == "bearA"
+    assert run.env["A_EXPECTED_EMAIL"] == "a@example.com"
+    assert run.argv == ("uv", "run", "bin/timezone-smoke.py")
+    assert reg._find_mode(h, "default").targets == SHARED_TARGETS
+    ms = reg._find_mode(h, "microsoft")
+    assert ms.provider == "microsoft" and ms.identities == {"A": "microsoft:a"}
+    assert ms.targets == (MICROSOFT_TARGET,)
 
 
 def test_engine_smoke_auto_mode_is_first_and_passes_no_phase():
@@ -1331,6 +1350,10 @@ _REQUIRED_ENV_TABLE = [
      {"SCHEDULER_URL", "A_BEARER", "A_REFRESH", "A_EXPECTED_EMAIL"}),
     ("config-smoke", "microsoft", MICROSOFT_TARGET,
      {"SCHEDULER_URL", "A_BEARER", "A_REFRESH", "A_EXPECTED_EMAIL"}),
+    ("timezone-smoke", "default", "dev",
+     {"SCHEDULER_URL", "A_BEARER", "A_REFRESH", "A_EXPECTED_EMAIL"}),
+    ("timezone-smoke", "microsoft", MICROSOFT_TARGET,
+     {"SCHEDULER_URL", "A_BEARER", "A_REFRESH", "A_EXPECTED_EMAIL"}),
     ("engine-smoke", "auto", "dev",
      {"SCHEDULER_URL", "D1_DATABASE_ID", "A_BEARER", "A_REFRESH", "A_EXPECTED_EMAIL"}),
     ("engine-smoke", "fanout", "dev",
@@ -1355,9 +1378,10 @@ _REQUIRED_ENV_TABLE = [
 
 
 def test_required_env_table_covers_every_harness_mode_combo():
-    # 26 harness x mode combos — one per registered Mode across all ten
+    # 28 harness x mode combos — one per registered Mode across all eleven
     # harnesses (regression x4, reset x2, multiuser x2, meeting x4,
-    # booking x4, config x2, engine x3, feed x2, poll x2, ms-smoke x1). The
+    # booking x4, config x2, engine x3, feed x2, poll x2, ms-smoke x1,
+    # timezone x2). The
     # provider axis (WP1.3) added multiuser's "microsoft" and meeting's
     # "microsoft-2-account"/"microsoft-3-account" and poll's "microsoft";
     # 2026-09-17 added config's, engine's and feed's "microsoft" and
@@ -1365,7 +1389,7 @@ def test_required_env_table_covers_every_harness_mode_combo():
     all_combos = {(h.name, m.name) for h in reg.HARNESSES.values() for m in h.modes}
     table_combos = {(name, mode) for name, mode, _target, _req in _REQUIRED_ENV_TABLE}
     assert table_combos == all_combos
-    assert len(_REQUIRED_ENV_TABLE) == 26
+    assert len(_REQUIRED_ENV_TABLE) == 28
 
 
 @pytest.mark.parametrize("harness_name,mode_name,target,required", _REQUIRED_ENV_TABLE)

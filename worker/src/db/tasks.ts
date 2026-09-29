@@ -58,3 +58,36 @@ export async function loadPinnedTaskIds(db: D1Database, owner: string): Promise<
     .all<{ id: string }>();
   return new Set((r.results ?? []).map((row) => row.id));
 }
+
+/** Card E of internal design notes. Bound (not yet run) UPDATE that
+ *  stamps `tz` onto every preferred window lacking one, on all of the owner's
+ *  task rows (done ones too, so a later un-done keeps its real-world window),
+ *  and bumps updated_at on the rows it changes. Windows with a tz and
+ *  task_templates (untimezoned templates deliberately follow the user's tz) are
+ *  untouched. Batched with the home_tz write in handlers/timezone.ts so the two
+ *  land atomically. Window order is kept (json_each walks the array in index
+ *  order). meta.changes = tasks stamped. Like every whole-body task write, it
+ *  can lose a race with a concurrent task PATCH (read-modify-write); accepted. */
+export function stampPreferredWindowTzStmt(
+  db: D1Database,
+  owner: string,
+  tz: string,
+  now: string = new Date().toISOString(),
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `UPDATE tasks
+          SET body = json_set(body, '$.preferred_windows', json((
+                SELECT json_group_array(
+                         CASE WHEN json_type(w.value, '$.tz') IS NULL
+                              THEN json_set(w.value, '$.tz', ?2)
+                              ELSE json(w.value) END)
+                  FROM (SELECT value FROM json_each(tasks.body, '$.preferred_windows') ORDER BY key) AS w))),
+              updated_at = ?3
+        WHERE owner_subject = ?1
+          AND json_type(body, '$.preferred_windows') = 'array'
+          AND EXISTS (SELECT 1 FROM json_each(tasks.body, '$.preferred_windows') AS e
+                       WHERE json_type(e.value, '$.tz') IS NULL)`,
+    )
+    .bind(owner, tz, now);
+}

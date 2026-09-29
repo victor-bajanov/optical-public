@@ -440,3 +440,41 @@ describe("solveProblem — dropped-task surface", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Card E (internal design notes): out-of-horizon availability sentinel
+// ---------------------------------------------------------------------------
+
+describe("out-of-horizon availability sentinel (foreign-tz hard window, no room)", () => {
+  // The Worker encodes "no room left" as one quarter starting at window.end.
+  it.each([
+    [false, "drop_was_cheaper_than_alternatives"],
+    [true, "must_include_unplaceable_in_isolation"],
+  ])("must_include=%s drops cleanly as %s, OPTIMAL, never infeasible", (mustInclude, reason) => {
+    const base = benchProblem(pMustInclude);
+    const end = base.window.end;
+    const endPlus15 = new Date(Date.parse(end + "Z") + 15 * 60_000).toISOString().slice(0, 19);
+    const t0 = base.tasks[0]!;
+    const p: Problem = {
+      ...base,
+      tasks: [
+        {
+          ...t0,
+          id: "s0",
+          must_include: mustInclude,
+          pinned_at: undefined,
+          preferred_windows: [],
+          dependencies: [],
+          chunks: [{ chunk_id: "s0#0", duration_minutes: 60 }],
+          availability_windows: [{ start: end, end: endPlus15 }] as Problem["tasks"][number]["availability_windows"],
+        },
+      ],
+    };
+    const result = solveProblem(p, GENEROUS);
+    expect(result.kind).toBe("solution");
+    if (result.kind !== "solution") return;
+    expect(result.solution.diagnostics.status).toBe("OPTIMAL");
+    expect(result.solution.schedule).toEqual([]);
+    expect(result.solution.dropped.map((d) => [d.task_id, d.reason])).toEqual([["s0", reason]]);
+  });
+});

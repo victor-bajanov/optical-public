@@ -122,6 +122,44 @@ describe("POST /v1/commit", () => {
     expect(cal.getCreated()[0]!.colorId).toBe("5");
   });
 
+  describe("a pending plan produced in a tz other than the subject's current one", () => {
+    // h1 (beforeEach) is a legacy NULL-window_tz row = produced under
+    // SCHEDULER_TZ (Sydney). A resolve that read the old tz can insert it after
+    // a PATCH /v1/timezone already cleared the pending plans; committing it
+    // would apply old-tz weeks and business hours.
+    const post = (cal: MockCalendarProvider, hash: string) =>
+      makeApp(cal).request(
+        "/v1/commit",
+        { method: "POST", headers: { "content-type": "application/json", Authorization: "Bearer fake" }, body: JSON.stringify({ plan_hash: hash }) },
+        env,
+      );
+
+    it("is refused with the vanished-hash answer (404 not_found) and nothing is committed", async () => {
+      await env.DB.prepare("INSERT OR REPLACE INTO users (subject, home_tz, created_at) VALUES ('primary', 'America/Los_Angeles', '2026-05-01T00:00:00Z')").run();
+      try {
+        const cal = new MockCalendarProvider();
+        const res = await post(cal, "h1");
+        expect(res.status).toBe(404);
+        expect(await res.json()).toEqual({ error: "not_found" });
+        expect(cal.getCreated()).toHaveLength(0);
+        expect((await getProposedPlan(env.DB, "h1"))?.committed_at).toBeNull();
+      } finally {
+        await env.DB.prepare("DELETE FROM users WHERE subject = 'primary'").run();
+      }
+    });
+
+    it("a plan tagged with the subject's current tz commits", async () => {
+      await env.DB.prepare("INSERT OR REPLACE INTO users (subject, home_tz, created_at) VALUES ('primary', 'America/Los_Angeles', '2026-05-01T00:00:00Z')").run();
+      try {
+        await env.DB.prepare("UPDATE proposed_plans SET window_tz = 'America/Los_Angeles' WHERE plan_hash = 'h1'").run();
+        const res = await post(new MockCalendarProvider(), "h1");
+        expect(res.status).toBe(200);
+      } finally {
+        await env.DB.prepare("DELETE FROM users WHERE subject = 'primary'").run();
+      }
+    });
+  });
+
   it("marks the plan committed_at and flips task status to committed", async () => {
     const cal = new MockCalendarProvider();
     const app = makeApp(cal);

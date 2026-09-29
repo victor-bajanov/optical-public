@@ -125,6 +125,13 @@ describe("/v1/plans/:hash", () => {
     expect(json).not.toHaveProperty("window_end");
   });
 
+  it("GET response omits the internal window_tz column", async () => {
+    await env.DB.prepare("UPDATE proposed_plans SET window_tz = 'Australia/Sydney' WHERE plan_hash = 'hash-1'").run();
+    const res = await makeApp().request("/v1/plans/hash-1", { headers: { Authorization: "Bearer fake" } }, env);
+    expect(res.status).toBe(200);
+    expect(await res.json()).not.toHaveProperty("window_tz");
+  });
+
   it("DELETE cannot remove another tenant's plan", async () => {
     await env.DB.prepare(
       "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject) VALUES ('b-plan', ?, '2026-05-18T12:00:00Z', '2099-01-01T00:00:00Z', NULL, 'b@org')",
@@ -195,6 +202,21 @@ describe("GET /v1/plans (pending list)", () => {
     // Plan bodies are heavyweight; the list is a summary — fetch a body via
     // GET /plans/{hash}.
     expect(json.plans[0]).not.toHaveProperty("body");
+  });
+
+  it("omits pending plans produced in a tz other than the caller's current one", async () => {
+    // Both seeded live plans are legacy NULL-window_tz rows (SCHEDULER_TZ,
+    // Sydney). After the caller moves to Los Angeles only a plan produced in
+    // LA is theirs to accept; the old-tz ones would be refused on commit.
+    await env.DB.prepare("INSERT OR REPLACE INTO users (subject, home_tz, created_at) VALUES ('me@x', 'America/Los_Angeles', '2026-05-01T00:00:00Z')").run();
+    try {
+      await env.DB.prepare("UPDATE proposed_plans SET window_tz = 'America/Los_Angeles' WHERE plan_hash = 'p-late-week'").run();
+      const res = await makeApp().request("/v1/plans", { headers: { Authorization: "Bearer fake" } }, env);
+      const json = (await res.json()) as { plans: Array<{ plan_hash: string }> };
+      expect(json.plans.map((p) => p.plan_hash)).toEqual(["p-late-week"]);
+    } finally {
+      await env.DB.prepare("DELETE FROM users WHERE subject = 'me@x'").run();
+    }
   });
 
   it("returns an empty list when nothing is pending", async () => {

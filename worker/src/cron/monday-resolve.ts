@@ -1,11 +1,20 @@
 // Cron expression: `0 15 * * SUN` (UTC) = 01:00 AEST Monday.
 // During AEDT (UTC+11, ~Oct-Apr), this fires at 02:00 local — still well before
 // normal work hours, so we deliberately do NOT shift with DST per spec §8.1.
+//
+// The schedule is one instance-wide instant, but each subject's week is their
+// own: the window, drop baseline and email are all in the subject's effective
+// tz (users.home_tz, else SCHEDULER_TZ). West of about UTC+9 the cron fires on
+// the user's Sunday, so the window is the UPCOMING local week
+// (upcomingLocalWeekWindow), not the one still ending; those users get their
+// "Monday" email on Sunday (an accepted v1 limitation, internal design notes
+// decision 7).
 import type { Env } from "../env";
 import type { CalendarProvider } from "../providers/calendar-provider";
 import type { NotificationProvider } from "../providers/notification-provider";
 import { runResolve } from "../planning/resolve-internal";
-import { localWeekWindow } from "../planning/datetime";
+import { upcomingLocalWeekWindow } from "../planning/datetime";
+import { getHomeTz } from "../db/users";
 import { computePlanDiff, type PlanBody } from "../diff/compute-diff";
 import { buildReplanEmailModel } from "../diff/email-model";
 import { attachRenderSnapshot, deleteProposedPlan, getCommittedDroppedForWeek } from "../planning/proposed-plans";
@@ -30,11 +39,15 @@ export async function runMondayResolve(args: MondayResolveArgs): Promise<MondayR
   const { env, calendar, notification } = args;
   const accountEmail = args.accountEmail;
   const now = args.now ?? new Date();
-  // The cron fires at 01:00/02:00 *local* Monday, so localWeekWindow(now) is the
-  // week just starting. Anchoring to the local Monday (not UTC) keeps the window
+  // Week identity is in the subject's effective tz, the same tz every other
+  // producer and consumer (webhook, resolve, supersede, accept) uses for them.
+  const tz = await getHomeTz(env.DB, accountEmail, env.SCHEDULER_TZ);
+  // The week starting on the user's nearest local Monday: the one just begun in
+  // Sydney (01:00/02:00 Mon at fire time), the one about to begin anywhere
+  // still on Sunday. Anchoring to the local Monday (not UTC) keeps the window
   // aligned with how weeks are committed — a UTC-Monday window started at 10:00
-  // local and dropped Monday-morning chunks. See localWeekWindow.
-  const window = localWeekWindow(now.toISOString(), env.SCHEDULER_TZ);
+  // local and dropped Monday-morning chunks. See upcomingLocalWeekWindow.
+  const window = upcomingLocalWeekWindow(now.toISOString(), tz);
 
   const result = await runResolve({
     env,
@@ -43,6 +56,9 @@ export async function runMondayResolve(args: MondayResolveArgs): Promise<MondayR
     windowEnd: window.end,
     accountEmail,
     trigger: "cron",
+    // The user's live upcoming week, even where it starts after fire time:
+    // their backlog must populate it (not be shed as for a future week).
+    upcomingWeek: true,
   });
 
   if (result.kind === "unsat") {
@@ -56,11 +72,11 @@ export async function runMondayResolve(args: MondayResolveArgs): Promise<MondayR
 
   // Drop baseline = the last accepted plan's dropped set for this calendar
   // week (however its window was anchored), so a task already dropped there
-  // and still dropped is not re-emailed (2026-07-07). SCHEDULER_TZ is the tz
-  // that derived this window (localWeekWindow above), and the churn baseline
-  // buckets it the same way — the two baselines must agree on which plan they
-  // are reading.
-  const committedDropped = await getCommittedDroppedForWeek(env.DB, accountEmail, result.body.window.start, env.SCHEDULER_TZ);
+  // and still dropped is not re-emailed (2026-07-07). `tz` is the tz that
+  // derived this window (above), and the churn baseline (resolve-internal)
+  // buckets it in the same subject tz — the two baselines must agree on which
+  // plan they are reading.
+  const committedDropped = await getCommittedDroppedForWeek(env.DB, accountEmail, result.body.window.start, tz, env.SCHEDULER_TZ);
   const baseline: PlanBody = {
     schedule: result.priorEvents,
     dropped: committedDropped,
@@ -95,7 +111,7 @@ export async function runMondayResolve(args: MondayResolveArgs): Promise<MondayR
     proposedSchedule: result.body.schedule,
     externalEvents: result.externalEvents,
     window: result.body.window,
-    tz: env.SCHEDULER_TZ,
+    tz,
     trigger: "monday-cron",
     warnings: result.body.warnings ?? [],
     meetingTaskIds: result.meetingTaskIds,

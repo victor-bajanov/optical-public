@@ -5,15 +5,17 @@ import { defaultCalendarProvider } from "../index-providers";
 import { requireBearer } from "../middleware/auth-bearer";
 import { verifyCapabilityWithEnv } from "../auth/capability";
 import { commitPlan } from "./commit";
-import { getCommittedPlansForSubject, getPendingPlansForSubject, getProposedPlan, type ProposedPlanRow } from "./proposed-plans";
+import { getCommittedPlansForSubject, getPendingPlansForSubject, getProposedPlan, planProducedInTz, type ProposedPlanRow } from "./proposed-plans";
 import type { ReplanEmailModel } from "../diff/email-model";
 import { renderConfirmPage, renderAcceptedPage, renderNoticePage, renderErrorPage, type WeekTab } from "../web/accept-page";
 import { formatLocalDate } from "../diff/format-local";
 import { localWeekWindow } from "./datetime";
+import { getHomeTz } from "../db/users";
 import { D } from "../schema/descriptions";
 
-/** Local-calendar-week identity: the Monday-00:00 instant (in `tz`) of the week
- *  containing `iso`. A mid-week replan narrows window_start to "now" (so the
+/** Local-calendar-week identity: the Monday-00:00 instant (in `tz`, the
+ *  subject's effective tz — the one their plans' windows were produced in) of
+ *  the week containing `iso`. A mid-week replan narrows window_start to "now" (so the
  *  solver can't place into the past), so the same week can carry
  *  differently-anchored windows — grouping, labels, and link-window matching
  *  must all use the week, never the raw (start,end) pair. Returns null for an
@@ -28,6 +30,13 @@ function weekKeyOf(iso: string, tz: string): string | null {
 
 function planWeekKey(p: ProposedPlanRow, tz: string): string | null {
   return weekKeyOf(p.window_start ?? p.created_at, tz);
+}
+
+/** Only plans produced in the subject's current tz belong to their current
+ *  weeks. A plan from an earlier tz (a resolve racing a tz change) is treated
+ *  as gone everywhere on this page: never shown, offered, or committed. */
+function inCurrentTz(plans: ProposedPlanRow[], tz: string, schedulerTz: string): ProposedPlanRow[] {
+  return plans.filter((p) => planProducedInTz(p, tz, schedulerTz));
 }
 
 /** Latest pending plan per local calendar week, ordered by window start.
@@ -100,7 +109,7 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
     method: "post", path: "/plans/{plan_hash}/accept", tags: ["internal"],
     operationId: "acceptPlan",
     summary: "Accept (commit) the proposed plan identified by {plan_hash}.",
-    description: "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer. If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. Idempotent on an already-committed hash.",
+    description: "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer. If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. A pending plan produced under a timezone other than the subject's current effective timezone (a resolve that raced a timezone change) is treated the same way as a superseded hash. Idempotent on an already-committed hash.",
     responses: {
       200: { content: { "application/json": { schema: z.object({ ok: z.boolean() }) } }, description: "Committed (idempotent on an already-committed plan)" },
       401: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "Unauthenticated" },
@@ -133,13 +142,18 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
     // the caller explicitly requests JSON via the Accept header.
     const wantsJson = Boolean(isBearerPath || c.req.header("accept")?.includes("application/json"));
     const pathHash = c.req.param("plan_hash");
-    const tz = c.env.SCHEDULER_TZ;
+    // Week grouping in the subject's effective tz — the tz every producer
+    // (webhook, cron, resolve) bucketed their plans' weeks in.
+    const tz = await getHomeTz(c.env.DB, subject, c.env.SCHEDULER_TZ);
 
     const cal = c.var.calendarProvider ?? await defaultCalendarProvider(c.env, subject);
     // Commit EXACTLY the hash in the path — never pre-resolve "latest". A vanished
     // hash surfaces below as 409, so a stale link can never silently apply a
     // different plan.
-    const result = await commitPlan(c.env.DB, cal, pathHash, subject, { createColorId: c.env.CREATE_COLOR_ID });
+    const result = await commitPlan(c.env.DB, cal, pathHash, subject, {
+      createColorId: c.env.CREATE_COLOR_ID,
+      currentTz: { tz, schedulerTz: c.env.SCHEDULER_TZ },
+    });
 
     if (result.status === 200) {
       if (wantsJson) return c.json({ ok: true }, 200);
@@ -149,10 +163,10 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
       // duplicate) must not be offered back as if it were another week.
       const committed = await getProposedPlan(c.env.DB, pathHash);
       const acceptedWeek = committed ? planWeekKey(committed, tz) : null;
-      const acceptsByWeek = latestAcceptByWeek(await getCommittedPlansForSubject(c.env.DB, subject), tz);
+      const acceptsByWeek = latestAcceptByWeek(inCurrentTz(await getCommittedPlansForSubject(c.env.DB, subject), tz, c.env.SCHEDULER_TZ), tz);
       const remaining = latestPerWeek(
         withoutAcceptSuperseded(
-          (await getPendingPlansForSubject(c.env.DB, subject, new Date())).filter(
+          inCurrentTz(await getPendingPlansForSubject(c.env.DB, subject, new Date()), tz, c.env.SCHEDULER_TZ).filter(
             (p) => p.plan_hash !== pathHash && (acceptedWeek === null || planWeekKey(p, tz) !== acceptedWeek),
           ),
           acceptsByWeek,
@@ -172,9 +186,9 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
       // replacement (found via the ws/we the form carried) and re-confirm.
       // A pending plan older than its week's latest accept is not a valid
       // replacement either — never point the caller back at it.
-      const acceptsByWeek = latestAcceptByWeek(await getCommittedPlansForSubject(c.env.DB, subject), tz);
+      const acceptsByWeek = latestAcceptByWeek(inCurrentTz(await getCommittedPlansForSubject(c.env.DB, subject), tz, c.env.SCHEDULER_TZ), tz);
       const pending = withoutAcceptSuperseded(
-        await getPendingPlansForSubject(c.env.DB, subject, new Date()),
+        inCurrentTz(await getPendingPlansForSubject(c.env.DB, subject, new Date()), tz, c.env.SCHEDULER_TZ),
         acceptsByWeek,
         tz,
       );
@@ -232,10 +246,11 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
     if (!claims || claims.purpose !== "accept") {
       return c.html(renderErrorPage(COPY.invalidLink), 400);
     }
-    const tz = c.env.SCHEDULER_TZ;
-    const acceptsByWeek = latestAcceptByWeek(await getCommittedPlansForSubject(c.env.DB, claims.subject), tz);
+    // Subject's effective tz: see the POST handler.
+    const tz = await getHomeTz(c.env.DB, claims.subject, c.env.SCHEDULER_TZ);
+    const acceptsByWeek = latestAcceptByWeek(inCurrentTz(await getCommittedPlansForSubject(c.env.DB, claims.subject), tz, c.env.SCHEDULER_TZ), tz);
     const pending = withoutAcceptSuperseded(
-      await getPendingPlansForSubject(c.env.DB, claims.subject, new Date()),
+      inCurrentTz(await getPendingPlansForSubject(c.env.DB, claims.subject, new Date()), tz, c.env.SCHEDULER_TZ),
       acceptsByWeek,
       tz,
     );

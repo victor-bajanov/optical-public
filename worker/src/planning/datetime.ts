@@ -26,6 +26,13 @@ function getOffsetMinutes(utcMillis: number, tz: string): number {
   return Math.round((localUtcMillis - utcMillis) / 60_000);
 }
 
+/** Wall-clock time of instant `utcMillis` in `tz`, as milliseconds of the
+ *  equivalent naive UTC datetime (so plain arithmetic on the result is naive
+ *  local arithmetic). Unlike toLocalNaive it accepts any minute. */
+export function localNaiveMs(utcMillis: number, tz: string): number {
+  return Date.parse(formatInZone(utcMillis, tz) + "Z");
+}
+
 export function toLocalNaive(iso: string, tz: string): LocalNaive {
   const instant = Date.parse(iso);
   if (Number.isNaN(instant)) {
@@ -50,8 +57,9 @@ export function toLocalNaive(iso: string, tz: string): LocalNaive {
  * Monday on or before it — NOT the next Monday. Both boundaries are real instants
  * anchored to local midnight (Mon 00:00 in `tz`), so the window aligns with how
  * weeks are committed and stays correct across DST. Used to re-resolve the
- * calendar week an edited event falls in, and by the Monday cron to pick the
- * week it fires in. Anchoring locally matters: a 09:00 Monday-AEST chunk is
+ * calendar week an edited event falls in, and as the week-identity bucket
+ * everywhere (supersede, baselines, accept). The Monday cron uses
+ * upcomingLocalWeekWindow instead. Anchoring locally matters: a 09:00 Monday-AEST chunk is
  * 23:00Z the prior Sunday, so a UTC-Monday window would wrongly exclude it.
  */
 export function localWeekWindow(iso: string, tz: string): { start: string; end: string } {
@@ -79,6 +87,24 @@ export function localWeekWindow(iso: string, tz: string): { start: string; end: 
     start: fromLocalNaive(naiveMidnight(mondayMs), tz),
     end: fromLocalNaive(naiveMidnight(mondayMs + 7 * 86_400_000), tz),
   };
+}
+
+/**
+ * The week starting on the local Monday NEAREST to `iso`, in `tz`: that is,
+ * localWeekWindow(iso + 3.5 days, tz). Used by the Monday cron, which fires at
+ * one instance-wide instant (Sun 15:00 UTC). Anywhere from UTC−12 to UTC+14
+ * that instant is between Sun 03:00 and Mon 05:00 local, so +3.5 days always
+ * lands inside the week starting on the Monday just begun (east) or about to
+ * begin (west). localWeekWindow(now) would instead re-resolve the ENDING week
+ * for anyone still on Sunday (e.g. London at Sun 16:00). For Sydney it gives
+ * the same week as localWeekWindow(now).
+ */
+export function upcomingLocalWeekWindow(iso: string, tz: string): { start: string; end: string } {
+  const instant = Date.parse(iso);
+  if (Number.isNaN(instant)) {
+    throw new Error(`invalid ISO datetime: ${iso}`);
+  }
+  return localWeekWindow(new Date(instant + 3.5 * 86_400_000).toISOString(), tz);
 }
 
 const QUARTER_MS = 15 * 60_000;

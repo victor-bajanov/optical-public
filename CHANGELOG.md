@@ -3,6 +3,23 @@
 Curated notes for each public release, newest first. The full commit list for
 a release is in that release's PR on the public repository.
 
+## v1.1.0
+
+- **Per-user timezone:** any signed-in user can now set their own timezone
+  with `GET/PATCH/DELETE /v1/timezone` (`getTimezone`, `setTimezone`,
+  `resetTimezone`). Zones are IANA names, stored canonicalised; UTC offsets
+  and bare legacy aliases are rejected, and `DELETE` falls back to the
+  deployment's `SCHEDULER_TZ`. Previously a deployment ran on one
+  operator-set timezone for everyone.
+- Business hours, week boundaries (webhook and cron windows, churn and drop
+  baselines, supersede, accept grouping) and the Monday cron's upcoming week
+  all follow the user's effective timezone. Changing it discards pending
+  plans; the next resolve moves free-floating chunks, while pins, deadlines
+  and `pinned_tz` templates stay put. A task's preferred windows keep their
+  wall-clock meaning in the timezone they were written in.
+- **Migration 0040** (`proposed_plans.window_tz`) must be applied before
+  deploying. New smoke harness: `bin/timezone-smoke.py`. See runbook §Q.
+
 ## v1.0.2
 
 - **Licence:** the Licensed Work is now "Optical 1.0.0 or later", so point

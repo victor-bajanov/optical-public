@@ -13,7 +13,7 @@ import { computeMovedPlanPatch, reconcileMovedTask, type PatchablePlanBody } fro
 import { signCapabilityWithEnv } from "../auth/capability";
 import { ACCEPT_TTL_SECONDS } from "../planning/accept-ttl";
 import { localWeekWindow } from "../planning/datetime";
-import { getDoneColorId } from "../db/users";
+import { getDoneColorId, getHomeTz } from "../db/users";
 import { getDoneTaskIds } from "../db/tasks";
 import { loadCompletionsByTask } from "../db/chunk-completions";
 import { applyManualMoveStmt, getTaskRow } from "../db/d1";
@@ -334,9 +334,13 @@ export async function runWebhookReplan(args: ReplanArgs): Promise<ReplanResult> 
 
   // Bucket the changed events into the distinct local weeks they touch. The
   // first event seen in a week supplies that week's email subject title.
+  // Weeks are the subject's own local Mon–Mon (effective tz: home_tz, else
+  // SCHEDULER_TZ) — the same tz resolve, supersede, the baselines and accept
+  // bucket in, so every consumer agrees on which week a window belongs to.
+  const tz = await getHomeTz(env.DB, accountEmail, env.SCHEDULER_TZ);
   const weeks = new Map<string, AffectedWeek>();
   for (const e of changedEvents) {
-    const window = localWeekWindow(e.start, env.SCHEDULER_TZ);
+    const window = localWeekWindow(e.start, tz);
     const existing = weeks.get(window.start);
     if (existing) {
       existing.triggerEventIds.push(e.id);
@@ -346,7 +350,7 @@ export async function runWebhookReplan(args: ReplanArgs): Promise<ReplanResult> 
   }
   if (weeks.size === 0) {
     // forceResolve with no detected human change → resolve the current week.
-    const window = localWeekWindow(detectStart, env.SCHEDULER_TZ);
+    const window = localWeekWindow(detectStart, tz);
     weeks.set(window.start, { window, inviteTitle: triggerInviteTitle ?? "manual replan", triggerEventIds: [] });
   }
 
@@ -363,7 +367,7 @@ export async function runWebhookReplan(args: ReplanArgs): Promise<ReplanResult> 
   const results: ReplanResult[] = [];
   for (const week of weeks.values()) {
     results.push(
-      await resolveWeek({ env, calendar, notify, accountEmail, oauthIssuer, dryRun, week }),
+      await resolveWeek({ env, calendar, notify, accountEmail, oauthIssuer, dryRun, week, tz }),
     );
   }
 
@@ -388,8 +392,10 @@ async function resolveWeek(args: {
   oauthIssuer: string;
   dryRun: boolean;
   week: AffectedWeek;
+  /** The subject's effective tz — the tz that produced `week.window`. */
+  tz: string;
 }): Promise<ReplanResult> {
-  const { env, calendar, notify, accountEmail, oauthIssuer, dryRun, week } = args;
+  const { env, calendar, notify, accountEmail, oauthIssuer, dryRun, week, tz } = args;
 
   const result = await runResolve({
     env,
@@ -409,10 +415,10 @@ async function resolveWeek(args: {
 
   // Drop baseline = the last accepted plan's dropped set for this calendar
   // week (however its window was anchored), so a task already dropped there
-  // and still dropped is not re-emailed (2026-07-07). SCHEDULER_TZ is the tz
+  // and still dropped is not re-emailed (2026-07-07). `tz` is the subject tz
   // that produced this window (above), and the churn baseline buckets it the
   // same way — the two baselines must agree on which plan they are reading.
-  const committedDropped = await getCommittedDroppedForWeek(env.DB, accountEmail, result.body.window.start, env.SCHEDULER_TZ);
+  const committedDropped = await getCommittedDroppedForWeek(env.DB, accountEmail, result.body.window.start, tz, env.SCHEDULER_TZ);
   const baseline: PlanBody = {
     schedule: result.priorEvents,
     dropped: committedDropped,
@@ -448,7 +454,7 @@ async function resolveWeek(args: {
     proposedSchedule: result.body.schedule,
     externalEvents: result.externalEvents,
     window: result.body.window,
-    tz: env.SCHEDULER_TZ,
+    tz,
     trigger: { kind: "webhook", inviteTitle: week.inviteTitle },
     triggerEventIds: week.triggerEventIds,
     warnings: result.body.warnings ?? [],

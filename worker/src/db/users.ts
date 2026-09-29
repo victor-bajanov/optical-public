@@ -1,3 +1,4 @@
+import { canonicalZoneName } from "../schema/common";
 export type UserRole = "admin" | "member";
 
 export interface UserRow {
@@ -81,6 +82,36 @@ export async function getUser(db: D1Database, subject: string): Promise<UserRow 
 export async function getHomeTz(db: D1Database, subject: string, schedulerTz: string): Promise<string> {
   const user = await getUser(db, subject);
   return user?.home_tz ?? schedulerTz;
+}
+
+/** Canonical spelling of an IANA zone, as Intl resolves it, so
+ *  "europe/london" is stored as "Europe/London". Throws RangeError for an
+ *  unknown zone or a UTC offset, so neither can ever reach the users row. */
+export function canonicalIanaZone(tz: string): string {
+  return canonicalZoneName(tz);
+}
+
+/** Bound (not yet run) home_tz UPDATE, so the /v1/timezone handler can batch
+ *  it atomically with the pending-plan delete. UPDATE-only: a config write
+ *  never creates a users row (that would grant membership and add the subject
+ *  to the active fan-out). `tz` must already be canonical, or null to clear. */
+export function setHomeTzStmt(db: D1Database, subject: string, tz: string | null): D1PreparedStatement {
+  return db.prepare(`UPDATE users SET home_tz = ? WHERE subject = ?`).bind(tz, subject);
+}
+
+/** Set the subject's home_tz (internal design notes, Card A) to the
+ *  canonical zone name and return it, or null if the subject has no users row
+ *  (nothing is written). Throws RangeError for an unknown zone. */
+export async function setHomeTz(db: D1Database, subject: string, tz: string): Promise<string | null> {
+  const canonical = canonicalIanaZone(tz);
+  const res = await setHomeTzStmt(db, subject, canonical).run();
+  return (res.meta?.changes ?? 0) > 0 ? canonical : null;
+}
+
+/** Clear the subject's home_tz so they inherit the instance SCHEDULER_TZ again.
+ *  A no-op for a subject with no users row. */
+export async function clearHomeTz(db: D1Database, subject: string): Promise<void> {
+  await setHomeTzStmt(db, subject, null).run();
 }
 
 // Per-user done color id (task done-marking feature). The user's done_color_id

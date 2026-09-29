@@ -9,7 +9,8 @@
 node_modules/
 
 # Local Claude Code scratch: worktrees (SDD), phase briefs, workflow scripts
-.claude/
+.claude/*
+!.claude/agents/
 
 # superpowers brainstorming visual companion artifacts
 .superpowers/
