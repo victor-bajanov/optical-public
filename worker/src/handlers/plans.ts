@@ -3,7 +3,8 @@ import type { Env } from "../env";
 import type { AppVariables } from "../index-providers";
 import { requireOwner } from "../middleware/owner-gate";
 import { PlanResponse } from "../schema/plan-response";
-import { deleteProposedPlan, getPendingPlansForSubject, getProposedPlan } from "../planning/proposed-plans";
+import { deleteProposedPlan, getPendingPlansForSubject, getProposedPlan, planProducedInTz } from "../planning/proposed-plans";
+import { getHomeTz } from "../db/users";
 
 const PendingPlanSummary = z.object({
   plan_hash: z.string().describe("Content hash identifying the plan; feed to GET/DELETE /plans/{plan_hash} or the accept flow."),
@@ -33,7 +34,7 @@ export function mountPlansRoutes(
     operationId: "listPendingPlans",
     summary: "List every pending (uncommitted, unexpired) proposed plan.",
     description:
-      "List all of the caller's pending proposed plans — uncommitted and unexpired — as lightweight summaries, ordered by window start. A burst of replans can leave pending plans strewn across widely separated weeks; this is the one-call way to enumerate (and then review or DELETE) all of them, instead of probing week-by-week via /plans/latest?covers. Fetch a specific plan's full body via GET /plans/{plan_hash}.",
+      "List all of the caller's pending proposed plans — uncommitted and unexpired — as lightweight summaries, ordered by window start. A burst of replans can leave pending plans strewn across widely separated weeks; this is the one-call way to enumerate (and then review or DELETE) all of them, instead of probing week-by-week via /plans/latest?covers. Plans produced under a timezone other than the caller's current effective timezone are omitted (they cannot be committed). Fetch a specific plan's full body via GET /plans/{plan_hash}.",
     security: [{ BearerAuth: [] }],
     responses: {
       200: {
@@ -50,7 +51,11 @@ export function mountPlansRoutes(
   v1.openapi(listPlansRoute, async (c) => {
     const owner = await requireOwner(c);
     if (owner instanceof Response) return owner as any;
-    const rows = await getPendingPlansForSubject(c.env.DB, owner, new Date());
+    // Only plans produced in the caller's current tz: an old-tz pending plan
+    // (a resolve racing a tz change) is refused on commit, so never list it.
+    const tz = await getHomeTz(c.env.DB, owner, c.env.SCHEDULER_TZ);
+    const rows = (await getPendingPlansForSubject(c.env.DB, owner, new Date()))
+      .filter((row) => planProducedInTz(row, tz, c.env.SCHEDULER_TZ));
     const plans = rows
       .map((row) => ({
         plan_hash: row.plan_hash,
@@ -104,9 +109,10 @@ export function mountPlansRoutes(
     // also treated as not-found.
     if (row.subject !== owner) return c.json({ error: "not_found" }, 404);
     // render_snapshot is internal presentation data, subject is owner-internal,
-    // and window_start/window_end just denormalize body.window; none are part
-    // of PlanResponse — strip all before serializing.
-    const { render_snapshot: _omit, subject: _owner, window_start: _ws, window_end: _we, ...rest } = row;
+    // window_start/window_end just denormalize body.window, and window_tz is
+    // internal week-identity bookkeeping; none are part of PlanResponse —
+    // strip all before serializing.
+    const { render_snapshot: _omit, subject: _owner, window_start: _ws, window_end: _we, window_tz: _wtz, ...rest } = row;
     return c.json(rest as z.infer<typeof PlanResponse>);
   });
 

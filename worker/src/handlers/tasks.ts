@@ -5,7 +5,7 @@ import { TaskCreate, TaskPatch, TaskStatus } from "../schema/task";
 import { TaskResponse } from "../schema/task-response";
 import { D } from "../schema/descriptions";
 import { putTaskRow, getTaskRow, listTasks, deleteRow, patchTaskRowStmt } from "../db/d1";
-import { getDoneColorId } from "../db/users";
+import { getDoneColorId, getHomeTz } from "../db/users";
 import { defaultCalendarProvider } from "../index-providers";
 import { recolorTaskChunks } from "../planning/recolor-done";
 import { deleteTaskChunks, SCHEDULER_HORIZON_MS } from "../planning/scheduler-chunks";
@@ -192,7 +192,11 @@ tasksApp.openapi(patchTaskRoute, async (c) => {
   // chunk's week has elapsed (incident 2026-07-06), and a past-week event left
   // off the done color while its record claimed confirmation is exactly the
   // false-revival landmine.
-  const weekStart = localWeekWindow(now, c.env.SCHEDULER_TZ).start;
+  // Anchored on the owner's own local week (effective tz), like every other
+  // week-identity site. Only a recolor reads the scan, so skip the users lookup
+  // on every other PATCH.
+  const scanTz = toDone || fromDone ? await getHomeTz(c.env.DB, ownerSubject, c.env.SCHEDULER_TZ) : c.env.SCHEDULER_TZ;
+  const weekStart = localWeekWindow(now, scanTz).start;
   const scanStart = new Date(Date.parse(weekStart) - 28 * 24 * 3600 * 1000).toISOString();
   const scanEnd = new Date(Date.parse(weekStart) + 28 * 24 * 3600 * 1000).toISOString();
   // chunk_id → confirming event id, populated only for chunks whose event the

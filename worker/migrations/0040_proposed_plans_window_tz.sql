@@ -1,0 +1,14 @@
+-- 0040_proposed_plans_window_tz.sql — the tz a plan's week was produced in
+-- (user-settable timezone, internal design notes).
+--
+-- Week identity is bucketed in the subject's effective tz (users.home_tz, else
+-- SCHEDULER_TZ). Once a user can change tz, a plan's window_start alone no
+-- longer says which week it belongs to: a Sydney plan for Mon 5 Oct starts at
+-- 4 Oct 13:00Z, which is Sunday 4 Oct in Los Angeles and so buckets into LA's
+-- week of 28 Sep. The week lookups (churn and drop baselines, supersede) and
+-- accept only treat a plan as belonging to the subject's current weeks when
+-- COALESCE(window_tz, SCHEDULER_TZ) equals the subject's current tz.
+--
+-- NULL on rows written before this migration: every one of them was produced
+-- under SCHEDULER_TZ (home_tz had no write path), so read NULL as SCHEDULER_TZ.
+ALTER TABLE proposed_plans ADD COLUMN window_tz TEXT;

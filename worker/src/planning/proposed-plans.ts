@@ -11,6 +11,9 @@ export interface ProposedPlanRow {
   render_snapshot: unknown | null;
   window_start: string | null;
   window_end: string | null;
+  /** The tz the window's week was bucketed in when the plan was produced
+   *  (migration 0040). NULL/absent = legacy row, produced under SCHEDULER_TZ. */
+  window_tz?: string | null;
 }
 
 interface RawRow {
@@ -23,6 +26,18 @@ interface RawRow {
   render_snapshot: string | null;
   window_start?: string | null;
   window_end?: string | null;
+  window_tz?: string | null;
+}
+
+/** The tz a plan's week was produced in: its window_tz, or SCHEDULER_TZ for a
+ *  legacy row (every pre-0040 row was produced under SCHEDULER_TZ). A plan
+ *  only belongs to a week bucketed in that same tz — after a tz change, an
+ *  old plan's window_start can fall inside a DIFFERENT new-tz week (a Sydney
+ *  Mon 5 Oct plan starts on LA's Sun 4 Oct), and matching it there would
+ *  anchor churn and drops on the wrong week. `schedulerTz` is passed in (not
+ *  read from env) to keep this layer Env-free. */
+export function planProducedInTz(row: { window_tz?: string | null }, tz: string, schedulerTz: string): boolean {
+  return (row.window_tz ?? schedulerTz) === tz;
 }
 
 /** True iff `candidateWindowStart` falls in the local week starting at
@@ -54,6 +69,7 @@ function rowFromRaw(row: RawRow): ProposedPlanRow {
     // the columns; new logic never needs to re-parse JSON for the window.
     window_start: row.window_start ?? w?.start ?? null,
     window_end: row.window_end ?? w?.end ?? null,
+    window_tz: row.window_tz ?? null,
   };
 }
 
@@ -64,6 +80,9 @@ export async function insertProposedPlan(
   createdAt: string,
   expiresAt: string,
   subject?: string | null,
+  /** The tz the window's week was bucketed in (the subject's effective tz).
+   *  Omitted/null = SCHEDULER_TZ, the same reading as a legacy row. */
+  windowTz?: string | null,
 ): Promise<void> {
   // plan_hash is a pure content hash, so a re-resolve reproducing an earlier
   // solution conflicts. Re-arm the TTL (created_at/expires_at) for an
@@ -74,16 +93,17 @@ export async function insertProposedPlan(
   const w = (body as { window?: { start?: string; end?: string } }).window;
   await db
     .prepare(
-      `INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end)
-       VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
+      `INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end, window_tz)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
        ON CONFLICT(plan_hash) DO UPDATE SET
          created_at = excluded.created_at,
          expires_at = excluded.expires_at,
          window_start = excluded.window_start,
-         window_end = excluded.window_end
+         window_end = excluded.window_end,
+         window_tz = excluded.window_tz
        WHERE committed_at IS NULL`,
     )
-    .bind(planHash, JSON.stringify(body), createdAt, expiresAt, subject ?? null, w?.start ?? null, w?.end ?? null)
+    .bind(planHash, JSON.stringify(body), createdAt, expiresAt, subject ?? null, w?.start ?? null, w?.end ?? null, windowTz ?? null)
     .run();
 }
 
@@ -93,7 +113,7 @@ export async function getProposedPlan(
 ): Promise<ProposedPlanRow | null> {
   const row = await db
     .prepare(
-      "SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot FROM proposed_plans WHERE plan_hash = ?",
+      "SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot, window_tz FROM proposed_plans WHERE plan_hash = ?",
     )
     .bind(planHash)
     .first<RawRow>();
@@ -135,13 +155,16 @@ export async function deleteProposedPlan(
  *  (plan_hash is a content hash, so a post-commit no-op replan can reproduce a
  *  committed row's hash — same guard rationale as deleteProposedPlan). The
  *  keepPlanHash guard protects the ON CONFLICT re-arm case where the "new"
- *  plan reuses an existing row. Returns the number of superseded rows. */
+ *  plan reuses an existing row. Only plans produced in `tz` are candidates
+ *  (planProducedInTz): an old-tz pending plan is not this week's sibling, and
+ *  accept refuses it anyway. Returns the number of superseded rows. */
 export async function supersedeOtherPendingPlansForWeek(
   db: D1Database,
   subject: string,
   windowStart: string,
   tz: string,
   keepPlanHash: string,
+  schedulerTz: string,
 ): Promise<number> {
   // window_start strings mix formats (Z vs +10:00 offsets), so the week bucket
   // can't be computed in SQL — select the subject's pending rows and bucket here.
@@ -149,9 +172,10 @@ export async function supersedeOtherPendingPlansForWeek(
   const rs = await db
     .prepare(
       `SELECT plan_hash, body, window_start FROM proposed_plans
-        WHERE subject = ? AND committed_at IS NULL AND plan_hash != ?`,
+        WHERE subject = ? AND committed_at IS NULL AND plan_hash != ?
+          AND COALESCE(window_tz, ?) = ?`,
     )
-    .bind(subject, keepPlanHash)
+    .bind(subject, keepPlanHash, schedulerTz, tz)
     .all<{ plan_hash: string; body: string; window_start: string | null }>();
   const doomed: string[] = [];
   for (const r of rs.results ?? []) {
@@ -170,6 +194,24 @@ export async function supersedeOtherPendingPlansForWeek(
     .bind(subject, ...doomed)
     .run();
   return res.meta?.changes ?? 0;
+}
+
+/** Delete every pending (uncommitted) plan for the subject, whatever its week.
+ *  Used when the subject's effective timezone changes: those plans were solved
+ *  against the old business hours and bucketed by the old week, so accepting
+ *  one would commit old-tz placements. Owner-scoped by the subject predicate;
+ *  committed rows are never touched. Returns the number of rows deleted. */
+export async function deletePendingPlansForSubject(db: D1Database, subject: string): Promise<number> {
+  const res = await deletePendingPlansForSubjectStmt(db, subject).run();
+  return res.meta?.changes ?? 0;
+}
+
+/** Bound (not yet run) form of deletePendingPlansForSubject, for batching
+ *  atomically with the home_tz write in the /v1/timezone handler. */
+export function deletePendingPlansForSubjectStmt(db: D1Database, subject: string): D1PreparedStatement {
+  return db
+    .prepare("DELETE FROM proposed_plans WHERE subject = ? AND committed_at IS NULL")
+    .bind(subject);
 }
 
 // Owner-scoped for the same reason: the commit path may only flip a plan the
@@ -240,7 +282,7 @@ export async function getCommittedPlansForSubject(
 ): Promise<ProposedPlanRow[]> {
   const rs = await db
     .prepare(
-      "SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot FROM proposed_plans WHERE committed_at IS NOT NULL AND subject = ? ORDER BY committed_at DESC LIMIT 16",
+      "SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot, window_tz FROM proposed_plans WHERE committed_at IS NOT NULL AND subject = ? ORDER BY committed_at DESC LIMIT 16",
     )
     .bind(subject)
     .all<RawRow>();
@@ -255,12 +297,20 @@ export async function getCommittedPlansForSubject(
  * supersedeOtherPendingPlansForWeek: a mid-week replan narrows window_start to
  * "now", and exact-pair matching misses the committed Mon-anchored plan.
  *
- * `tz` must be the tz that PRODUCED the window — env.SCHEDULER_TZ for every
- * caller today (webhook, cron, accept, resolve). Bucketing in a user's home_tz
- * instead splits the week: a Sydney week straddles two UTC weeks, so a
- * UTC-home_tz user's mid-week resolve lands in the UTC week after its own
- * Mon-anchored plan's and misses it entirely. See the internal backlog follow-up
- * for what a real home_tz migration would have to move in one go.
+ * `tz` must be the tz that PRODUCED the window. Every producer and consumer
+ * uses the subject's effective tz (getHomeTz: users.home_tz, else
+ * env.SCHEDULER_TZ) — webhook bucketing, the Monday cron, resolve (churn and
+ * supersede), both baselines and accept — so they all agree on a user's own
+ * local Mon–Mon week. Mixing tzs splits the week: a Sydney week straddles two
+ * UTC weeks, so bucketing a Sydney-anchored window in a UTC user's tz (or vice
+ * versa) makes a mid-week resolve land in a different week from its own
+ * Mon-anchored plan and miss it entirely. After a user changes tz, plans
+ * bucketed under the old tz may no longer be found for the new-tz week; churn
+ * then falls back to the live scheduler-owned events (internal design notes
+ * decision 8). A time-range match alone is not enough for that: an old-tz
+ * plan's start can land inside the new-tz week (Sydney's Mon 5 Oct is LA's Sun
+ * 4 Oct), so only plans PRODUCED in `tz` match — COALESCE(window_tz,
+ * schedulerTz) = tz, legacy NULL rows reading as SCHEDULER_TZ (planProducedInTz).
  *
  * Both week baselines read this one lookup — drops (below) and churn
  * (resolve-internal) — so they can never select different plans for the same
@@ -293,19 +343,21 @@ export async function getCommittedPlanForWeek(
   subject: string,
   windowStart: string,
   tz: string,
+  schedulerTz: string,
 ): Promise<ProposedPlanRow | null> {
   const week = localWeekWindow(windowStart, tz);
   const rs = await db
     .prepare(
-      `SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot, window_start, window_end
+      `SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot, window_start, window_end, window_tz
          FROM proposed_plans
         WHERE subject = ? AND committed_at IS NOT NULL AND window_start IS NOT NULL
           AND datetime(window_start) >= datetime(?)
           AND datetime(window_start) < datetime(?)
+          AND COALESCE(window_tz, ?) = ?
         ORDER BY committed_at DESC
         LIMIT 16`,
     )
-    .bind(subject, week.start, week.end)
+    .bind(subject, week.start, week.end, schedulerTz, tz)
     .all<RawRow>();
   for (const raw of rs.results ?? []) {
     const row = rowFromRaw(raw);
@@ -325,25 +377,36 @@ export async function getCommittedDroppedForWeek(
   subject: string,
   windowStart: string,
   tz: string,
+  schedulerTz: string,
 ): Promise<DroppedEntry[]> {
-  const plan = await getCommittedPlanForWeek(db, subject, windowStart, tz);
+  const plan = await getCommittedPlanForWeek(db, subject, windowStart, tz, schedulerTz);
   return (plan?.body.dropped ?? []) as DroppedEntry[];
+}
+
+/** Restricts a pending-plan read to plans produced in the subject's current
+ *  tz (planProducedInTz): an old-tz pending plan is refused on commit, so it
+ *  must not be offered either. */
+export interface ProducedIn {
+  tz: string;
+  schedulerTz: string;
 }
 
 export async function getLatestProposedPlanForSubject(
   db: D1Database,
   subject: string,
   now: Date,
+  producedIn?: ProducedIn,
 ): Promise<ProposedPlanRow | null> {
   const row = await db
     .prepare(
-      `SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot
+      `SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot, window_tz
          FROM proposed_plans
         WHERE subject = ? AND committed_at IS NULL AND expires_at >= ?
+          ${producedIn ? "AND COALESCE(window_tz, ?) = ?" : ""}
         ORDER BY created_at DESC
         LIMIT 1`,
     )
-    .bind(subject, now.toISOString())
+    .bind(subject, now.toISOString(), ...(producedIn ? [producedIn.schedulerTz, producedIn.tz] : []))
     .first<RawRow>();
   return row ? rowFromRaw(row) : null;
 }
@@ -359,7 +422,7 @@ export async function getPendingPlansForSubject(
 ): Promise<ProposedPlanRow[]> {
   const rs = await db
     .prepare(
-      `SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot, window_start, window_end
+      `SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot, window_start, window_end, window_tz
          FROM proposed_plans
         WHERE subject = ? AND committed_at IS NULL AND expires_at >= ?
         ORDER BY created_at DESC
@@ -384,16 +447,18 @@ export async function getLatestProposedPlanForSubjectCovering(
   subject: string,
   now: Date,
   instant: Date,
+  producedIn?: ProducedIn,
 ): Promise<ProposedPlanRow | null> {
   const rs = await db
     .prepare(
-      `SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot
+      `SELECT plan_hash, body, subject, created_at, expires_at, committed_at, render_snapshot, window_tz
          FROM proposed_plans
         WHERE subject = ? AND committed_at IS NULL AND expires_at >= ?
+          ${producedIn ? "AND COALESCE(window_tz, ?) = ?" : ""}
         ORDER BY created_at DESC
         LIMIT 50`,
     )
-    .bind(subject, now.toISOString())
+    .bind(subject, now.toISOString(), ...(producedIn ? [producedIn.schedulerTz, producedIn.tz] : []))
     .all<RawRow>();
   const ms = instant.getTime();
   for (const raw of rs.results ?? []) {

@@ -335,6 +335,20 @@ HARNESSES: dict[str, Harness] = {
         exit_convention="pass01",
         parser="dash",
     ),
+    "timezone-smoke": Harness(
+        name="timezone-smoke",
+        script="bin/timezone-smoke.py",
+        # User-settable timezone (internal design notes, Card D). Same
+        # shape as config-smoke: /v1/timezone + /v1/whoami + two resolves;
+        # the bearer alone selects the calendar, so no --provider, and every
+        # write is undone through the API (PATCH/DELETE), so no D1.
+        modes=(
+            Mode(name="default", identities={"A": "google:a"}, targets=_SHARED_TARGETS, provider="google"),
+            Mode(name="microsoft", identities={"A": "microsoft:a"}, targets=_MICROSOFT_TARGETS, provider="microsoft"),
+        ),
+        exit_convention="pass01",
+        parser="dash",
+    ),
     "engine-smoke": Harness(
         name="engine-smoke",
         script="bin/engine-smoke.py",

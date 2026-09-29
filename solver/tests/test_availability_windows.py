@@ -123,3 +123,26 @@ def test_empty_availability_windows_is_unconstrained():
     p = _problem({"availability_windows": []})
     sol = solve(p)
     assert any(c.task_id == "m1" for c in sol.solution.schedule)
+
+
+# Card E (internal design notes): the Worker encodes "no room left" for a
+# foreign-tz hard window as one quarter just past the horizon. It must compile
+# to a clean drop, never a 422 or a non-optimal status.
+_SENTINEL = [{"start": "2026-05-25T00:00:00", "end": "2026-05-25T00:15:00"}]
+
+
+@pytest.mark.parametrize(
+    ("must_include", "reason"),
+    [
+        (False, "drop_was_cheaper_than_alternatives"),
+        (True, "must_include_unplaceable_in_isolation"),
+    ],
+)
+def test_out_of_horizon_sentinel_mask_drops_cleanly(must_include, reason):
+    p = _problem({"availability_windows": _SENTINEL, "must_include": must_include})
+    res = solve(p)
+    assert res.unsat_core is None
+    sol = res.solution
+    assert sol.diagnostics.status == "OPTIMAL"
+    assert not [c for c in sol.schedule if c.task_id == "m1"]
+    assert [(d.task_id, d.reason) for d in sol.dropped] == [("m1", reason)]

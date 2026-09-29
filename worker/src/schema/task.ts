@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ContextEnum, IsoDateTime, TimeOfDay, Uuid } from "./common";
+import { ContextEnum, IanaZone, IsoDateTime, TimeOfDay, Uuid } from "./common";
 import { D } from "./descriptions";
 
 const Chunk = z
@@ -21,12 +21,13 @@ const Deadline = z
   })
   .strict();
 
-const PreferredWindow = z
+export const PreferredWindow = z
   .object({
     days: z.array(z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"])).min(1).describe(D.task.preferred_windows.days),
     start: TimeOfDay.describe(D.task.preferred_windows.start),
     end: TimeOfDay.describe(D.task.preferred_windows.end),
     hard: z.boolean().describe(D.task.preferred_windows.hard),
+    tz: IanaZone.describe(D.task.preferred_windows.tz).optional(),
   })
   .strict();
 

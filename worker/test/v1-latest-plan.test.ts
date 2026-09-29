@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { env } from "cloudflare:test";
 import { Hono } from "hono";
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -178,5 +178,37 @@ describe("GET /v1/plans/latest", () => {
       env,
     );
     expect(res.status).toBe(403);
+  });
+});
+
+describe("GET /v1/plans/latest skips plans produced in a tz other than the caller's current one", () => {
+  // A resolve racing a tz change can leave a pending plan from the old tz;
+  // accept/commit refuse it like a vanished hash, so it must not be offered.
+  const seed = (hash: string, createdAt: string, windowTz: string | null) =>
+    env.DB.prepare(
+      "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end, window_tz) VALUES (?, ?, ?, '2099-01-01T00:00:00Z', NULL, 'u@org', ?, ?, ?)",
+    ).bind(hash, JSON.stringify(planBody), createdAt, planBody.window.start, planBody.window.end, windowTz).run();
+  const latest = async (query = "") =>
+    ((await (await makeApp().request(`/v1/plans/latest${query}`, { headers: { Authorization: "Bearer tok" } }, env)).json()) as { plan: { plan_hash: string } | null }).plan;
+
+  beforeEach(async () => {
+    await seedBearer("tok", "u@org");
+    await env.DB.prepare("INSERT OR REPLACE INTO users (subject, home_tz, created_at) VALUES ('u@org', 'America/Los_Angeles', '2026-05-01T00:00:00Z')").run();
+  });
+  afterEach(async () => {
+    await env.DB.prepare("DELETE FROM users WHERE subject = 'u@org'").run();
+  });
+
+  it("returns the newest current-tz plan, not a newer old-tz one", async () => {
+    await seed("la", "2026-05-18T00:00:00Z", "America/Los_Angeles");
+    await seed("old-legacy", "2026-05-19T00:00:00Z", null); // NULL = SCHEDULER_TZ (Sydney)
+    expect((await latest())?.plan_hash).toBe("la");
+    expect((await latest("?covers=2026-05-20T00:00:00Z"))?.plan_hash).toBe("la");
+  });
+
+  it("returns null when only old-tz plans are pending", async () => {
+    await seed("old-syd", "2026-05-19T00:00:00Z", "Australia/Sydney");
+    expect(await latest()).toBeNull();
+    expect(await latest("?covers=2026-05-20T00:00:00Z")).toBeNull();
   });
 });

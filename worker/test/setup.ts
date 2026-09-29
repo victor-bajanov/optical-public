@@ -39,6 +39,7 @@ import identityProviderSql from "../migrations/0036_identity_provider.sql?raw";
 import identityProviderSubjectSql from "../migrations/0037_identity_provider_subject.sql?raw";
 import solverCallsSql from "../migrations/0038_solver_calls.sql?raw";
 import solverCallsEngineSql from "../migrations/0039_solver_calls_engine.sql?raw";
+import proposedPlansWindowTzSql from "../migrations/0040_proposed_plans_window_tz.sql?raw";
 import { OCCURRENCE_UNIQUE_INDEX_DDL } from "../src/recurrence/occurrence-index";
 
 beforeAll(async () => {
@@ -82,5 +83,6 @@ beforeAll(async () => {
     { name: "0037_identity_provider_subject.sql", queries: [identityProviderSubjectSql] },
     { name: "0038_solver_calls.sql", queries: [solverCallsSql] },
     { name: "0039_solver_calls_engine.sql", queries: [solverCallsEngineSql] },
+    { name: "0040_proposed_plans_window_tz.sql", queries: [proposedPlansWindowTzSql] },
   ]);
 });

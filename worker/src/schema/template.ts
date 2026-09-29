@@ -1,25 +1,18 @@
 import { z } from "zod";
-import { ContextEnum, IsoDate, TimeOfDay } from "./common";
+import { ContextEnum, IanaZone, IsoDate, TimeOfDay } from "./common";
 import { D } from "./descriptions";
+import { PreferredWindow } from "./task";
 
 // Minimal RRULE validation: must contain FREQ=.
 const RRule = z.string().regex(/(^|;)FREQ=/, "rrule must contain FREQ=");
 
-const TaskBodyPartial = z.record(z.unknown()); // partial Task spec; validated when materialised (Plan C).
-
-// IANA zone validator — probes Intl.DateTimeFormat which throws RangeError
-// for unknown zones in the Workers runtime.
-const IanaZone = z.string().refine(
-  (s) => {
-    try {
-      new Intl.DateTimeFormat("en-US", { timeZone: s });
-      return true;
-    } catch {
-      return false;
-    }
-  },
-  { message: "invalid IANA timezone (e.g. 'Australia/Sydney', 'America/New_York')" },
-);
+// Partial Task spec; validated in full when materialised (Plan C), where a
+// failure only skips the occurrence with a console.warn. preferred_windows is
+// validated here too, so a bad window (e.g. an unknown or offset tz) is a 400
+// at write time instead of a template that silently never materialises.
+const TaskBodyPartial = z
+  .object({ preferred_windows: z.array(PreferredWindow).describe(D.task.preferred_windows.$).optional() })
+  .passthrough();
 
 export const TemplateCreate = z.object({
   title: z.string().min(1).max(500).describe(D.template.title),

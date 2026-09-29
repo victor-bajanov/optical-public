@@ -104,12 +104,89 @@ describe("runMondayResolve", () => {
     expect(pending?.n).toBe(0);
   });
 
-  it("the drop baseline buckets the week in SCHEDULER_TZ, even for a home_tz user", async () => {
-    // Sibling of the webhook's drop-baseline tz test. The cron resolves the
-    // Sydney week [2026-05-17T14:00Z, 2026-05-24T14:00Z); the committed plan
-    // below is a mid-week-narrowed commit of that same Sydney week. Under UTC
-    // bucketing the two land in different weeks and the accepted drop re-emails.
-    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', 'UTC', '2026-05-01T00:00:00Z')").run();
+  it("a London home_tz user gets London's upcoming Mon–Mon week, emailed in Europe/London", async () => {
+    // The cron fires at Sun 16:00 BST. localWeekWindow(now) in London would be
+    // the ENDING week (Mon 11 May); the Sydney week would be [17T14Z, 24T14Z).
+    // Neither is the user's week: that is London's Mon 18 May 00:00 BST.
+    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', 'Europe/London', '2026-05-01T00:00:00Z')").run();
+    const solver = { fetch: async () => new Response(JSON.stringify({ schedule: [{ task_id: "t1", chunk_id: "t1#0", start: "2026-05-19T09:00:00", duration_minutes: 90, context: "deep" }], dropped: [], objective: { total: 0, components: { lateness: 0, fit: 0, churn: 0, daily_cap: 0, streak_cap: 0, drop: 0 } }, diagnostics: { pass1_wall_seconds: 0, pass2_wall_seconds: 0, status: "OPTIMAL" } }), { status: 200, headers: { "content-type": "application/json" } }) } as unknown as Fetcher;
+    const notify = new MockNotificationProvider();
+    const result = await runMondayResolve({
+      env: { ...env, SOLVER: solver, OAUTH_ISSUER: "https://scheduler.example.com" },
+      calendar: new MockCalendarProvider(),
+      notification: notify,
+      accountEmail: "primary",
+      now: new Date("2026-05-17T15:00:00Z"),
+    });
+    expect(result.kind).toBe("ok");
+    expect(notify.sent).toHaveLength(1);
+    const model = notify.sent[0]!.model;
+    expect(model.window).toEqual({ start: "2026-05-17T23:00:00.000Z", end: "2026-05-24T23:00:00.000Z" });
+    expect(model.tz).toBe("Europe/London");
+    const row = await env.DB.prepare("SELECT window_start, window_end FROM proposed_plans WHERE plan_hash = ?")
+      .bind(result.kind === "ok" ? result.planHash : "").first<{ window_start: string; window_end: string }>();
+    expect(row).toEqual({ window_start: "2026-05-17T23:00:00.000Z", window_end: "2026-05-24T23:00:00.000Z" });
+  });
+
+  it.each([
+    ["Europe/London"],       // Sun 16:00 BST at fire time; week starts 17 May 23:00Z
+    ["America/Los_Angeles"], // Sun 08:00 PDT at fire time; week starts 18 May 07:00Z
+  ])("a %s user's pure-backlog task reaches the solver although their week starts after the cron fires", async (tz) => {
+    // West of UTC+9 the upcoming week hasn't started at Sun 15:00Z. The cron's
+    // window is still the user's live week, so their backlog (t1: no deadline,
+    // no earliest_start) must populate it — not be shed as it is for an
+    // explicit future-week resolve (runbook §F).
+    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', ?, '2026-05-01T00:00:00Z')").bind(tz).run();
+    let requestedTaskIds: string[] = [];
+    const solver = { fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(init!.body as string) as { tasks: Array<{ id: string }> };
+      requestedTaskIds = body.tasks.map((t) => t.id);
+      return new Response(JSON.stringify({ schedule: [], dropped: [], objective: { total: 0, components: { lateness: 0, fit: 0, churn: 0, daily_cap: 0, streak_cap: 0, drop: 0 } }, diagnostics: { pass1_wall_seconds: 0, pass2_wall_seconds: 0, status: "OPTIMAL" } }), { status: 200, headers: { "content-type": "application/json" } });
+    } } as unknown as Fetcher;
+    const result = await runMondayResolve({
+      env: { ...env, SOLVER: solver, OAUTH_ISSUER: "https://scheduler.example.com" },
+      calendar: new MockCalendarProvider(),
+      notification: new MockNotificationProvider(),
+      accountEmail: "primary",
+      now: new Date("2026-05-17T15:00:00Z"),
+    });
+    expect(result.kind).toBe("ok");
+    expect(requestedTaskIds).toContain("t1");
+  });
+
+  it("the drop baseline buckets the week in the user's home_tz, the tz that produced the window", async () => {
+    // Every producer and consumer uses the subject's effective tz. The cron
+    // resolves London's week [2026-05-17T23:00Z, 2026-05-24T23:00Z); the
+    // committed plan below is a late-Sunday-narrowed commit of that same London
+    // week (Sun 24 May 20:00 BST = Mon 25 May 05:00 AEST). Bucketed in Sydney it
+    // lands in the NEXT week, misses, and the accepted drop re-emails.
+    await env.DB.prepare("INSERT INTO users (subject, home_tz, created_at) VALUES ('primary', 'Europe/London', '2026-05-01T00:00:00Z')").run();
+    const drop = { task_id: "t1", title: "Deep work", drop_cost: 5, reason: "drop_was_cheaper_than_alternatives", contributing_constraints: ["preferred_window"] };
+    await env.DB.prepare(
+      "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end, window_tz) VALUES (?, ?, ?, ?, ?, 'primary', ?, ?, 'Europe/London')",
+    ).bind(
+      "committed-drop-late-sunday",
+      JSON.stringify({ schedule: [], dropped: [drop], window: { start: "2026-05-24T19:00:00.000Z", end: "2026-05-24T23:00:00.000Z" } }),
+      "2026-05-11T00:00:00Z", "2099-01-01T00:00:00Z", "2026-05-11T01:00:00Z",
+      "2026-05-24T19:00:00.000Z", "2026-05-24T23:00:00.000Z",
+    ).run();
+    const dropSolver = { fetch: async () => new Response(JSON.stringify({ schedule: [], dropped: [drop], objective: { total: 0, components: { lateness: 0, fit: 0, churn: 0, daily_cap: 0, streak_cap: 0, drop: 0 } }, diagnostics: { pass1_wall_seconds: 0, pass2_wall_seconds: 0, status: "OPTIMAL" } }), { status: 200, headers: { "content-type": "application/json" } }) } as unknown as Fetcher;
+    const notify = new MockNotificationProvider();
+    const result = await runMondayResolve({
+      env: { ...env, SOLVER: dropSolver, OAUTH_ISSUER: "https://scheduler.example.com" },
+      calendar: new MockCalendarProvider(),
+      notification: notify,
+      accountEmail: "primary",
+      now: new Date("2026-05-17T15:00:00Z"),
+    });
+    expect(result.kind).toBe("ok");
+    expect(notify.sent).toHaveLength(0);
+  });
+
+  it("a null-home_tz user still resolves the SCHEDULER_TZ week, drop baseline included", async () => {
+    // No users row: effective tz is SCHEDULER_TZ (Australia/Sydney), so nothing
+    // changes for existing users. The committed plan is a mid-week-narrowed
+    // commit of the Sydney week the cron resolves.
     const drop = { task_id: "t1", title: "Deep work", drop_cost: 5, reason: "drop_was_cheaper_than_alternatives", contributing_constraints: ["preferred_window"] };
     await env.DB.prepare(
       "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end) VALUES (?, ?, ?, ?, ?, 'primary', ?, ?)",
@@ -130,6 +207,8 @@ describe("runMondayResolve", () => {
     });
     expect(result.kind).toBe("ok");
     expect(notify.sent).toHaveLength(0);
+    const plans = await env.DB.prepare("SELECT COUNT(*) AS n FROM proposed_plans WHERE committed_at IS NULL").first<{ n: number }>();
+    expect(plans?.n).toBe(0);
   });
 
   it("reports a single move (zero removed) when one scheduler event differs in start", async () => {

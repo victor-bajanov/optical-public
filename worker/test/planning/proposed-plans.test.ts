@@ -13,6 +13,7 @@ import {
   getCommittedDroppedForWeek,
   supersedeOtherPendingPlansForWeek,
   getPendingPlansForSubject,
+  deletePendingPlansForSubject,
 } from "../../src/planning/proposed-plans";
 import { commitPlan } from "../../src/planning/commit";
 import { MockCalendarProvider } from "../../src/providers/mock-calendar-provider";
@@ -345,13 +346,13 @@ describe("getCommittedPlanForWeek", () => {
     await seed("this-week", WMON, "2026-05-18T01:00:00Z");
     await seed("next-week", WNEXT, "2026-05-25T01:00:00Z"); // committed later
     expect((await getLatestCommittedPlanForSubject(env.DB, "a@x.com"))?.plan_hash).toBe("next-week");
-    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ);
+    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got?.plan_hash).toBe("this-week");
   });
 
   it("a mid-week-narrowed window.start still matches its Mon-anchored week plan", async () => {
     await seed("mon", WMON, "2026-05-18T01:00:00Z");
-    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMID.start, env.SCHEDULER_TZ);
+    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMID.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got?.plan_hash).toBe("mon");
   });
 
@@ -359,7 +360,7 @@ describe("getCommittedPlanForWeek", () => {
     await seed("next-week", WNEXT, "2026-05-25T01:00:00Z");
     await seed("pending-this-week", WMON, null);
     await seed("foreign-this-week", WMON, "2026-05-18T01:00:00Z", { subject: "b@x.com" });
-    expect(await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ)).toBeNull();
+    expect(await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ)).toBeNull();
   });
 
   it("finds the target week's plan behind 16+ newer commits for another week", async () => {
@@ -370,7 +371,7 @@ describe("getCommittedPlanForWeek", () => {
     for (let i = 0; i < 20; i++) {
       await seed(`noise-${i}`, WMON, `2026-05-26T0${i % 10}:00:00Z`);
     }
-    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WNEXT.start, env.SCHEDULER_TZ);
+    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WNEXT.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got?.plan_hash).toBe("target");
   });
 
@@ -380,7 +381,7 @@ describe("getCommittedPlanForWeek", () => {
       .prepare("INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end) VALUES ('columns-only', ?, '2026-05-18T00:00:00Z', '2099-01-01T00:00:00Z', '2026-05-18T01:00:00Z', 'a@x.com', ?, ?)")
       .bind(JSON.stringify({ schedule: [], dropped: [] }), WMON.start, WMON.end)
       .run();
-    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ);
+    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got?.plan_hash).toBe("columns-only");
   });
 
@@ -390,7 +391,7 @@ describe("getCommittedPlanForWeek", () => {
       .prepare("INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end) VALUES ('garbage', ?, '2026-05-18T00:00:00Z', '2099-01-01T00:00:00Z', '2026-05-19T01:00:00Z', 'a@x.com', 'not-a-date', 'not-a-date')")
       .bind(JSON.stringify({ schedule: [], dropped: [], window: { start: "not-a-date", end: "not-a-date" } }))
       .run();
-    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ);
+    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got?.plan_hash).toBe("valid");
   });
 
@@ -398,7 +399,7 @@ describe("getCommittedPlanForWeek", () => {
     // window_start strings mix formats, so the range predicate must compare
     // instants (SQLite datetime()), never raw strings.
     await seed("offset-form", WMID, "2026-05-20T05:00:00Z");
-    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ);
+    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got?.plan_hash).toBe("offset-form");
   });
 
@@ -407,11 +408,75 @@ describe("getCommittedPlanForWeek", () => {
     // select different plans for the same week.
     await seed("older", WMON, "2026-05-18T01:00:00Z", { dropped: [{ task_id: "t1" }] });
     await seed("newer", WMID, "2026-05-20T05:00:00Z", { dropped: [{ task_id: "t2" }] });
-    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ);
+    const got = await getCommittedPlanForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got?.plan_hash).toBe("newer");
-    expect(await getCommittedDroppedForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ)).toEqual(
+    expect(await getCommittedDroppedForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ)).toEqual(
       got?.body.dropped,
     );
+  });
+});
+
+describe("window_tz: a plan only matches weeks bucketed in the tz that produced it", () => {
+  const SYD = "Australia/Sydney";
+  const LA = "America/Los_Angeles";
+  // Sydney week of Mon 5 Oct 2026 (AEDT from Sun 4 Oct): [4 Oct 13:00Z, 11 Oct 13:00Z).
+  const SYD_W5 = { start: "2026-10-04T13:00:00.000Z", end: "2026-10-11T13:00:00.000Z" };
+  // Sydney week of Mon 28 Sep (AEST): [27 Sep 14:00Z, 4 Oct 13:00Z).
+  const SYD_W28 = { start: "2026-09-27T14:00:00.000Z", end: "2026-10-04T13:00:00.000Z" };
+  // LA week of Mon 28 Sep (PDT): [28 Sep 07:00Z, 5 Oct 07:00Z).
+  const LA_W28 = { start: "2026-09-28T07:00:00.000Z", end: "2026-10-05T07:00:00.000Z" };
+  const seed = (hash: string, w: { start: string; end: string }, windowTz: string | null, committedAt: string | null = "2026-09-20T00:00:00Z") =>
+    env.DB
+      .prepare("INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, window_start, window_end, window_tz) VALUES (?, ?, '2026-09-20T00:00:00Z', '2099-01-01T00:00:00Z', ?, 'a@x.com', ?, ?, ?)")
+      .bind(hash, JSON.stringify({ schedule: [], dropped: [{ task_id: hash }], window: w }), committedAt, w.start, w.end, windowTz)
+      .run();
+
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM proposed_plans").run();
+  });
+
+  it("Sydney→LA: a Sydney-produced plan for Mon 5 Oct is not the LA week of 28 Sep's plan", async () => {
+    // 4 Oct 13:00Z is Sun 4 Oct 06:00 PDT, so bucketing its start in LA alone
+    // would wrongly match the LA week of 28 Sep.
+    await seed("syd", SYD_W5, SYD);
+    expect(await getCommittedPlanForWeek(env.DB, "a@x.com", LA_W28.start, LA, SYD)).toBeNull();
+    expect(await getCommittedDroppedForWeek(env.DB, "a@x.com", LA_W28.start, LA, SYD)).toEqual([]);
+  });
+
+  it("Sydney→LA: a legacy NULL row counts as SCHEDULER_TZ-produced and does not match either", async () => {
+    await seed("legacy", SYD_W5, null);
+    expect(await getCommittedPlanForWeek(env.DB, "a@x.com", LA_W28.start, LA, SYD)).toBeNull();
+  });
+
+  it("LA→Sydney: an LA-produced plan does not match the Sydney week its start falls in", async () => {
+    // 28 Sep 07:00Z is Mon 28 Sep 17:00 AEST: inside the Sydney week of 28 Sep.
+    await seed("la", LA_W28, LA);
+    expect(await getCommittedPlanForWeek(env.DB, "a@x.com", SYD_W28.start, SYD, SYD)).toBeNull();
+  });
+
+  it("a plan tagged with the lookup tz matches, and a legacy NULL row matches a SCHEDULER_TZ user", async () => {
+    await seed("la", LA_W28, LA);
+    await seed("legacy", SYD_W28, null);
+    expect((await getCommittedPlanForWeek(env.DB, "a@x.com", LA_W28.start, LA, SYD))?.plan_hash).toBe("la");
+    expect((await getCommittedPlanForWeek(env.DB, "a@x.com", SYD_W28.start, SYD, SYD))?.plan_hash).toBe("legacy");
+  });
+
+  it("supersede only deletes pending plans produced in the same tz", async () => {
+    await seed("syd-pending", SYD_W5, SYD, null);
+    await seed("legacy-pending", SYD_W5, null, null);
+    await seed("la-pending", LA_W28, LA, null);
+    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", LA_W28.start, LA, "new-1", SYD);
+    expect(n).toBe(1);
+    const left = await env.DB.prepare("SELECT plan_hash FROM proposed_plans ORDER BY plan_hash").all<{ plan_hash: string }>();
+    expect(left.results?.map((r) => r.plan_hash)).toEqual(["legacy-pending", "syd-pending"]);
+  });
+
+  it("insertProposedPlan records the producing tz, and a re-arm updates it", async () => {
+    const body = { schedule: [], dropped: [], window: LA_W28 };
+    await insertProposedPlan(env.DB, "tz-1", body, "2026-09-20T00:00:00Z", "2099-01-01T00:00:00Z", "a@x.com", LA);
+    const row = await env.DB.prepare("SELECT window_tz FROM proposed_plans WHERE plan_hash = 'tz-1'").first<{ window_tz: string | null }>();
+    expect(row?.window_tz).toBe(LA);
+    expect((await getProposedPlan(env.DB, "tz-1"))?.window_tz).toBe(LA);
   });
 });
 
@@ -431,26 +496,26 @@ describe("getCommittedDroppedForWeek", () => {
 
   it("a mid-week-anchored resolve finds the committed Mon-anchored plan of the same week as baseline", async () => {
     await seed("mon", WMON, dropped("t1"), "2026-05-18T01:00:00Z");
-    const got = await getCommittedDroppedForWeek(env.DB, "a@x.com", WMID.start, env.SCHEDULER_TZ);
+    const got = await getCommittedDroppedForWeek(env.DB, "a@x.com", WMID.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got).toEqual(dropped("t1"));
   });
 
   it("a committed plan for a different week is not a baseline", async () => {
     await seed("next-week", { start: "2026-05-24T14:00:00.000Z", end: "2026-05-31T14:00:00.000Z" }, dropped("t1"), "2026-05-25T01:00:00Z");
-    const got = await getCommittedDroppedForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ);
+    const got = await getCommittedDroppedForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got).toEqual([]);
   });
 
   it("the most recently committed plan of the week wins, regardless of anchoring", async () => {
     await seed("older", WMON, dropped("t1"), "2026-05-18T01:00:00Z");
     await seed("newer", WMID, dropped("t2"), "2026-05-20T05:00:00Z");
-    const got = await getCommittedDroppedForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ);
+    const got = await getCommittedDroppedForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got).toEqual(dropped("t2"));
   });
 
   it("uncommitted plans are never a baseline", async () => {
     await seed("pending", WMON, dropped("t1"), null);
-    const got = await getCommittedDroppedForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ);
+    const got = await getCommittedDroppedForWeek(env.DB, "a@x.com", WMON.start, env.SCHEDULER_TZ, env.SCHEDULER_TZ);
     expect(got).toEqual([]);
   });
 });
@@ -572,7 +637,7 @@ describe("supersedeOtherPendingPlansForWeek", () => {
     await seed("old-1", "a@x.com", W);
     await seed("old-2", "a@x.com", W);
     await seed("new-1", "a@x.com", W);
-    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", W.start, env.SCHEDULER_TZ, "new-1");
+    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", W.start, env.SCHEDULER_TZ, "new-1", env.SCHEDULER_TZ);
     expect(n).toBe(2);
     const left = await env.DB.prepare("SELECT plan_hash FROM proposed_plans ORDER BY plan_hash").all<{ plan_hash: string }>();
     expect(left.results?.map((r) => r.plan_hash)).toEqual(["new-1"]);
@@ -584,7 +649,7 @@ describe("supersedeOtherPendingPlansForWeek", () => {
     const wmid = { start: "2026-05-20T00:00:00+10:00", end: "2026-05-25T00:00:00+10:00" };
     await seed("mon-anchored", "a@x.com", W);
     await seed("new-1", "a@x.com", wmid);
-    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", wmid.start, env.SCHEDULER_TZ, "new-1");
+    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", wmid.start, env.SCHEDULER_TZ, "new-1", env.SCHEDULER_TZ);
     expect(n).toBe(1);
     const left = await env.DB.prepare("SELECT plan_hash FROM proposed_plans ORDER BY plan_hash").all<{ plan_hash: string }>();
     expect(left.results?.map((r) => r.plan_hash)).toEqual(["new-1"]);
@@ -601,7 +666,7 @@ describe("supersedeOtherPendingPlansForWeek", () => {
       .run();
     await seed("old-1", "a@x.com", W);
     await seed("new-1", "a@x.com", W);
-    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", W.start, env.SCHEDULER_TZ, "new-1");
+    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", W.start, env.SCHEDULER_TZ, "new-1", env.SCHEDULER_TZ);
     expect(n).toBe(1);
     // The unbucketable row is left for the expiry sweep, not deleted blindly.
     expect(await getProposedPlan(env.DB, "malformed")).not.toBeNull();
@@ -610,7 +675,7 @@ describe("supersedeOtherPendingPlansForWeek", () => {
   it("a plan for a different week is NOT superseded", async () => {
     await seed("next-week", "a@x.com", { start: "2026-05-25T00:00:00Z", end: "2026-06-01T00:00:00Z" });
     await seed("new-1", "a@x.com", W);
-    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", W.start, env.SCHEDULER_TZ, "new-1");
+    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", W.start, env.SCHEDULER_TZ, "new-1", env.SCHEDULER_TZ);
     expect(n).toBe(0);
   });
 
@@ -618,7 +683,7 @@ describe("supersedeOtherPendingPlansForWeek", () => {
     await seed("committed-1", "a@x.com", W, "2026-05-18T01:00:00Z");
     await seed("foreign-1", "b@x.com", W);
     await seed("new-1", "a@x.com", W);
-    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", W.start, env.SCHEDULER_TZ, "new-1");
+    const n = await supersedeOtherPendingPlansForWeek(env.DB, "a@x.com", W.start, env.SCHEDULER_TZ, "new-1", env.SCHEDULER_TZ);
     expect(n).toBe(0);
     const left = await env.DB.prepare("SELECT COUNT(*) AS c FROM proposed_plans").first<{ c: number }>();
     expect(left?.c).toBe(3);
@@ -648,5 +713,30 @@ describe("getPendingPlansForSubject", () => {
     expect(rows.map((r) => r.plan_hash)).toEqual(["p-new", "p-old"]);
     expect(rows[0]?.window_start).toBe(W2.start);
     expect(rows[0]?.window_end).toBe(W2.end);
+  });
+});
+
+describe("deletePendingPlansForSubject", () => {
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM proposed_plans").run();
+  });
+
+  it("deletes only the subject's pending rows, leaving committed rows and other subjects alone", async () => {
+    const mk = (s: string) => ({ ...body, schedule: [{ ...body.schedule[0], task_id: s }] });
+    await insertProposedPlan(env.DB, "a-pending-1", mk("a1"), "2026-05-18T12:00:00Z", "2026-05-21T12:00:00Z", "a@org");
+    await insertProposedPlan(env.DB, "a-pending-2", mk("a2"), "2026-05-18T12:00:00Z", "2026-05-21T12:00:00Z", "a@org");
+    await insertProposedPlan(env.DB, "a-committed", mk("a3"), "2026-05-18T12:00:00Z", "2026-05-21T12:00:00Z", "a@org");
+    await markProposedPlanCommitted(env.DB, "a-committed", "2026-05-18T13:00:00Z", "a@org");
+    await insertProposedPlan(env.DB, "b-pending", mk("b1"), "2026-05-18T12:00:00Z", "2026-05-21T12:00:00Z", "b@org");
+
+    const n = await deletePendingPlansForSubject(env.DB, "a@org");
+    expect(n).toBe(2);
+
+    const rs = await env.DB.prepare("SELECT plan_hash FROM proposed_plans ORDER BY plan_hash").all<{ plan_hash: string }>();
+    expect(rs.results.map((r) => r.plan_hash)).toEqual(["a-committed", "b-pending"]);
+  });
+
+  it("returns 0 when the subject has no pending plans", async () => {
+    expect(await deletePendingPlansForSubject(env.DB, "nobody@org")).toBe(0);
   });
 });

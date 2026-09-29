@@ -332,6 +332,14 @@ export interface ResolveArgs {
   accountEmail: string;
   trigger: ResolveTrigger;
   weightsOverride?: Partial<SolverWeights>;
+  /** The window is the subject's UPCOMING week (the Monday cron), not an
+   *  arbitrary future week. West of about UTC+9 the cron fires before the
+   *  user's local Monday, so the window hasn't started yet; without this flag
+   *  window-relative shedding would treat it like an explicit future-week
+   *  resolve and shed all pure backlog (runbook §F). With it, window membership
+   *  is judged as of max(now, windowStart) — the week counts as started, as it
+   *  already does for Sydney, where the cron fires at Mon 01:00/02:00. */
+  upcomingWeek?: boolean;
 }
 
 /** One `solver_calls` row (migration 0038). Written after every solve that
@@ -863,6 +871,8 @@ async function loadPendingTasks(
   ownerSubject: string,
   windowStartMs: number,
   windowEndMs: number,
+  // The "now" window membership is judged at (ResolveArgs.upcomingWeek).
+  membershipNowMs: number,
 ): Promise<Task[]> {
   if (!ownerSubject) throw new Error("owner_scope_missing");
   // id, created_at, updated_at, template_id, scheduled_for live in columns;
@@ -900,7 +910,6 @@ async function loadPendingTasks(
   // shed task is excluded from the solver input only — its status and DB row
   // are untouched, so it still appears in GET /v1/tasks. See
   // internal design notes.
-  const nowMs = Date.now();
   const kept = rows.filter(({ task, template_id, scheduled_for }) =>
     taskBelongsInWindow(
       {
@@ -912,7 +921,7 @@ async function loadPendingTasks(
       },
       windowStartMs,
       windowEndMs,
-      nowMs,
+      membershipNowMs,
     ),
   );
 
@@ -950,6 +959,9 @@ async function reconcileChunkCompletions(
   // call sites, since this function receives no CalendarProvider). See
   // calendar-provider.ts's defaultDoneColorId doc comment (Card H).
   defaultDoneColorId: string,
+  // The "now" window membership is judged at (ResolveArgs.upcomingWeek);
+  // defaults to the real clock.
+  membershipNowMs?: number,
 ): Promise<{ completedByTask: Map<string, Set<string>>; revivedTasks: Task[] }> {
   const nowIso = new Date().toISOString();
   // The user's done color. If misconfigured to "" we never record/keep-by-color
@@ -1077,7 +1089,7 @@ async function reconcileChunkCompletions(
       },
       windowStartMs,
       windowEndMs,
-      Date.parse(nowIso),
+      membershipNowMs ?? Date.parse(nowIso),
     ),
   );
 
@@ -1155,10 +1167,14 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
 
   const windowStartMs = Date.parse(windowStart);
   const windowEndMs = Date.parse(windowEnd);
+  // Window membership "now": the real clock, except that the Monday cron's
+  // upcoming week counts as started even when it begins after fire time
+  // (ResolveArgs.upcomingWeek). Placement is still floored separately.
+  const membershipNowMs = args.upcomingWeek ? Math.max(Date.now(), windowStartMs) : Date.now();
   const [weights, contexts, tasks, businessHours] = await Promise.all([
     loadWeights(db, ownerSubject),
     loadContexts(db, ownerSubject),
-    loadPendingTasks(db, ownerSubject, windowStartMs, windowEndMs),
+    loadPendingTasks(db, ownerSubject, windowStartMs, windowEndMs, membershipNowMs),
     loadBusinessHours(db, ownerSubject),
   ]);
 
@@ -1195,7 +1211,7 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
     );
     // Re-load pending tasks to pick up meeting rows the sweep just created, and
     // keep only the meeting rows not already loaded into `tasks`.
-    const reloaded = await loadPendingTasks(db, ownerSubject, windowStartMs, windowEndMs);
+    const reloaded = await loadPendingTasks(db, ownerSubject, windowStartMs, windowEndMs, membershipNowMs);
     const haveIds = new Set(tasks.map((t) => t.id));
     extraMeetingRows = reloaded.filter(
       (t) => t.source?.kind === MEETING_SOURCE_KIND && !haveIds.has(t.id),
@@ -1246,6 +1262,7 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
     windowStartMs,
     windowEndMs,
     calendar.defaultDoneColorId ?? env.DONE_COLOR_ID ?? "",
+    membershipNowMs,
   );
 
   // Build the solver input: start from the window's pending tasks, add back any
@@ -1279,10 +1296,12 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
   // meeting entries out of the fallback; build-problem overwrites a promoted
   // meeting's anchor with its live slot regardless, so that ordering is
   // defense in depth rather than a live hazard.
-  // SCHEDULER_TZ, not homeTz: week identity must use the tz that produced the
-  // window, and every producer anchors on SCHEDULER_TZ (see
+  // homeTz: week identity must use the tz that produced the window, and every
+  // producer (webhook, Monday cron) and consumer (supersede, both baselines,
+  // accept) uses the subject's effective tz — so a home_tz user's mid-week
+  // resolve lands in the same local week as their Mon-anchored plan (see
   // getCommittedPlanForWeek).
-  const weekPlan = await getCommittedPlanForWeek(db, ownerSubject, windowStart, env.SCHEDULER_TZ);
+  const weekPlan = await getCommittedPlanForWeek(db, ownerSubject, windowStart, homeTz, env.SCHEDULER_TZ);
   const previousSchedule = computeChurnBaseline({
     weekPlanSchedule: weekPlan?.body.schedule as ResolveBody["schedule"] | undefined,
     priorEvents,
@@ -1602,7 +1621,9 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
     ...(meetingWarnings.length > 0 ? { warnings: meetingWarnings } : {}),
   };
   const planHash = await computePlanHash(body as unknown as Record<string, unknown>);
-  await insertProposedPlan(db, planHash, body as unknown as Record<string, unknown>, now, expiresAt, accountEmail);
+  // window_tz = homeTz: the tz this window's week is bucketed in, so a later
+  // lookup in a different tz (after a tz change) never mistakes it for its week.
+  await insertProposedPlan(db, planHash, body as unknown as Record<string, unknown>, now, expiresAt, accountEmail, homeTz);
 
   // A fresh resolve makes every other pending plan for this week stale — even
   // one anchored to a different window_start (a mid-week replan narrows the
@@ -1610,7 +1631,8 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
   // one plan per week. Runs even when the caller later no-diff-deletes THIS
   // plan: an empty diff means the calendar already matches baseline, so the
   // older pending plan was obsolete anyway (spec: no-diff interaction, intended).
-  await supersedeOtherPendingPlansForWeek(db, accountEmail, windowStart, env.SCHEDULER_TZ, planHash);
+  // Bucketed in homeTz, the same subject tz as the churn baseline above.
+  await supersedeOtherPendingPlansForWeek(db, accountEmail, windowStart, homeTz, planHash, env.SCHEDULER_TZ);
 
   return { kind: "ok", planHash, body, priorEvents, externalEvents, meetingTaskIds: [...promotedMeetingTaskIds] };
 }

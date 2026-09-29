@@ -19,6 +19,7 @@ The `@cloudflare/vitest-pool-workers` pool can't collect the whole suite in one
 process, so the full run is batched per `test/` subdir — run `test:ci`, not a
 bare `vitest run`.
 
+
 # Deploy
 
 ## Dev (`weekly-scheduling-assistant-dev`)
@@ -261,6 +262,41 @@ management-view only) — the original `listBookings` used for slot-blocking
 availability is unchanged and still excludes them, since a cancelled slot
 should re-open immediately. See runbook §M for the full mechanism and known
 v1 limitations.
+
+## User timezone
+
+**No flag.** It rides `users.home_tz` (0018) plus migration 0040. Any signed-in
+user can set their own timezone with `GET/PATCH/DELETE /v1/timezone`
+(`getTimezone`/`setTimezone`/`resetTimezone`,
+`worker/src/handlers/timezone.ts`). An IANA zone is stored canonicalised;
+DELETE falls back to `SCHEDULER_TZ`. There's one tz per user, with no
+home/current split. A change of *effective* tz discards the user's pending
+plans (they were solved under the old hours) and replans nothing by itself.
+The next resolve applies business hours in the new tz, so free-floating
+chunks move, while pins, deadlines and `pinned_tz` templates stay put. Task
+`preferred_windows` are wall-clock, so a change stamps the *old* tz onto the
+untimezoned windows of all its tasks (never templates).
+`planning/window-projection.ts` then projects them into the planning tz,
+with a hard window that doesn't stay single becoming an exact
+`availability_windows` mask. `replan-now?force=true` replans at once.
+
+Every week-identity site (webhook and cron window derivation, churn/drop
+baselines, supersede, accept grouping) buckets in the subject's **effective
+tz** (`getHomeTz`), never `env.SCHEDULER_TZ` directly. They must move
+together, because a bucket must use the tz that produced the window. The
+Monday cron still fires once at Sun 15:00 UTC and takes each user's
+`upcomingLocalWeekWindow` (the local week containing now + 3.5 d). See
+runbook §Q, including the transition caveats. Proposed plans record their
+bucketing tz (`proposed_plans.window_tz`, migration **0040**, NULL =
+`SCHEDULER_TZ`), and week lookups match same-tz rows only. Apply 0040 before
+deploying:
+
+```bash
+op run --env-file=../.env -- npx wrangler d1 migrations apply DB --env dev --remote
+op run --env-file=../.env -- npx wrangler deploy --env dev
+```
+
+Smoke: `bin/timezone-smoke.py`.
 
 ## Per-user cost curves & weights
 
