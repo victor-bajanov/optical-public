@@ -3,6 +3,13 @@
 Curated notes for each public release, newest first. The full commit list for
 a release is in that release's PR on the public repository.
 
+## v1.1.1
+
+- **Security (solver dependency):** the solver's `certifi` is bumped to
+  2026.10.19, which removes trust for the compromised eMudhra intermediate
+  CAs (Mozilla bug 2083449). This changes only `solver/uv.lock` and no
+  other packages. Rebuild and redeploy the solver container to pick it up.
+
 ## v1.1.0
 
 - **Per-user timezone:** any signed-in user can now set their own timezone
