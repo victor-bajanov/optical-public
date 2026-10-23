@@ -7,6 +7,7 @@
 #   default            → prod database `scheduler`        (--remote)
 #   --local            → local `npx wrangler dev` database
 #   --env dev          → dev database `scheduler-dev` with `--env dev` (remote)
+#   --env trial        → refuses any --scopes containing calendar:raw-token
 #
 # `--env <name>` targets the per-env worker config (wrangler.toml [env.<name>])
 # and the D1 database named `scheduler-<name>`. Flags may appear in any order
@@ -42,6 +43,28 @@ done
 if [[ -n "$ENV_NAME" && ! "$ENV_NAME" =~ ^[a-z0-9-]+$ ]]; then
   echo "--env value must be a simple env name (got: $ENV_NAME)" >&2
   exit 64
+fi
+
+# Scopes are interpolated into the SQL below, so validate them on EVERY env
+# before anything else looks at them: single-space-separated tokens of a closed
+# charset (no quotes, semicolons, whitespace other than single spaces). This
+# also keeps the trial guard's whole-token match from being bypassed by a
+# quote splice such as "scheduler:read '||'calendar:raw-token".
+SCOPES_RE='^[A-Za-z0-9:._-]+( [A-Za-z0-9:._-]+)*$'
+if [[ ! "$ALLOWED_SCOPES" =~ $SCOPES_RE ]]; then
+  echo "--scopes must be single-space-separated tokens of [A-Za-z0-9:._-] (got: $(printf '%q' "$ALLOWED_SCOPES"))" >&2
+  exit 64
+fi
+
+# Trial guard: `calendar:raw-token` is checked only against the client's
+# allowlist, never the user's role, so on the invite-only trial every member
+# who signs in through such a client would receive raw IdP tokens. Refuse it
+# there before any wrangler call (inventory §4; runbook §R E7).
+if [[ "$ENV_NAME" == "trial" && " $ALLOWED_SCOPES " == *" calendar:raw-token "* ]]; then
+  echo "Refusing to register $CLIENT_ID on --env trial with calendar:raw-token in its scopes" >&2
+  echo "(scopes: $ALLOWED_SCOPES). Trial clients get 'scheduler:read scheduler:write'" >&2
+  echo "(plus 'admin' for the CLI client) and never calendar:raw-token." >&2
+  exit 65
 fi
 
 if [[ "$CLIENT_ID" == *"'"* || "$REDIRECT_URI" == *"'"* ]]; then

@@ -537,3 +537,61 @@ describe("dispatchScheduled — POLL_CRON", () => {
     expect(pollSweep).toHaveBeenCalledTimes(1);
   });
 });
+
+// Card C (decision C, O14b #3): a delisted-but-not-offboarded organiser's
+// polls get no nudges (mail from their mailbox), no deadline booking and no
+// escalation while an allow-list is configured. Their polls stay `open`, so
+// re-listing resumes them on the next tick (offboarding deletes them).
+describe("runPollSweep — delisted organiser (card C)", () => {
+  const LISTED = "listed-organiser@example.com";
+
+  async function seedTwoOrganisers() {
+    await seedSubject(SUBJECT);
+    await seedSubject(LISTED);
+    const delistedPoll = await seedPoll({ deadlineUtc: "2026-08-10T00:00:00Z" });
+    await seedInvitee(delistedPoll.id, "a@example.com");
+    const nudgePoll = await seedPoll({ deadlineUtc: "2026-08-10T12:00:00Z" });
+    await seedInvitee(nudgePoll.id, "b@example.com");
+    const listedPoll = await seedPoll({ subject: LISTED, deadlineUtc: "2026-08-10T00:00:00Z" });
+    await seedInvitee(listedPoll.id, "c@example.com");
+    return { delistedPoll, nudgePoll, listedPoll };
+  }
+
+  it("skips a delisted organiser's deadline booking and nudges; a listed organiser's poll still books", async () => {
+    const { delistedPoll, nudgePoll, listedPoll } = await seedTwoOrganisers();
+    const bookAtDeadline = vi.fn<BookAtDeadline>(async () => {});
+    const mock = new MockNotificationProvider();
+    const makeNotification = vi.fn(() => mock);
+    const info = vi.spyOn(console, "info");
+
+    const result = await runPollSweep(
+      { ...env, MEMBERSHIP_ALLOWLIST: LISTED, OPERATOR_EMAIL: "" },
+      new Date("2026-08-10T00:00:01Z"),
+      { bookAtDeadline, makeNotification },
+    );
+
+    expect(bookAtDeadline.mock.calls.map((c) => c[1])).toEqual([listedPoll.id]);
+    expect(makeNotification).not.toHaveBeenCalledWith(SUBJECT);
+    expect(mock.sentPollEmails).toHaveLength(0);
+    expect(result.checked).toBe(1);
+    expect(info).toHaveBeenCalledWith("delisted_skip", { path: "poll_sweep" });
+    expect((await getPoll(env.DB, delistedPoll.id))?.status).toBe("open");
+    expect((await getPoll(env.DB, nudgePoll.id))?.nudgedFinalAt).toBeNull();
+    info.mockRestore();
+  });
+
+  it("sweeps every organiser when no allow-list is set (prod parity)", async () => {
+    const { delistedPoll, listedPoll } = await seedTwoOrganisers();
+    const bookAtDeadline = vi.fn<BookAtDeadline>(async () => {});
+    const mock = new MockNotificationProvider();
+
+    await runPollSweep(
+      { ...env, MEMBERSHIP_ALLOWLIST: undefined, OPERATOR_EMAIL: "" },
+      new Date("2026-08-10T00:00:01Z"),
+      { bookAtDeadline, makeNotification: makeConstantNotification(mock) },
+    );
+
+    expect(bookAtDeadline.mock.calls.map((c) => c[1]).sort()).toEqual([delistedPoll.id, listedPoll.id].sort());
+    expect(mock.sentPollEmails.map((e) => e.to)).toEqual(["b@example.com"]);
+  });
+});

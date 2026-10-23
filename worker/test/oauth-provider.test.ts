@@ -1,19 +1,23 @@
 import { env, SELF } from "cloudflare:test";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { Hono } from "hono";
 import { __setIdentityProviderForTests } from "../src/auth/identity-provider";
 import type { IdentityProvider } from "../src/auth/identity-provider";
 import { oauthProviderApp, handleAuthCallback } from "../src/auth/oauth-provider";
 import { getSubjectProvider } from "../src/auth/identity-store";
-import { getUser } from "../src/db/users";
+import { getUser, upsertUser } from "../src/db/users";
 import { OPTICAL_DONE_CATEGORY } from "../src/providers/graph-event-mapping";
 import type { Env } from "../src/env";
+import { hashToken } from "../src/auth/tokens";
+import { hashingKey } from "../src/auth/crypto-keys";
+import { FULL_UPSTREAM_GRANT } from "./fixtures/upstream-grant";
 
 const mockIdp: IdentityProvider = {
   scopes: ["s"],
   authorizeUrl: ({ state }) => `https://idp.test/auth?state=${state}`,
-  exchangeCode: async () => ({ accessToken: "a", refreshToken: "r", expiresIn: 3600, scope: "s" }),
+  exchangeCode: async () => ({ accessToken: "a", refreshToken: "r", expiresIn: 3600, scope: FULL_UPSTREAM_GRANT }),
   fetchIdentity: async () => ({ email: "operator@example.com", providerSubject: "sub-operator" }),
+  revokeGrant: async () => {},
   refreshAccessToken: async () => ({ accessToken: "a", expiresIn: 3600 }),
 };
 
@@ -54,7 +58,57 @@ beforeEach(async () => {
 
 afterEach(() => {
   __setIdentityProviderForTests(null);
+  vi.restoreAllMocks();
 });
+
+// Shared /oauth/token helpers. A standalone app takes a per-test env through
+// the third `.request()` arg (SELF.fetch always uses the fixed wrangler env and
+// can't take a wrapped DB or a flipped MEMBERSHIP_ALLOWLIST).
+function tokenApp() {
+  const app = new Hono<{ Bindings: Env }>();
+  app.route("/oauth", oauthProviderApp);
+  return app;
+}
+
+const TOKEN_URL = "https://x/oauth/token";
+
+// Seed an access + refresh pair for `subject` exactly as issueTokens writes it.
+async function seedPair(
+  subject: string | null,
+  opts: { expiresAt?: string } = {},
+): Promise<{ access: string; refresh: string; accessHash: string; refreshHash: string }> {
+  const access = `acc-${crypto.randomUUID()}`;
+  const refresh = `ref-${crypto.randomUUID()}`;
+  const accessHash = await hashToken(access, hashingKey(env as Env));
+  const refreshHash = await hashToken(refresh, hashingKey(env as Env));
+  const expiresAt = opts.expiresAt ?? new Date(Date.now() + 3600_000).toISOString();
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO oauth_tokens (hashed_token, client_id, scopes, expires_at, refresh_of, revoked_at, subject) VALUES (?,?,?,?,?,?,?)")
+      .bind(accessHash, "codemode", "scheduler:read", expiresAt, null, null, subject),
+    env.DB.prepare("INSERT INTO oauth_tokens (hashed_token, client_id, scopes, expires_at, refresh_of, revoked_at, subject) VALUES (?,?,?,?,?,?,?)")
+      .bind(refreshHash, "codemode", "scheduler:read", expiresAt, accessHash, null, subject),
+  ]);
+  return { access, refresh, accessHash, refreshHash };
+}
+
+const tokenReq = (fields: Record<string, string>) => ({
+  method: "POST",
+  headers: { "content-type": "application/x-www-form-urlencoded" },
+  body: new URLSearchParams(fields),
+});
+
+const refreshReq = (refresh_token: string, client_id = "codemode") =>
+  tokenReq({ grant_type: "refresh_token", refresh_token, client_id });
+
+const revokedAt = async (hash: string) =>
+  (await env.DB.prepare("SELECT revoked_at FROM oauth_tokens WHERE hashed_token = ?").bind(hash).first<{ revoked_at: string | null }>())!.revoked_at;
+
+const liveTokenCount = async () =>
+  (await env.DB.prepare("SELECT COUNT(*) AS n FROM oauth_tokens WHERE revoked_at IS NULL").first<{ n: number }>())!.n;
+
+/** Every `oauth_refresh_refused` call a console.warn spy saw, as [tag, payload]. */
+const refusals = (warn: { mock: { calls: unknown[][] } }) =>
+  warn.mock.calls.filter((call) => call[0] === "oauth_refresh_refused");
 
 describe("/oauth/authorize", () => {
   it("400 on unknown client", async () => {
@@ -210,6 +264,7 @@ describe("/oauth/token refresh_token", () => {
     });
     const { refresh_token } = await tokRes.json() as { refresh_token: string };
 
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const refRes = await SELF.fetch("https://x/oauth/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -219,6 +274,7 @@ describe("/oauth/token refresh_token", () => {
     const body = await refRes.json() as { access_token: string; refresh_token: string };
     expect(body.access_token).toMatch(/^[A-Za-z0-9_-]{43,}$/);
     expect(body.refresh_token).not.toBe(refresh_token);
+    expect(refusals(warn)).toEqual([]); // a successful rotation logs no refusal
 
     const reuse = await SELF.fetch("https://x/oauth/token", {
       method: "POST",
@@ -226,6 +282,280 @@ describe("/oauth/token refresh_token", () => {
       body: new URLSearchParams({ grant_type: "refresh_token", refresh_token, client_id: "codemode" }),
     });
     expect(reuse.status).toBe(400);
+  });
+
+  // O14 #5: refresh re-applies applyRoleEntitlement against the subject's live
+  // role, so a demoted admin's rotated pair no longer carries `admin`. It only
+  // narrows: an admin whose stored grant lacks `admin` does not gain it.
+  describe("re-narrows admin against the live role (O14)", () => {
+    async function seedRefresh(subject: string, scopes: string): Promise<string> {
+      const access = `acc-${crypto.randomUUID()}`;
+      const refresh = `ref-${crypto.randomUUID()}`;
+      const accessHash = await hashToken(access, hashingKey(env as Env));
+      const refreshHash = await hashToken(refresh, hashingKey(env as Env));
+      const later = new Date(Date.now() + 3600_000).toISOString();
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO oauth_tokens (hashed_token, client_id, scopes, expires_at, refresh_of, revoked_at, subject) VALUES (?,?,?,?,?,?,?)")
+          .bind(accessHash, "codemode", scopes, later, null, null, subject),
+        env.DB.prepare("INSERT INTO oauth_tokens (hashed_token, client_id, scopes, expires_at, refresh_of, revoked_at, subject) VALUES (?,?,?,?,?,?,?)")
+          .bind(refreshHash, "codemode", scopes, later, accessHash, null, subject),
+      ]);
+      return refresh;
+    }
+    async function refreshOnce(refresh_token: string) {
+      return SELF.fetch("https://x/oauth/token", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token, client_id: "codemode" }),
+      });
+    }
+    const scopesOf = async (token: string) =>
+      (await env.DB.prepare("SELECT scopes FROM oauth_tokens WHERE hashed_token = ?")
+        .bind(await hashToken(token, hashingKey(env as Env))).first<{ scopes: string }>())!.scopes;
+
+    it("member role: `admin` is dropped from the response and both new rows", async () => {
+      const subject = `demoted-${crypto.randomUUID()}@example.com`;
+      await upsertUser(env.DB, subject, "member");
+      const res = await refreshOnce(await seedRefresh(subject, "scheduler:read admin"));
+      expect(res.status).toBe(200);
+      const body = await res.json() as { access_token: string; refresh_token: string; scope: string };
+      expect(body.scope).toBe("scheduler:read");
+      expect(await scopesOf(body.access_token)).toBe("scheduler:read");
+      expect(await scopesOf(body.refresh_token)).toBe("scheduler:read");
+    });
+
+    it("no users row: treated as non-admin, `admin` is dropped", async () => {
+      const subject = `ghost-${crypto.randomUUID()}@example.com`;
+      const res = await refreshOnce(await seedRefresh(subject, "scheduler:read admin"));
+      expect(res.status).toBe(200);
+      const body = await res.json() as { access_token: string; scope: string };
+      expect(body.scope).toBe("scheduler:read");
+      expect(await scopesOf(body.access_token)).toBe("scheduler:read");
+    });
+
+    it("admin role: `admin` is kept", async () => {
+      const subject = `admin-${crypto.randomUUID()}@example.com`;
+      await upsertUser(env.DB, subject, "admin");
+      const res = await refreshOnce(await seedRefresh(subject, "scheduler:read admin"));
+      expect(res.status).toBe(200);
+      const body = await res.json() as { access_token: string; scope: string };
+      expect(body.scope).toBe("scheduler:read admin");
+      expect(await scopesOf(body.access_token)).toBe("scheduler:read admin");
+    });
+
+    it("admin role, stored grant without `admin`: never widened", async () => {
+      const subject = `admin-narrow-${crypto.randomUUID()}@example.com`;
+      await upsertUser(env.DB, subject, "admin");
+      const res = await refreshOnce(await seedRefresh(subject, "scheduler:read"));
+      expect(res.status).toBe(200);
+      const body = await res.json() as { access_token: string; scope: string };
+      expect(body.scope).toBe("scheduler:read");
+      expect(await scopesOf(body.access_token)).toBe("scheduler:read");
+    });
+  });
+});
+
+// O4 (G5 gap): in allow-list mode a delisted subject's refresh is refused and
+// that refresh chain is revoked, so an uninvite takes effect at the client's
+// next refresh rather than only at the next sign-in.
+describe("/oauth/token refresh_token membership (O4)", () => {
+  const ALLOWLIST = { ...env, MEMBERSHIP_ALLOWLIST: "kept@example.com" } as Env;
+
+  it("allow-list set, subject delisted: 400 invalid_grant, no new tokens, the presented chain is revoked", async () => {
+    const { refresh, accessHash, refreshHash } = await seedPair("delisted@example.com");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await tokenApp().request("https://x/oauth/token", refreshReq(refresh), ALLOWLIST);
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string; error_description?: string; access_token?: string };
+    expect(body.error).toBe("invalid_grant");
+    expect(body.error_description).toBe("not a member");
+    expect(refusals(warn)).toEqual([["oauth_refresh_refused", { reason: "not_member", client_id: "codemode" }]]);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(refresh);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("delisted@example.com");
+    expect(body.access_token).toBeUndefined();
+    expect(await revokedAt(refreshHash)).not.toBeNull();
+    expect(await revokedAt(accessHash)).not.toBeNull();
+    const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM oauth_tokens WHERE revoked_at IS NULL").first<{ n: number }>();
+    expect(n!.n).toBe(0);
+    // Re-listing later does not resurrect the revoked chain.
+    const again = await tokenApp().request("https://x/oauth/token", refreshReq(refresh),
+      { ...env, MEMBERSHIP_ALLOWLIST: "delisted@example.com" } as Env);
+    expect(again.status).toBe(400);
+  });
+
+  it("allow-list set, subject still listed: rotates as before", async () => {
+    const { refresh } = await seedPair("kept@example.com");
+    const res = await tokenApp().request("https://x/oauth/token", refreshReq(refresh), ALLOWLIST);
+    expect(res.status).toBe(200);
+  });
+
+  it("allow-list set, OPERATOR_EMAIL subject not on it: rotates (operator always passes)", async () => {
+    const { refresh } = await seedPair("operator@example.com");
+    const res = await tokenApp().request("https://x/oauth/token", refreshReq(refresh), ALLOWLIST);
+    expect(res.status).toBe(200);
+  });
+
+  it("no allow-list configured: unchanged, a subject with no users row still rotates", async () => {
+    const { refresh } = await seedPair("no-users-row@example.com");
+    const res = await tokenApp().request("https://x/oauth/token", refreshReq(refresh),
+      { ...env, MEMBERSHIP_ALLOWLIST: "" } as Env);
+    expect(res.status).toBe(200);
+  });
+});
+
+/** env whose refresh-grant SELECT parks every reader until `parties` have read,
+ *  so all of them see the same pre-rotation row (revoked_at NULL). Without the
+ *  barrier two in-isolate requests don't reliably interleave: one request's
+ *  SELECT and rotation can both finish before the other reads. The 2 s fallback
+ *  turns a regression that stops a request reaching the SELECT into a failure,
+ *  not a hang. */
+function racingEnv(parties = 2): Env {
+  const REFRESH_SELECT = /SELECT client_id, scopes, expires_at, refresh_of, revoked_at, subject FROM oauth_tokens/;
+  let arrived = 0;
+  let release!: () => void;
+  const allIn = new Promise<void>((r) => { release = r; });
+  const gate = Promise.race([allIn, new Promise<void>((r) => setTimeout(r, 2000))]);
+  const db = new Proxy(env.DB, {
+    get(target, prop) {
+      if (prop === "prepare") {
+        return (q: string) => {
+          const stmt = target.prepare(q);
+          if (!REFRESH_SELECT.test(q)) return stmt;
+          return {
+            bind: (...args: unknown[]) => {
+              const bound = stmt.bind(...args);
+              return {
+                first: async <T>() => {
+                  const row = await bound.first<T>();
+                  if (++arrived >= parties) release();
+                  await gate;
+                  return row;
+                },
+              };
+            },
+          };
+        };
+      }
+      const v = Reflect.get(target, prop);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  return { ...env, DB: db } as unknown as Env;
+}
+
+// Single-use rotation: a CAS on revoked_at IS NULL is the serialization point,
+// so a concurrent burst of one refresh token mints exactly one new chain.
+describe("/oauth/token refresh_token concurrent rotation", () => {
+  it("two concurrent refreshes of one token: exactly one 200, the other 400 invalid_grant, one live pair", async () => {
+    const { refresh, accessHash, refreshHash } = await seedPair("member@example.com");
+    const e = racingEnv(2);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const [a, b] = await Promise.all([
+      tokenApp().request(TOKEN_URL, refreshReq(refresh), e),
+      tokenApp().request(TOKEN_URL, refreshReq(refresh), e),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([200, 400]);
+    const loser = a.status === 400 ? a : b;
+    expect(await loser.json()).toEqual({ error: "invalid_grant", error_description: "revoked" });
+    expect(await liveTokenCount()).toBe(2); // the winner's new access + refresh only
+    expect(await revokedAt(refreshHash)).not.toBeNull();
+    expect(await revokedAt(accessHash)).not.toBeNull();
+    expect(refusals(warn)).toEqual([["oauth_refresh_refused", { reason: "lost_race", client_id: "codemode" }]]);
+  });
+
+  it("issuance failure rolls back the paired access revoke with the new-pair inserts", async () => {
+    const { refresh, accessHash, refreshHash } = await seedPair("member@example.com");
+    // Every batch gains a trailing statement that fails, so D1 rolls the whole
+    // batch back: the issuance transaction is what's under test.
+    const db = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "batch") {
+          return (stmts: D1PreparedStatement[]) =>
+            target.batch([...stmts, target.prepare("INSERT INTO no_such_table (x) VALUES (1)")]);
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    const res = await tokenApp().request(TOKEN_URL, refreshReq(refresh), { ...env, DB: db } as unknown as Env);
+    expect(res.status).toBe(500);
+    // The presented refresh is spent (the CAS committed on its own), but the
+    // paired access token is revoked in the same transaction as the failed
+    // inserts, so it stays live and nothing new was minted.
+    expect(await revokedAt(refreshHash)).not.toBeNull();
+    expect(await revokedAt(accessHash)).toBeNull();
+    expect(await liveTokenCount()).toBe(1);
+  });
+});
+
+// Every 400 of the refresh grant logs one oauth_refresh_refused line, exactly
+// {reason, client_id}, with no token material and no subject. (not_member is
+// pinned in the O4 describe above; lost_race in the concurrent-rotation test.)
+describe("oauth_refresh_refused log", () => {
+  const SUBJECT = "member@example.com";
+
+  async function expectRefusal(
+    req: ReturnType<typeof tokenReq>,
+    reason: string,
+    clientId: string,
+    body: Record<string, string>,
+    secrets: string[] = [],
+  ) {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await tokenApp().request(TOKEN_URL, req, env);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual(body);
+    expect(refusals(warn)).toEqual([["oauth_refresh_refused", { reason, client_id: clientId }]]);
+    const logged = JSON.stringify(warn.mock.calls);
+    for (const s of [...secrets, SUBJECT]) expect(logged).not.toContain(s);
+  }
+
+  it("missing client_id: missing_params with an empty client_id", async () => {
+    const { refresh } = await seedPair(SUBJECT);
+    await expectRefusal(tokenReq({ grant_type: "refresh_token", refresh_token: refresh }),
+      "missing_params", "", { error: "invalid_request" }, [refresh]);
+  });
+
+  it("missing refresh_token: missing_params", async () => {
+    await expectRefusal(tokenReq({ grant_type: "refresh_token", client_id: "codemode" }),
+      "missing_params", "codemode", { error: "invalid_request" });
+  });
+
+  it("unknown token: unknown_token", async () => {
+    const stranger = `ref-${crypto.randomUUID()}`;
+    await expectRefusal(refreshReq(stranger), "unknown_token", "codemode", { error: "invalid_grant" }, [stranger]);
+  });
+
+  it("access token presented: not_refresh_token", async () => {
+    const { access } = await seedPair(SUBJECT);
+    await expectRefusal(refreshReq(access), "not_refresh_token", "codemode",
+      { error: "invalid_grant", error_description: "not a refresh token" }, [access]);
+  });
+
+  it("already rotated: revoked", async () => {
+    const { refresh } = await seedPair(SUBJECT);
+    const first = await tokenApp().request(TOKEN_URL, refreshReq(refresh), env);
+    expect(first.status).toBe(200);
+    await expectRefusal(refreshReq(refresh), "revoked", "codemode",
+      { error: "invalid_grant", error_description: "revoked" }, [refresh]);
+  });
+
+  it("wrong client: client_mismatch logs the presented client_id, not the token's", async () => {
+    const { refresh } = await seedPair(SUBJECT);
+    await expectRefusal(refreshReq(refresh, "other-client"), "client_mismatch", "other-client",
+      { error: "invalid_grant" }, [refresh]);
+  });
+
+  it("expired: expired", async () => {
+    const { refresh } = await seedPair(SUBJECT, { expiresAt: new Date(Date.now() - 3600_000).toISOString() });
+    await expectRefusal(refreshReq(refresh), "expired", "codemode",
+      { error: "invalid_grant", error_description: "expired" }, [refresh]);
+  });
+
+  it("long client_id: capped at 64 characters", async () => {
+    const stranger = `ref-${crypto.randomUUID()}`;
+    await expectRefusal(refreshReq(stranger, "c".repeat(300)), "unknown_token", "c".repeat(64),
+      { error: "invalid_grant" }, [stranger]);
   });
 });
 

@@ -4,6 +4,10 @@ import type {
 import { SyncTokenInvalidatedError } from "./calendar-provider";
 import type { CalendarEvent, Change, IncrementalResult, Subscription } from "./types";
 import {
+  OPTICAL_BOOKING_KEY, OPTICAL_DEPLOYMENT_KEY, OPTICAL_MEETING_TASK_ID_KEY, OPTICAL_POLL_ID_KEY, SCHEDULER_CHUNK_ID_KEY,
+} from "./types";
+import { scopeEventToDeployment, withDeploymentStamp } from "./deployment-scope";
+import {
   type GraphEvent, toCalendarEventFromGraph, isBusyGraphEvent,
   toGraphPatch, OPTICAL_DONE_CATEGORY, graphPropId, isoZ,
 } from "./graph-event-mapping";
@@ -15,6 +19,8 @@ export interface MicrosoftCalendarProviderOptions {
   fetch?: typeof fetch;
   /** Clock for the delta horizon (tests). */
   now?: () => Date;
+  /** See CalendarProvider.deploymentId. */
+  deploymentId?: string;
 }
 
 const GRAPH = "https://graph.microsoft.com/v1.0";
@@ -46,6 +52,23 @@ function isDeletedGraphEvent(g: GraphEvent): boolean {
   return Boolean(g["@removed"]) || Boolean(g.isCancelled);
 }
 
+/** The named properties every read expands: EVERY private key Optical writes.
+ *  Graph returns only the singleValueExtendedProperties named in $expand, so
+ *  a key missing here is invisible on Outlook. Without the deployment stamp a
+ *  foreign chunk reads as a legacy (own) one; without the poll id a
+ *  poll-booked meeting is imported as movable (meetings/identify.ts); without
+ *  the booking id decline auto-cancel never recognises its own bookings. */
+function expandOpticalProperties(): string {
+  const ids = [
+    SCHEDULER_CHUNK_ID_KEY,
+    OPTICAL_MEETING_TASK_ID_KEY,
+    OPTICAL_DEPLOYMENT_KEY,
+    OPTICAL_POLL_ID_KEY,
+    OPTICAL_BOOKING_KEY,
+  ].map(graphPropId);
+  return `singleValueExtendedProperties($filter=${ids.map((id) => `id eq '${id}'`).join(" or ")})`;
+}
+
 export class MicrosoftCalendarProvider implements CalendarProvider {
   private readonly getAccessToken: TokenFetcher;
   private readonly fetchFn: typeof fetch;
@@ -58,9 +81,11 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
   // done_color_id row must resolve here, not to the Google-shaped env default.
   readonly defaultDoneColorId = OPTICAL_DONE_CATEGORY;
   private readonly now: () => Date;
+  readonly deploymentId?: string;
 
   constructor(opts: MicrosoftCalendarProviderOptions) {
     this.getAccessToken = opts.getAccessToken;
+    this.deploymentId = opts.deploymentId;
     this.now = opts.now ?? (() => new Date());
     // Closure wrap: bare `this.fetchFn = fetch` breaks in Workers ("Illegal
     // invocation") — same trick as google-calendar-provider.ts:104.
@@ -79,6 +104,12 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
       res = await this.fetchFn(url, withAuth(token));
     }
     return res;
+  }
+
+  /** Every read maps through here, so another deployment's event never
+   *  surfaces with its ownership tags (providers/deployment-scope.ts). */
+  private toEvent(g: GraphEvent): CalendarEvent {
+    return scopeEventToDeployment(toCalendarEventFromGraph(g), this.deploymentId);
   }
 
   /** One page-following pass over a delta URL. Shared by the window fetch
@@ -118,7 +149,7 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
   ): CalendarEvent | null {
     if (isDeletedGraphEvent(g)) return null;
     if (!isBusyGraphEvent(g)) return null;
-    const ev = toCalendarEventFromGraph(g);
+    const ev = this.toEvent(g);
     const evStart = Date.parse(ev.start);
     const evEnd = Date.parse(ev.end);
     if (Number.isNaN(evStart) || Number.isNaN(evEnd)) {
@@ -141,9 +172,7 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
     // Only the initial request needs $expand: fetchIncrementalChanges reuses
     // the stored deltaLink/nextLink verbatim, and Graph derives those from
     // this request's parameters, so the expand carries forward automatically.
-    const chunkId = graphPropId("scheduler_chunk_id");
-    const taskId = graphPropId("optical_meeting_task_id");
-    params.set("$expand", `singleValueExtendedProperties($filter=id eq '${chunkId}' or id eq '${taskId}')`);
+    params.set("$expand", expandOpticalProperties());
     const r = await this.runDelta(`${GRAPH}/me/calendarView/delta?${params.toString()}`);
     if (r.invalidated) {
       // A fresh initial sync can't be stale; surface loudly rather than loop.
@@ -177,9 +206,7 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
       startDateTime: new Date(start).toISOString(),
       endDateTime: new Date(end).toISOString(),
     });
-    const chunkId = graphPropId("scheduler_chunk_id");
-    const taskId = graphPropId("optical_meeting_task_id");
-    params.set("$expand", `singleValueExtendedProperties($filter=id eq '${chunkId}' or id eq '${taskId}')`);
+    params.set("$expand", expandOpticalProperties());
     const events: CalendarEvent[] = [];
     const warnState = { warned: false };
     let url: string | undefined = `${GRAPH}/me/calendarView?${params.toString()}`;
@@ -214,7 +241,7 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
       if (isDeletedGraphEvent(g)) {
         changes.push({ kind: "delete", eventId: g.id });
       } else if (isBusyGraphEvent(g)) {
-        const ev = toCalendarEventFromGraph(g);
+        const ev = this.toEvent(g);
         // Unlike fetchEventsInWindow (which has always guarded this),
         // upserting an event with an unparseable "" start/end would reach
         // build-problem.ts and abort the whole replan via localWeekWindow("").
@@ -242,7 +269,10 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
     schedulerMetadata: Record<string, string>,
     opts?: CreateEventOptions,
   ): Promise<{ eventId: string }> {
-    const props = { ...(event.extendedProperties?.private ?? {}), ...schedulerMetadata };
+    const props = {
+      ...(event.extendedProperties?.private ?? {}),
+      ...withDeploymentStamp(schedulerMetadata, this.deploymentId),
+    };
     const payload: Record<string, unknown> = {
       subject: event.summary,
       body: { contentType: "text", content: event.description ?? "" },
@@ -324,16 +354,14 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
   async getEvent(eventId: string): Promise<CalendarEvent | null> {
     // Same $expand as the delta read so scheduler metadata survives a
     // single-event fetch (decline-cancel / poll re-verification read it).
-    const chunkId = graphPropId("scheduler_chunk_id");
-    const taskId = graphPropId("optical_meeting_task_id");
     const params = new URLSearchParams();
-    params.set("$expand", `singleValueExtendedProperties($filter=id eq '${chunkId}' or id eq '${taskId}')`);
+    params.set("$expand", expandOpticalProperties());
     const res = await this.authedFetch(`${GRAPH}/me/events/${encodeURIComponent(eventId)}?${params.toString()}`);
     if (res.status === 404 || res.status === 410) return null;
     if (!res.ok) throw new Error(`Graph get failed: ${res.status} ${await res.text()}`);
     // A cancelled Graph event maps to status "cancelled" (not null), mirroring
     // the Google provider's contract — callers check status first.
-    return toCalendarEventFromGraph((await res.json()) as GraphEvent);
+    return this.toEvent((await res.json()) as GraphEvent);
   }
 
   async deleteEvent(eventId: string): Promise<void> {

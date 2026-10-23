@@ -1,6 +1,6 @@
 // Single source of truth for D1 tables scoped to one user. Drives offboardUser's
 // DELETE batch (policy: "delete") and the schema-introspection guard test, which
-// fails if a table exposing an owner_subject/subject/account_email column is not
+// fails if a table exposing an owner_subject/subject/account_email/owner column is not
 // listed here — forcing an explicit delete/keep decision on every new table.
 //
 // `column` is the per-user scoping column. `extraDeletes` carries additional
@@ -34,6 +34,15 @@ export const OWNER_SCOPED_TABLES: readonly OwnerScopedTable[] = [
   { table: "config_meeting_policy", column: "owner_subject", policy: "delete" },
   { table: "config_booking_page", column: "owner_subject", policy: "delete" },
   { table: "bookings", column: "owner_subject", policy: "delete" },
+  // Per-call solver telemetry (0038); `owner` is the resolving subject. Deleted
+  // on offboard so a leaver's usage history goes with them (hosted-trial O3).
+  { table: "solver_calls", column: "owner", policy: "delete" },
+  // Per-subject outbound mail cap counters (0044, O9.8).
+  { table: "outbound_mail_counts", column: "subject", policy: "delete" },
+  // O9.1 agent-confirm deferrals (0042). Deleting them on offboard also kills
+  // every emailed confirm link the leaver still holds: the confirm route finds
+  // no row and replays nothing.
+  { table: "pending_actions", column: "owner_subject", policy: "delete" },
   {
     table: "polls",
     column: "subject",
@@ -58,10 +67,10 @@ export const OWNER_SCOPED_TABLES: readonly OwnerScopedTable[] = [
       "DELETE FROM proposed_plans WHERE subject IS NULL AND json_extract(body, '$.account_email') = ?",
     ],
   },
-  { table: "audit_log", column: "subject", policy: "keep", reason: "history intentionally retained" },
-  { table: "users", column: "subject", policy: "keep", reason: "deactivated via deactivateUser, not hard-deleted" },
+  { table: "audit_log", column: "subject", policy: "keep", reason: "history retained; when DELETED_ACCOUNT_RETENTION_DAYS is set, the purge (lifecycle/purge-deleted.ts) pseudonymises the subject that many days after offboard" },
+  { table: "users", column: "subject", policy: "keep", reason: "deactivated via deactivateUser at offboard; when DELETED_ACCOUNT_RETENTION_DAYS is set, the purge (lifecycle/purge-deleted.ts) deletes the row that many days later" },
 ] as const;
 
 /** Columns that mark a table as scoped to a single user. The guard scans the live
  *  schema for any of these; every match must appear in OWNER_SCOPED_TABLES. */
-export const OWNER_SCOPING_COLUMNS = ["owner_subject", "subject", "account_email"] as const;
+export const OWNER_SCOPING_COLUMNS = ["owner_subject", "subject", "account_email", "owner"] as const;

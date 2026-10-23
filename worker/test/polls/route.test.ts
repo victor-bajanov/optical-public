@@ -250,6 +250,18 @@ describe("GET /poll/_static/poll.<hash>.js", () => {
 });
 
 describe("GET /poll/:id/grid", () => {
+  it("401s for an O9.1 confirm-action token (purposes are not interchangeable)", async () => {
+    const poll = await seedPoll();
+    const confirmToken = await signCapabilityWithEnv(
+      { purpose: "confirm-action", actionId: poll.id, subject: OWNER, ttlSeconds: 3600 },
+      TEST_ENV,
+    );
+    const app = appWith(new MockCalendarProvider({ events: [] }));
+    const res = await app.request(`/poll/${poll.id}/grid?t=${encodeURIComponent(confirmToken)}`, {}, ON);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "invalid_token" });
+  });
+
   it("401s for an invalid or wrong-poll token", async () => {
     const pollA = await seedPoll();
     const pollB = await seedPoll();
@@ -1851,5 +1863,136 @@ describe("POST /poll/:id/join", () => {
       expect(res.status).toBe(404);
       expect(res.headers.get("content-type")).not.toContain("text/html");
     });
+  });
+});
+
+// Card C (decision C, O14b #3): a delisted-but-not-offboarded organiser's
+// poll is closed to the public while an allow-list is set. Every invitee
+// action reads exactly like a dead link (the friendly expired page, or the
+// 401 invalid_token the client already handles) — the grid and the save both
+// read the organiser's calendar with their grant, a save can auto-book (an
+// event and invitations from their account) and notifies the organiser from
+// their mailbox, and the hourly sweep that would close the poll is skipped
+// for them too. Guest join (an email from their mailbox) is the same opaque
+// 404 as a poll without a guest link. Nothing is written, so re-listing
+// restores every existing link unchanged.
+describe("delisted organiser (card C)", () => {
+  const DELISTED: Env = { ...ON, MEMBERSHIP_ALLOWLIST: "someone-else@org", OPERATOR_EMAIL: "" };
+  const LISTED: Env = { ...ON, MEMBERSHIP_ALLOWLIST: OWNER, OPERATOR_EMAIL: "" };
+
+  it("the invitee page reads as expired and the grid 401s, with no calendar read", async () => {
+    const poll = await seedPoll();
+    const { token } = await seedInvitee(poll, "a@x.com");
+    const provider = new MockCalendarProvider({ events: [] });
+    const fetchSpy = vi.spyOn(provider, "fetchEventsInWindow");
+    const app = appWith(provider);
+    const info = vi.spyOn(console, "info");
+
+    const page = await app.request(`/poll/${poll.id}?t=${encodeURIComponent(token)}`, {}, DELISTED);
+    expect(page.status).toBe(200);
+    expect((await page.text()).toLowerCase()).toContain("expired");
+
+    const grid = await app.request(`/poll/${poll.id}/grid?t=${encodeURIComponent(token)}`, {}, DELISTED);
+    expect(grid.status).toBe(401);
+    expect(await grid.json()).toEqual({ error: "invalid_token" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(info).toHaveBeenCalledWith("delisted_skip", { path: "poll_page" });
+  });
+
+  it("a response save 401s: nothing saved, no auto-book, no organiser email", async () => {
+    const poll = await seedPoll();
+    const { invitee, token } = await seedInvitee(poll, "a@x.com");
+    const notification = new MockNotificationProvider();
+    const app = appWith(new MockCalendarProvider({ events: [] }), notification);
+    const book = vi.fn(async () => {});
+    __setMaybeBookOnAllInForTests(book);
+
+    const res = await app.request(
+      `/poll/${poll.id}/response?t=${encodeURIComponent(token)}`,
+      { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ cells: [], hideName: false, name: "Sam" }) },
+      DELISTED,
+    );
+    expect(res.status).toBe(401);
+    expect(book).not.toHaveBeenCalled();
+    expect(notification.sentPollEmails).toEqual([]);
+    const row = await env.DB.prepare("SELECT responded_at FROM poll_invitees WHERE id = ?")
+      .bind(invitee.id)
+      .first<{ responded_at: string | null }>();
+    expect(row!.responded_at).toBeNull();
+  });
+
+  it("the guest join form reads as expired and a join POST is the opaque 404, with no email, invitee or attempt row", async () => {
+    const poll = await seedPoll({}, "shared-secret");
+    const notification = new MockNotificationProvider();
+    const app = appWith(new MockCalendarProvider({ events: [] }), notification);
+    const info = vi.spyOn(console, "info");
+
+    const form = await app.request(`/poll/${poll.id}?g=shared-secret`, {}, DELISTED);
+    expect(form.status).toBe(200);
+    expect((await form.text()).toLowerCase()).toContain("expired");
+
+    const join = await app.request(
+      `/poll/${poll.id}/join`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "1.1.1.1" },
+        body: JSON.stringify({ name: "Guest", email: "g@x.com", turnstileToken: "tok", guestToken: "shared-secret" }),
+      },
+      DELISTED,
+    );
+    const noGuestLink = await seedPoll();
+    const reference = await app.request(
+      `/poll/${noGuestLink.id}/join`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "1.1.1.1" },
+        body: JSON.stringify({ name: "Guest", email: "g@x.com", turnstileToken: "tok", guestToken: "whatever" }),
+      },
+      ON,
+    );
+    expect(join.status).toBe(404);
+    expect(await join.text()).toBe(await reference.text());
+    expect(notification.sentPollEmails).toEqual([]);
+    const invitees = await env.DB.prepare("SELECT COUNT(*) AS n FROM poll_invitees WHERE poll_id = ?").bind(poll.id).first<{ n: number }>();
+    expect(invitees!.n).toBe(0);
+    const attempts = await env.DB.prepare("SELECT COUNT(*) AS n FROM poll_join_attempts WHERE poll_id = ?").bind(poll.id).first<{ n: number }>();
+    expect(attempts!.n).toBe(0);
+    expect(info).toHaveBeenCalledWith("delisted_skip", { path: "poll_guest_join" });
+  });
+
+  // Fix list (C review): each status-link view reads the organiser's calendar
+  // to rank candidates, so the ?t= status link is gated too — the same 404
+  // as an unknown poll.
+  it("the organiser's status link (?t=) is the same 404 as an unknown poll, with no calendar read", async () => {
+    const poll = await seedPoll();
+    await seedInvitee(poll, "a@x.com");
+    const statusToken = await signCapabilityWithEnv(
+      { purpose: "poll-status", pollId: poll.id, subject: OWNER, ttlSeconds: 3600 },
+      TEST_ENV,
+    );
+    const provider = new MockCalendarProvider({ events: [] });
+    const fetchSpy = vi.spyOn(provider, "fetchEventsInWindow");
+    const app = appWith(provider);
+    const info = vi.spyOn(console, "info");
+
+    const res = await app.request(`/poll/${poll.id}/status?t=${encodeURIComponent(statusToken)}`, {}, DELISTED);
+    const unknown = await app.request(`/poll/no-such-poll/status?t=${encodeURIComponent(statusToken)}`, {}, DELISTED);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe(await unknown.text());
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(info).toHaveBeenCalledWith("delisted_skip", { path: "poll_page" });
+
+    const listed = await app.request(`/poll/${poll.id}/status?t=${encodeURIComponent(statusToken)}`, {}, LISTED);
+    expect(listed.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalled();
+  });
+
+  it("a listed organiser's poll still serves its grid and guest join form", async () => {
+    const poll = await seedPoll({}, "shared-secret");
+    const { token } = await seedInvitee(poll, "a@x.com");
+    const app = appWith(new MockCalendarProvider({ events: [] }));
+    expect((await app.request(`/poll/${poll.id}/grid?t=${encodeURIComponent(token)}`, {}, LISTED)).status).toBe(200);
+    const form = await app.request(`/poll/${poll.id}?g=shared-secret`, {}, LISTED);
+    expect(await form.text()).toContain(`action="/poll/${poll.id}/join"`);
   });
 });

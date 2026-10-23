@@ -96,6 +96,11 @@ export interface CalendarProvider {
    *  its "Optical Done" category. See getDoneColorId (db/users.ts) and its
    *  three callers. */
   readonly defaultDoneColorId?: string;
+  /** This deployment's identity (deploymentIdFromEnv, the OAUTH_ISSUER
+   *  origin). When set, createEvent stamps it on every event and every read
+   *  strips the ownership tags off an event another deployment stamped
+   *  (providers/deployment-scope.ts). Undefined: no stamp, no scoping. */
+  readonly deploymentId?: string;
 }
 
 export class SyncTokenInvalidatedError extends Error {

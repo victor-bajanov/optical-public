@@ -20,6 +20,11 @@ export interface MovableVerdict {
 export type MovableVerdictReason =
   /** The meeting's task row outlived its calendar event (deleted/cancelled). */
   | "event_missing"
+  /** The row's event is not an owned movable meeting (isOwnedMovableMeeting):
+   *  a poll-booked event, a meeting someone else organises, or one with no
+   *  other attendee. The meetings sync never writes such a row, so it was
+   *  forged or the event has changed since import (O9.5). */
+  | "not_owned_movable"
   /** Starts within MEETING_MIN_NOTICE_MINUTES — no move is allowed. */
   | "imminent_notice"
   /** Committed-moved within MEETING_COMMIT_STABILITY_MINUTES — held in place. */

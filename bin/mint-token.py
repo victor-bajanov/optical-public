@@ -15,8 +15,9 @@ authorization_code + PKCE grant end to end:
   4. exchanges the code at <url>/oauth/token
   5. prints SCHEDULER_BEARER and SCHEDULER_REFRESH_TOKEN
 
-You must log in (in the browser) as an account listed in the worker's
-OPERATOR_EMAIL allowlist — for the regression smoke harness that is the
+You must log in (in the browser) as an account the worker's membership gate
+admits: a MEMBERSHIP_ALLOWLIST or OPERATOR_EMAIL entry (with no allow-list
+set, an existing active user also passes) — for the regression smoke harness that is the
 sandbox account (e.g. operator.alt@example.com). That account becomes the
 connected calendar/subject.
 
@@ -177,6 +178,35 @@ def make_pkce() -> tuple[str, str]:
     return verifier, challenge
 
 
+def login_prompt(provider: str) -> str:
+    """Shown before the browser opens when no expected account is known."""
+    return f"Log in as a MEMBERSHIP_ALLOWLIST or OPERATOR_EMAIL {provider.capitalize()} account."
+
+
+def access_denied_hint(provider: str) -> str:
+    """Explains an access_denied callback: the worker's membership gate
+    refused the identity (hosted-trial O5: a set allow-list is authoritative).
+    Only a pre-O4 worker redirects access_denied; a current one renders an
+    "Invitation only" page instead (see no_callback_hint)."""
+    return (f"The {provider.capitalize()} account you logged in as is not in the worker's "
+            "MEMBERSHIP_ALLOWLIST or OPERATOR_EMAIL.")
+
+
+# How long the localhost listener waits for the worker's redirect. A refused
+# sign-in (hosted-trial O4) never redirects back, so without a bound the
+# script would block forever on a browser tab showing "Invitation only".
+DEFAULT_CALLBACK_TIMEOUT_S = 300
+
+
+def no_callback_hint(provider: str, timeout_s: float) -> str:
+    """Shown when the listener times out. The usual cause is the worker's
+    membership gate: it now renders a 403 "Invitation only" page in the
+    browser instead of redirecting access_denied back to this listener."""
+    return (f"No callback received within {timeout_s:g}s. If the browser shows "
+            f"\"Invitation only\", the {provider.capitalize()} account you logged in as is "
+            "not in the worker's MEMBERSHIP_ALLOWLIST or OPERATOR_EMAIL.")
+
+
 def token_export_lines(
     access: str, refresh: str, minted_at: str, expected_email: str | None = None
 ) -> list[str]:
@@ -219,6 +249,16 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def make_callback_server(port: int, timeout_s: float) -> http.server.HTTPServer:
+    """The single-shot localhost listener. `timeout` bounds handle_request()
+    so a sign-in the worker refuses (no redirect back) ends the script."""
+    server = http.server.HTTPServer(("127.0.0.1", port), _CallbackHandler)
+    server.timeout = timeout_s
+    server.expected_path = "/callback"  # type: ignore[attr-defined]
+    server.query = None  # type: ignore[attr-defined]
+    return server
+
+
 def fetch_whoami_email(url: str, bearer: str, timeout: float = 15.0) -> str | None:
     """`GET /v1/whoami`'s email for `bearer`, or None if the call itself failed
     (network error, non-JSON body). None means "could not check" — the caller
@@ -254,6 +294,10 @@ def main() -> int:
                    help="Federated identity provider to authorize against (default: google). "
                         "Requires MS_PROVIDER_ENABLED=true on the target worker for \"microsoft\".")
     p.add_argument("--port", type=int, default=8976, help="Localhost port for the callback listener (default: 8976).")
+    p.add_argument("--callback-timeout", type=float, default=DEFAULT_CALLBACK_TIMEOUT_S,
+                   help="Seconds to wait for the browser callback before giving up "
+                        f"(default: {DEFAULT_CALLBACK_TIMEOUT_S}). A non-member sees an "
+                        "'Invitation only' page and is never redirected back.")
     p.add_argument("--scope", default="scheduler:read scheduler:write calendar:raw-token admin",
                    help="Requested scope string (server narrows to the client's allowed_scopes and the subject's role).")
     p.add_argument("--config", default=None,
@@ -303,32 +347,29 @@ def main() -> int:
         "provider": args.provider,
     })
 
-    server = http.server.HTTPServer(("127.0.0.1", args.port), _CallbackHandler)
-    server.expected_path = "/callback"  # type: ignore[attr-defined]
-    server.query = None  # type: ignore[attr-defined]
+    server = make_callback_server(args.port, args.callback_timeout)
 
     print(f"Opening browser for authorization (client_id={args.client_id}, provider={args.provider}).", file=sys.stderr)
     if expected_email:
         print(f"Log in as {expected_email} (the config's {args.provider} account).\n", file=sys.stderr)
     else:
-        print(f"Log in as an OPERATOR_EMAIL-allowlisted {args.provider.capitalize()} account.\n", file=sys.stderr)
+        print(login_prompt(args.provider) + "\n", file=sys.stderr)
     print(f"If the browser does not open, visit:\n  {authorize}\n", file=sys.stderr)
     webbrowser.open(authorize)
 
-    # Block until the single callback request arrives.
+    # Block until the single callback request arrives (or the timeout lapses).
     server.handle_request()
     query: dict[str, list[str]] | None = server.query  # type: ignore[attr-defined]
     server.server_close()
 
     if not query:
-        print("No callback received.", file=sys.stderr)
+        print(no_callback_hint(args.provider, args.callback_timeout), file=sys.stderr)
         return 1
     if "error" in query:
         err = query["error"][0]
         print(f"Authorization failed: {err}", file=sys.stderr)
         if err == "access_denied":
-            print("The Google account you logged in as is not in the worker's "
-                  "OPERATOR_EMAIL allowlist.", file=sys.stderr)
+            print(access_denied_hint(args.provider), file=sys.stderr)
         return 1
     if query.get("state", [None])[0] != state:
         print("State mismatch — possible CSRF; aborting.", file=sys.stderr)

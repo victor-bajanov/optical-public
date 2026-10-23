@@ -8,6 +8,8 @@ import {
   getLatestProposedPlanForSubjectCovering,
 } from "../planning/proposed-plans";
 import { getHomeTz } from "../db/users";
+import { redactRenderSnapshot } from "../diff/redact-snapshot";
+import { RenderSnapshotSchema, type RenderSnapshot } from "../schema/render-snapshot";
 
 const PlanResponse = z.object({
   plan: z
@@ -19,7 +21,7 @@ const PlanResponse = z.object({
         start: z.string().describe("Inclusive start of the plan's scheduling window (ISO 8601)."),
         end: z.string().describe("Exclusive end of the plan's scheduling window (ISO 8601)."),
       }).nullable().describe("The week/window the plan covers, or null if the plan body carries no window."),
-      render_snapshot: z.unknown().nullable().describe("Cached render of the plan for display, or null if not snapshotted."),
+      render_snapshot: RenderSnapshotSchema.nullable().describe("Cached render of the plan for display, or null if not snapshotted. Titles of calendar events the user does not organise are redacted to \"Busy\" (prompt-injection guard); the user's own email and accept page keep the real titles."),
     })
     .nullable()
     .describe("The latest uncommitted proposed plan, or null if the caller has none."),
@@ -80,7 +82,9 @@ export function mountLatestPlanRoute(
           created_at: plan.created_at,
           expires_at: plan.expires_at,
           window: window ?? null,
-          render_snapshot: plan.render_snapshot ?? null,
+          // Redact others' event titles for API callers (O9.6); the stored
+          // snapshot keeps them for the user's own accept page.
+          render_snapshot: (redactRenderSnapshot(plan.render_snapshot ?? null) as RenderSnapshot | null),
         },
       },
       200,

@@ -173,3 +173,14 @@ describe("MicrosoftIdentityProvider", () => {
     expect(r).toEqual({ accessToken: "at2", expiresIn: 3599, refreshToken: "rt2" });
   });
 });
+
+describe("MicrosoftIdentityProvider.revokeGrant", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("is a documented no-op: Entra has no per-app revoke for a delegated grant, so it makes no network call", async () => {
+    const f = vi.fn(async () => { throw new Error("network must not be used"); });
+    vi.stubGlobal("fetch", f);
+    const idp = new MicrosoftIdentityProvider({ clientId: "c", clientSecret: "s" });
+    await expect(idp.revokeGrant("any-token")).resolves.toBeUndefined();
+    expect(f).not.toHaveBeenCalled();
+  });
+});

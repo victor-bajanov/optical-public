@@ -1,5 +1,5 @@
 import { env, applyD1Migrations } from "cloudflare:test";
-import { beforeAll } from "vitest";
+import { beforeAll, beforeEach } from "vitest";
 // Vite ?raw imports resolve to string contents at build time.
 import initialSql from "../migrations/0001_initial.sql?raw";
 import seedSql from "../migrations/0002_seed_config.sql?raw";
@@ -40,7 +40,21 @@ import identityProviderSubjectSql from "../migrations/0037_identity_provider_sub
 import solverCallsSql from "../migrations/0038_solver_calls.sql?raw";
 import solverCallsEngineSql from "../migrations/0039_solver_calls_engine.sql?raw";
 import proposedPlansWindowTzSql from "../migrations/0040_proposed_plans_window_tz.sql?raw";
+import usersRetentionWarnedAtSql from "../migrations/0041_users_retention_warned_at.sql?raw";
+import pendingActionsSql from "../migrations/0042_pending_actions.sql?raw";
+import usersDeactivatedAtSql from "../migrations/0043_users_deactivated_at.sql?raw";
+import outboundMailCountsSql from "../migrations/0044_outbound_mail_counts.sql?raw";
+import pendingActionsMailChannelSql from "../migrations/0045_pending_actions_mail_channel.sql?raw";
 import { OCCURRENCE_UNIQUE_INDEX_DDL } from "../src/recurrence/occurrence-index";
+import { __setSignInSubscriberForTests } from "../src/webhooks/sign-in-subscribe";
+
+// Every /auth/callback sign-in ensures a push channel in the background
+// (webhooks/sign-in-subscribe.ts). The real subscriber would build a live
+// Google/Graph provider and call out over the network, so tests get a no-op
+// unless they install their own (test/oauth-callback.test.ts does).
+beforeEach(() => {
+  __setSignInSubscriberForTests(async () => {});
+});
 
 beforeAll(async () => {
   await applyD1Migrations(env.DB, [
@@ -84,5 +98,10 @@ beforeAll(async () => {
     { name: "0038_solver_calls.sql", queries: [solverCallsSql] },
     { name: "0039_solver_calls_engine.sql", queries: [solverCallsEngineSql] },
     { name: "0040_proposed_plans_window_tz.sql", queries: [proposedPlansWindowTzSql] },
+    { name: "0041_users_retention_warned_at.sql", queries: [usersRetentionWarnedAtSql] },
+    { name: "0042_pending_actions.sql", queries: [pendingActionsSql] },
+    { name: "0043_users_deactivated_at.sql", queries: [usersDeactivatedAtSql] },
+    { name: "0044_outbound_mail_counts.sql", queries: [outboundMailCountsSql] },
+    { name: "0045_pending_actions_mail_channel.sql", queries: [pendingActionsMailChannelSql] },
   ]);
 });

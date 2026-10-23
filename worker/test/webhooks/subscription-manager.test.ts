@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { ensureSubscription } from "../../src/webhooks/subscription-manager";
 import { MockCalendarProvider } from "../../src/providers/mock-calendar-provider";
-import { getCalendarSync } from "../../src/db/calendar-sync";
+import { getCalendarSync, casCalendarSyncChannel } from "../../src/db/calendar-sync";
 
 /** Wraps env.DB so the upsertCalendarSync write (INSERT INTO calendar_sync)
  *  throws — simulates a D1 write failure right after a new Graph
@@ -26,9 +26,18 @@ function throwingUpsertDB(realDb: typeof env.DB) {
   return proxy;
 }
 
+/** A channel write needs the subject to hold a stored grant (casCalendarSyncChannel). */
+async function seedGrant(subject: string) {
+  await env.DB.prepare(
+    "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject) VALUES (?,?,?,?,?,?)",
+  ).bind(subject, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", `sub-${subject}`).run();
+}
+
 describe("ensureSubscription", () => {
   beforeEach(async () => {
     await env.DB.prepare("DELETE FROM calendar_sync").run();
+    await env.DB.prepare("DELETE FROM identity_tokens").run();
+    await seedGrant("operator@org");
   });
 
   it("subscribes when no row exists", async () => {
@@ -315,5 +324,238 @@ describe("ensureSubscription", () => {
       const row = await getCalendarSync(env.DB, "operator@org", "primary");
       expect(row?.channel_id).toBe("sub-old");
     });
+  });
+});
+
+// Two writers racing on one owner (a sign-in's waitUntil against the daily
+// sweep, two quick sign-ins, two rotations): both read the same channel state
+// and both create a channel. Only the first write may land; the loser must
+// stop the channel it just made, or it stays live at Google until expiry.
+describe("ensureSubscription — concurrent writers (CAS on channel_id)", () => {
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM calendar_sync").run();
+    await env.DB.prepare("DELETE FROM identity_tokens").run();
+    await seedGrant("racer@org");
+  });
+
+  /** Holds every subscribeToChanges call until `n` have arrived, so both
+   *  callers have read calendar_sync before either writes. */
+  function barrierCalendar(n: number) {
+    const cal = new MockCalendarProvider();
+    const real = cal.subscribeToChanges.bind(cal);
+    let arrived = 0;
+    let open!: () => void;
+    const gate = new Promise<void>((r) => { open = r; });
+    cal.subscribeToChanges = async (url: string, token: string) => {
+      const sub = await real(url, token);
+      if (++arrived === n) open();
+      await gate;
+      return sub;
+    };
+    return cal;
+  }
+
+  async function race(cal: MockCalendarProvider) {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const args = {
+      db: env.DB,
+      ownerSubject: "racer@org",
+      calendar: cal,
+      callbackUrl: "https://x/v1/webhook/google-calendar",
+      now: new Date("2026-05-18T00:00:00Z"),
+    };
+    const results = await Promise.all([ensureSubscription(args), ensureSubscription(args)]);
+    return { results, warn };
+  }
+
+  it("two first-time callers: exactly one channel stored, the loser's channel stopped", async () => {
+    const cal = barrierCalendar(2);
+    const { results, warn } = await race(cal);
+    expect(cal.getSubscribeCallCount()).toBe(2);
+    const row = await getCalendarSync(env.DB, "racer@org", "primary");
+    const stored = row?.channel_id;
+    expect(["mock-channel-1", "mock-channel-2"]).toContain(stored);
+    const loser = stored === "mock-channel-1" ? "mock-channel-2" : "mock-channel-1";
+    expect(cal.getStoppedChannels()).toEqual([{ channelId: loser, resourceId: "mock-resource" }]);
+    expect(results.map((r) => r.subscribed).sort()).toEqual([false, true]);
+    expect(warn).toHaveBeenCalledWith("ensureSubscription: lost a concurrent write, stopping own channel", { channelId: loser });
+  });
+
+  it("a race on a sync-token-only row keeps its sync token and stops the loser's channel", async () => {
+    await env.DB.prepare(
+      "INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token) VALUES ('racer@org', 'primary', 'tok-1')",
+    ).run();
+    const cal = barrierCalendar(2);
+    await race(cal);
+    const row = await getCalendarSync(env.DB, "racer@org", "primary");
+    expect(row?.next_sync_token).toBe("tok-1");
+    expect(cal.getStoppedChannels()).toHaveLength(1);
+  });
+
+  it("two rotations of the same expired channel: one wins, the old channel and the loser's are both stopped", async () => {
+    await env.DB.prepare(
+      "INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url) VALUES ('racer@org', 'primary', 'tok', 'ch-old', 'secret', '2026-05-17T00:00:00Z', 'res-old', 'https://x/v1/webhook/google-calendar')",
+    ).run();
+    const cal = barrierCalendar(2);
+    await race(cal);
+    const stored = (await getCalendarSync(env.DB, "racer@org", "primary"))?.channel_id;
+    const loser = stored === "mock-channel-1" ? "mock-channel-2" : "mock-channel-1";
+    expect(cal.getStoppedChannels()).toEqual(
+      expect.arrayContaining([
+        { channelId: "ch-old", resourceId: "res-old" },
+        { channelId: loser, resourceId: "mock-resource" },
+      ]),
+    );
+    // The old channel is stopped once, by the winner only.
+    expect(cal.getStoppedChannels().filter((s) => s.channelId === "ch-old")).toHaveLength(1);
+  });
+});
+
+// A channel write is only valid while the subject still holds a stored grant.
+// An offboard (admin, self-serve or the retention sweep, which the trial cron
+// runs next to channel renewal) deletes identity_tokens and calendar_sync; a
+// sign-in waitUntil subscribe or a sweep pass already in flight must not then
+// recreate the calendar_sync row (keyed by email, it would outlive the purge)
+// or leave a live provider channel behind.
+describe("ensureSubscription — subject offboarded mid-flight (no stored grant)", () => {
+  const fields = {
+    channel_id: "ch-new",
+    channel_token: "tok",
+    channel_expires_at: "2026-05-25T00:00:00Z",
+    channel_resource_id: "res-new",
+    channel_callback_url: "https://x/v1/webhook/google-calendar",
+  };
+
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM calendar_sync").run();
+    await env.DB.prepare("DELETE FROM identity_tokens").run();
+  });
+
+  it("B1: casCalendarSyncChannel refuses to insert a row for a subject with no identity_tokens row", async () => {
+    const won = await casCalendarSyncChannel(env.DB, "gone@example.com", "primary", null, fields);
+    expect(won).toBe(false);
+    expect(await getCalendarSync(env.DB, "gone@example.com", "primary")).toBeNull();
+  });
+
+  it("B2: an offboard landing between subscribeToChanges and the write leaves no row and stops the new channel", async () => {
+    await seedGrant("leaver@example.com");
+    const soon = new Date(Date.now() + 2 * 3600 * 1000).toISOString();
+    await env.DB.prepare(
+      "INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url) VALUES ('leaver@example.com', 'primary', 'tok', 'ch-old', 'secret', ?, 'res-old', 'https://x/v1/webhook/google-calendar')",
+    ).bind(soon).run();
+    const cal = new MockCalendarProvider();
+    cal.subscribeToChanges = async (_url: string, token: string) => {
+      // What offboardUser's D1 batch does to this subject.
+      await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind("leaver@example.com").run();
+      await env.DB.prepare("DELETE FROM calendar_sync WHERE owner_subject = ?").bind("leaver@example.com").run();
+      return { channelId: "ch-new", channelToken: token, resourceId: "res-new", expiresAt: soon };
+    };
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const r = await ensureSubscription({
+      db: env.DB,
+      ownerSubject: "leaver@example.com",
+      calendar: cal,
+      callbackUrl: "https://x/v1/webhook/google-calendar",
+      now: new Date(),
+    });
+
+    expect(r).toEqual({ subscribed: false });
+    expect(await getCalendarSync(env.DB, "leaver@example.com", "primary")).toBeNull();
+    expect(cal.getStoppedChannels()).toEqual([{ channelId: "ch-new", resourceId: "res-new" }]);
+    expect(warn).toHaveBeenCalledWith("ensureSubscription: lost a concurrent write, stopping own channel", { channelId: "ch-new" });
+  });
+
+  it("B4: an offboard landing during an in-place renew does not recreate the row; the renewed channel is stopped", async () => {
+    await seedGrant("leaver@example.com");
+    const fixedNow = new Date("2026-08-19T12:00:00Z"); // UTC Wednesday (no forced rotate)
+    const soon = new Date(fixedNow.getTime() + 2 * 3600 * 1000).toISOString();
+    await env.DB.prepare(
+      "INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url) VALUES ('leaver@example.com', 'primary', 'tok', 'sub-old', 'secret', ?, '', 'https://x/v1/webhook/microsoft-calendar')",
+    ).bind(soon).run();
+    const cal = new MockCalendarProvider({ supportsRenew: true });
+    cal.renewSubscription = async (channelId: string) => {
+      cal.renewedChannelIds.push(channelId);
+      await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind("leaver@example.com").run();
+      await env.DB.prepare("DELETE FROM calendar_sync WHERE owner_subject = ?").bind("leaver@example.com").run();
+      return { expiresAt: "2026-08-26T12:00:00Z" };
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const r = await ensureSubscription({
+      db: env.DB,
+      ownerSubject: "leaver@example.com",
+      calendar: cal,
+      callbackUrl: "https://x/v1/webhook/microsoft-calendar",
+      now: fixedNow,
+    });
+
+    expect(r).toEqual({ subscribed: false });
+    expect(await getCalendarSync(env.DB, "leaver@example.com", "primary")).toBeNull();
+    expect(cal.getSubscribeCallCount()).toBe(0);
+    expect(cal.getStoppedChannels()).toEqual([{ channelId: "sub-old", resourceId: "" }]);
+    expect(warn).toHaveBeenCalledWith("ensureSubscription: renewed channel no longer stored, stopping it", { channelId: "sub-old" });
+  });
+
+  it("B4b: an in-place renew never overwrites a channel a concurrent rotation stored", async () => {
+    await seedGrant("holder@example.com");
+    const fixedNow = new Date("2026-08-19T12:00:00Z");
+    const soon = new Date(fixedNow.getTime() + 2 * 3600 * 1000).toISOString();
+    await env.DB.prepare(
+      "INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url) VALUES ('holder@example.com', 'primary', 'tok', 'sub-old', 'secret', ?, '', 'https://x/v1/webhook/microsoft-calendar')",
+    ).bind(soon).run();
+    const cal = new MockCalendarProvider({ supportsRenew: true });
+    cal.renewSubscription = async (channelId: string) => {
+      cal.renewedChannelIds.push(channelId);
+      // A concurrent rotation won and stored its own channel meanwhile.
+      await env.DB.prepare(
+        "UPDATE calendar_sync SET channel_id = 'sub-rotated', channel_expires_at = '2026-08-26T00:00:00Z' WHERE owner_subject = ?",
+      ).bind("holder@example.com").run();
+      return { expiresAt: "2026-08-26T12:00:00Z" };
+    };
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const r = await ensureSubscription({
+      db: env.DB,
+      ownerSubject: "holder@example.com",
+      calendar: cal,
+      callbackUrl: "https://x/v1/webhook/microsoft-calendar",
+      now: fixedNow,
+    });
+
+    expect(r).toEqual({ subscribed: false });
+    const row = await getCalendarSync(env.DB, "holder@example.com", "primary");
+    expect(row?.channel_id).toBe("sub-rotated");
+    expect(row?.channel_expires_at).toBe("2026-08-26T00:00:00Z");
+  });
+
+  it("B1b: a surviving row whose grant is gone is not updated either (the conflict update is refused too)", async () => {
+    await env.DB.prepare(
+      "INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url) VALUES ('gone@example.com', 'primary', 'tok', 'ch-old', 'secret', '2026-05-20T00:00:00Z', 'res-old', 'https://x/v1/webhook/google-calendar')",
+    ).run();
+    const won = await casCalendarSyncChannel(env.DB, "gone@example.com", "primary", "ch-old", fields);
+    expect(won).toBe(false);
+    const row = await getCalendarSync(env.DB, "gone@example.com", "primary");
+    expect(row).toEqual({
+      owner_subject: "gone@example.com",
+      calendar_id: "primary",
+      next_sync_token: "tok",
+      channel_id: "ch-old",
+      channel_token: "secret",
+      channel_expires_at: "2026-05-20T00:00:00Z",
+      channel_resource_id: "res-old",
+      channel_callback_url: "https://x/v1/webhook/google-calendar",
+    });
+  });
+
+  it("B3: a grant holder with no calendar_sync row still gets one inserted", async () => {
+    await seedGrant("holder@example.com");
+    const won = await casCalendarSyncChannel(env.DB, "holder@example.com", "primary", null, fields);
+    expect(won).toBe(true);
+    const row = await getCalendarSync(env.DB, "holder@example.com", "primary");
+    expect(row?.channel_id).toBe("ch-new");
+    expect(row?.channel_resource_id).toBe("res-new");
   });
 });

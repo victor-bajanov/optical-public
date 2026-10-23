@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { Hono } from "hono";
 import type { Env } from "../../src/env";
@@ -9,6 +9,7 @@ import { hashToken } from "../../src/auth/tokens";
 import { hashingKey } from "../../src/auth/crypto-keys";
 import { upsertUser } from "../../src/db/users";
 import { getCalendarSync } from "../../src/db/calendar-sync";
+import { storeIdentityTokens } from "../../src/auth/identity-store";
 
 function makeApp(calendar?: MockCalendarProvider) {
   const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -29,8 +30,12 @@ async function seedAdminBearer(token: string, subject: string) {
     .bind(h, "c", "scheduler:read scheduler:write admin", "2099-01-01T00:00:00Z", null, null, subject).run();
 }
 
+// Seeds the stored grant too: a channel write needs one (casCalendarSyncChannel).
 async function seedExpiredChannel(owner: string) {
   const expired = new Date(Date.now() - 3600 * 1000).toISOString();
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject) VALUES (?,?,?,?,?,?)",
+  ).bind(owner, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", `sub-${owner}`).run();
   await env.DB.prepare(
     "INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url) VALUES (?, 'primary', 'tok', ?, 'secret', ?, ?, 'https://x/v1/webhook/google-calendar')",
   )
@@ -41,7 +46,7 @@ async function seedExpiredChannel(owner: string) {
 describe("POST /admin/renew-subscriptions", () => {
   beforeEach(async () => {
     await env.DB.prepare("DELETE FROM calendar_sync").run();
-    for (const t of ["oauth_tokens", "oauth_clients", "users"]) await env.DB.prepare(`DELETE FROM ${t}`).run();
+    for (const t of ["oauth_tokens", "oauth_clients", "users", "identity_tokens"]) await env.DB.prepare(`DELETE FROM ${t}`).run();
   });
 
   it("401 without bearer", async () => {
@@ -62,7 +67,7 @@ describe("POST /admin/renew-subscriptions", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, checked: 2, renewed: 2, failed: 0 });
+    expect(await res.json()).toEqual({ ok: true, checked: 2, renewed: 2, created: 0, create_failed: 0, failed: 0 });
     expect((await getCalendarSync(env.DB, "a@org", "primary"))?.channel_id).not.toBe("ch-a@org");
     expect((await getCalendarSync(env.DB, "b@org", "primary"))?.channel_id).not.toBe("ch-b@org");
   });
@@ -83,6 +88,48 @@ describe("POST /admin/renew-subscriptions", () => {
     );
 
     expect(res.status).toBe(500);
-    expect(await res.json()).toEqual({ ok: false, checked: 1, renewed: 0, failed: 1 });
+    expect(await res.json()).toEqual({ ok: false, checked: 1, renewed: 0, created: 0, create_failed: 0, failed: 1 });
+  });
+
+  it("creates a first channel for a grant holder who has none and reports it as created (trial finding 1)", async () => {
+    await upsertUser(env.DB, "operator@org", "admin");
+    await seedAdminBearer("tok", "operator@org");
+    await storeIdentityTokens(env, "invitee@org", { refreshToken: "r", accessToken: "a", expiresIn: 3600, scope: "s" }, "google", "sub-1");
+
+    const res = await makeApp(new MockCalendarProvider()).request(
+      "/admin/renew-subscriptions",
+      { method: "POST", headers: { Authorization: "Bearer tok" } },
+      env,
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, checked: 1, renewed: 0, created: 1, create_failed: 0, failed: 0 });
+    expect((await getCalendarSync(env.DB, "invitee@org", "primary"))?.channel_id).toMatch(/^mock-channel-/);
+  });
+
+  it("a create-pass failure alone stays 200 ok:true, reported as create_failed (a dead grant must not fail the renew sweep)", async () => {
+    await upsertUser(env.DB, "operator@org", "admin");
+    await seedAdminBearer("tok", "operator@org");
+    await seedExpiredChannel("a@org");
+    await storeIdentityTokens(env, "dead-grant@org", { refreshToken: "r", accessToken: "a", expiresIn: 3600, scope: "s" }, "google", "sub-2");
+    const cal = new MockCalendarProvider();
+    let calls = 0;
+    const real = cal.subscribeToChanges.bind(cal);
+    // Renew pass runs first (a@org rotates), then the create pass (dead-grant@org) fails.
+    cal.subscribeToChanges = async (url: string, token: string) => {
+      if (++calls === 2) throw new Error("invalid_grant");
+      return real(url, token);
+    };
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await makeApp(cal).request(
+      "/admin/renew-subscriptions",
+      { method: "POST", headers: { Authorization: "Bearer tok" } },
+      env,
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, checked: 2, renewed: 1, created: 0, create_failed: 1, failed: 0 });
+    err.mockRestore();
   });
 });

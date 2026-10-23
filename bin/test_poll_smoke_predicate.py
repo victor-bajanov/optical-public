@@ -1429,5 +1429,32 @@ def test_mailbox_circuit_breaker_disables_after_full_timeout():
         restore()
 
 
+# =============================================================================
+# awaiting_agent_confirmation — O9.3 gated deployments (AGENT_CONFIRM_CLIENT_IDS)
+# =============================================================================
+
+
+def test_202_awaiting_confirmation_is_recognised():
+    body = {"status": "awaiting_confirmation", "action_id": "a1", "expires_at": "x", "message": "m"}
+    assert poll_smoke.awaiting_agent_confirmation(202, body) is True
+
+
+def test_ordinary_created_and_errors_are_not_gating():
+    assert poll_smoke.awaiting_agent_confirmation(201, {"id": "p"}) is False
+    assert poll_smoke.awaiting_agent_confirmation(202, {"status": "other"}) is False
+    assert poll_smoke.awaiting_agent_confirmation(400, {"error": "invalid_range"}) is False
+
+
+def test_gating_message_names_the_flag_not_a_poll_bug():
+    msg = poll_smoke.agent_confirm_gated_message()
+    assert "AGENT_CONFIRM_CLIENT_IDS" in msg
+    assert "not a poll failure" in msg
+    # The public release's ms-deployment leak rule (scripts/release/lib/rules.toml)
+    # rejects naming the private Microsoft smoke deployment; name dev only.
+    import re
+    assert not re.search(r"\bdev/ms\b|\bms/dev\b|\b(against|on) `?ms`?\b", msg)
+    assert "against dev" in msg
+
+
 if __name__ == "__main__":
     sys.exit(__import__("pytest").main([__file__, "-v"]))

@@ -54,6 +54,12 @@ _spec = importlib.util.spec_from_file_location(
 _smoke_lib = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _smoke_lib
 _spec.loader.exec_module(_smoke_lib)
+# Per-env hosts (L7's expected deployment stamp for a workers.dev target).
+_hosts_spec = importlib.util.spec_from_file_location(
+    "_env_hosts", str(Path(__file__).resolve().parent / "_env_hosts.py")
+)
+_env_hosts = importlib.util.module_from_spec(_hosts_spec)
+_hosts_spec.loader.exec_module(_env_hosts)
 Identity = _smoke_lib.Identity
 SchedulerClient = _smoke_lib.SchedulerClient
 CalendarClient = _smoke_lib.CalendarClient
@@ -977,6 +983,40 @@ def _scheduler_chunk_id(ev: dict) -> str | None:
     return cid if isinstance(cid, str) else None
 
 
+_OPTICAL_DEPLOYMENT_KEY = "optical_deployment"
+
+
+def _expected_issuer_origin(scheduler_url: str, wrangler_env: str) -> str | None:
+    """The origin the target deployment stamps on its events (its OAUTH_ISSUER
+    origin, worker deploymentIdFromEnv). A custom-domain SCHEDULER_URL is the
+    issuer itself. A *.workers.dev URL is not: the worker still stamps its
+    custom-domain issuer, so resolve it from bin/_env_hosts.py by the wrangler
+    env (SMOKE_WRANGLER_ENV); None when that env isn't listed (check skipped)."""
+    parsed = httpx.URL(scheduler_url)
+    host = parsed.host
+    if host.endswith(".workers.dev"):
+        known = _env_hosts.ENV_HOSTS.get(wrangler_env)
+        return f"https://{known}" if known else None
+    return f"{parsed.scheme}://{host}" + (f":{parsed.port}" if parsed.port else "")
+
+
+def _deployment_stamp_problem(ev: dict, expected_origin: str | None) -> str | None:
+    """None when a chunk event carries the target deployment's stamp
+    (`expected_origin`, from _expected_issuer_origin) or no stamp at all (a
+    deployment still on the pre-stamp code), or when the expected origin is
+    unknown; else a message naming both. A foreign stamp means the event was
+    committed by ANOTHER deployment sharing this calendar (runbook §I, "Which
+    deployment owns an event")."""
+    priv = ((ev.get("extendedProperties") or {}).get("private")) or {}
+    stamp = priv.get(_OPTICAL_DEPLOYMENT_KEY)
+    if stamp is None or expected_origin is None or stamp == expected_origin:
+        return None
+    return (
+        f"chunk event {ev.get('id')!r} carries {_OPTICAL_DEPLOYMENT_KEY}={stamp!r}, "
+        f"expected {expected_origin!r} (the target deployment's OAUTH_ISSUER origin)"
+    )
+
+
 def list_scheduler_chunk_events(
     cal: CalendarClient, monday: date
 ) -> list[dict]:
@@ -1015,6 +1055,8 @@ def _chunk_index_of(ev: dict) -> str | None:
 
 
 _DIFF_ROLES = {"moved-to", "added", "new-clash", "moved-from", "removed"}
+_ENTRY_ORIGINS = {"task", "own_event", "others_event"}
+_REDACTED_TITLE = "Busy"
 
 
 def _assert_render_snapshot_model(snapshot: dict | None) -> None:
@@ -1035,6 +1077,8 @@ def _assert_render_snapshot_model(snapshot: dict | None) -> None:
       - at least one before/after entry has a non-empty title (titles resolved)
       - trigger reflects the webhook ({"kind":"webhook","inviteTitle":...})
       - at least one entry carries a diff role (an actual diff was classified)
+      - (O9.6) every entry has an origin; entries not from the user's own
+        tasks/events, and a foreign trigger's inviteTitle, read "Busy"
     """
     if snapshot is None:
         print(
@@ -1071,6 +1115,28 @@ def _assert_render_snapshot_model(snapshot: dict | None) -> None:
         "webhook-check model FAILED: trigger is not classified as a webhook "
         f"({trigger!r}) — buildReplanEmailModel did not receive the webhook trigger"
     )
+
+    # O9.6: the API copy of the snapshot is redacted. Every entry carries an
+    # origin; anything not the user's own task/event reads "Busy", and so does
+    # a webhook trigger whose invite the user doesn't organise.
+    no_origin = [e for e in entries if e.get("origin") not in _ENTRY_ORIGINS]
+    assert not no_origin, (
+        "webhook-check model FAILED: timeline entries without a known origin "
+        f"{sorted(_ENTRY_ORIGINS)} (pre-O9.6 deploy?): {no_origin[:3]!r}"
+    )
+    leaked = [
+        e for e in entries
+        if e["origin"] not in ("task", "own_event") and e.get("title") != _REDACTED_TITLE
+    ]
+    assert not leaked, (
+        "webhook-check model FAILED: others' event titles not redacted to "
+        f"{_REDACTED_TITLE!r}: {[e.get('role') for e in leaked]!r}"
+    )
+    if trigger.get("inviteOrganizedBySelf") is not True:
+        assert trigger.get("inviteTitle") == _REDACTED_TITLE, (
+            "webhook-check model FAILED: a foreign trigger's inviteTitle is not "
+            f"redacted to {_REDACTED_TITLE!r}"
+        )
 
     diff_entries = [e for e in entries if e.get("role") in _DIFF_ROLES]
     assert diff_entries, (
@@ -1698,6 +1764,15 @@ def run_level_chunks(env: Env, sched: SchedulerClient, cal: CalendarClient,
                 "L7: baseline commit did not create both chunk events for the "
                 f"subject (found indices {sorted(subj_chunks)!r})"
             )
+        # The chunks this deployment just committed carry ITS stamp (or none,
+        # on a deployment still running the pre-stamp code).
+        expected_origin = _expected_issuer_origin(
+            env.scheduler_url, os.environ.get("SMOKE_WRANGLER_ENV", "dev"),
+        )
+        for ev in subj_chunks.values():
+            problem = _deployment_stamp_problem(ev, expected_origin)
+            if problem is not None:
+                raise AssertionError(f"L7 baseline: {problem}")
 
         # 2. PARTIAL — paint chunk #0 done, then resolve + commit.
         #    Only 1 of 2 chunks recorded → the task flips done only when ALL chunks

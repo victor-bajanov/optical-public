@@ -10,9 +10,11 @@ export function mountRenewSubscriptionsRoute(
   app: Hono<{ Bindings: Env; Variables: AppVariables }>,
 ) {
   // Manual trigger for the daily channel-renewal sweep (cron/renew-subscriptions).
-  // Fans out over every calendar_sync owner with a channel — unlike the
-  // caller-scoped /admin/webhook/subscribe, which needs a token per owner.
-  // Needed in dev, where crons are disabled and channels otherwise lapse.
+  // Fans out over every calendar_sync owner with a channel (renew), then every
+  // active grant holder without one (create) — unlike the caller-scoped
+  // /admin/webhook/subscribe, which needs a token per owner. Needed in dev,
+  // where crons are disabled and channels otherwise lapse. ok/500 follow renew
+  // failures only; create failures are reported in create_failed.
   app.post("/admin/renew-subscriptions", requireBearer, requireAdminSubject, requireScope("admin"), async (c) => {
     const injected = c.var.calendarProvider;
     const result = await runRenewSubscriptions(

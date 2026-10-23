@@ -2,12 +2,13 @@ import type { Env } from "../env";
 import type { CalendarEvent } from "../providers/types";
 import { isSchedulerOwned } from "../webhooks/google-calendar";
 import { getCalendarSync, PRIMARY_CALENDAR_ID } from "../db/calendar-sync";
-import { defaultCalendarProvider, ProviderDisabledError } from "../index-providers";
+import { defaultCalendarProvider, defaultIdentityProvider, ProviderDisabledError } from "../index-providers";
 import { deactivateUser } from "../db/users";
 import { writeAudit } from "../db/audit";
-import { ACCESS_PREFIX } from "../auth/identity-store";
+import { ACCESS_PREFIX, getSubjectProvider, readRefreshToken } from "../auth/identity-store";
+import { revokeUpstreamGrant, type RevokeCapable } from "../auth/upstream-revoke";
 import { OWNER_SCOPED_TABLES } from "./owner-scoped-tables";
-import { SCHEDULER_HORIZON_MS } from "../planning/scheduler-chunks";
+import { SCHEDULER_HORIZON_MS, deletableChunks } from "../planning/scheduler-chunks";
 
 interface MinimalCalendar {
   stopChannel(channelId: string, resourceId: string): Promise<void>;
@@ -22,6 +23,9 @@ interface MinimalCalendar {
 export interface OffboardOptions {
   // Test seam: build a per-subject calendar provider. Defaults to the real one.
   calendarFor?: (env: Env, subject: string) => MinimalCalendar | Promise<MinimalCalendar>;
+  // Test seam: build the subject's identity provider for the upstream revoke
+  // (step 2.7). Defaults to the real one for the subject's stored provider.
+  identityFor?: (env: Env, subject: string) => RevokeCapable | Promise<RevokeCapable>;
   // Override the audit source recorded on the offboard action. Defaults to "admin".
   // Pass "cron" when the offboard is triggered by an automated sweep.
   auditSource?: import("../db/audit").AuditSource;
@@ -31,6 +35,11 @@ export interface OffboardOptions {
 // LOAD-BEARING (Plan 4 brief D):
 //   1. read calendar_sync (need channel ids + a live access token),
 //   2. stop the Google channel (tolerate any failure),
+//   2.5. sweep scheduler-owned chunk events (tolerate any failure),
+//   2.7. revoke the upstream grant when UPSTREAM_REVOKE_ENABLED (tolerate any
+//        failure) — AFTER 2 and 2.5,
+//        which need a live access token the revoke would kill, and BEFORE 3,
+//        which deletes the refresh token the revoke needs,
 //   3. delete the per-user rows,
 //   4. clear the KV access-token cache,
 //   5. reset the per-user Durable Object,
@@ -95,10 +104,11 @@ export async function offboardUser(
         new Date(horizonEnd).toISOString(),
         { syncToken: false },
       );
-      for (const e of events) {
-        if (isSchedulerOwned(e) && Date.parse(e.start) < horizonEnd) {
-          await cal.deleteEvent(e.id);
-        }
+      // Runs before step 3 deletes the tasks rows that deletableChunks needs
+      // to recognise this deployment's unstamped (legacy) chunks.
+      const chunks = events.filter((e) => isSchedulerOwned(e) && Date.parse(e.start) < horizonEnd);
+      for (const e of await deletableChunks(env.DB, subject, chunks)) {
+        await cal.deleteEvent(e.id);
       }
     } catch (e) {
       console.warn("offboardUser: scheduler-event sweep failed (continuing)", {
@@ -106,6 +116,24 @@ export async function offboardUser(
       });
     }
   }
+
+  // 2.7: revoke the upstream grant so the IdP stops honouring it once we
+  // forget it. Gated by UPSTREAM_REVOKE_ENABLED (trial only; see env.ts):
+  // off, the step is skipped entirely. Google: the revoke endpoint.
+  // Microsoft: a documented no-op (no per-app revoke for a delegated grant;
+  // the user removes the app, see MicrosoftIdentityProvider.revokeGrant).
+  // Best-effort like 2 and 2.5: revokeUpstreamGrant never throws, so no
+  // failure here (decrypt, provider construction, network, IdP error) can
+  // block the deletion below. The MS kill switch logs offboard_revoke_skipped.
+  // Any other failure logs offboard_revoke_failed, never carrying the token.
+  const identityFor = opts.identityFor
+    ?? (async (e: Env, s: string) => defaultIdentityProvider(e, await getSubjectProvider(e, s)));
+  await revokeUpstreamGrant(env, {
+    token: () => readRefreshToken(env, subject),
+    idp: () => identityFor(env, subject),
+    logPrefix: "offboard_revoke",
+    context: { subject },
+  });
 
   // 3: per-user D1 rows, generated from the owner-scoped-table registry (single
   // source of truth — see owner-scoped-tables.ts). Adding a per-user table there

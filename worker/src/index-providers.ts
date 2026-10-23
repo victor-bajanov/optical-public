@@ -1,6 +1,7 @@
 import { GoogleCalendarProvider } from "./providers/google-calendar-provider";
 import { GmailNotificationProvider } from "./providers/gmail-notification-provider";
 import { MicrosoftCalendarProvider } from "./providers/microsoft-calendar-provider";
+import { deploymentIdFromEnv } from "./providers/deployment-scope";
 import { MicrosoftGraphNotificationProvider } from "./providers/microsoft-graph-notification-provider";
 import type { CalendarProvider } from "./providers/calendar-provider";
 import type { NotificationProvider } from "./providers/notification-provider";
@@ -8,9 +9,11 @@ import type { IdentityProvider } from "./auth/identity-provider";
 import { injectedIdentityProvider } from "./auth/identity-provider";
 import { GoogleIdentityProvider } from "./auth/google-identity-provider";
 import { MicrosoftIdentityProvider } from "./auth/microsoft-identity-provider";
+import { googleScopeOptions, microsoftScopeOptions } from "./auth/scope-check";
 import { getAccessToken, getSubjectProvider } from "./auth/identity-store";
 import type { ProviderName } from "./providers/provider-name";
 import type { Env } from "./env";
+import { withOutboundMailCap } from "./mail/outbound-cap";
 
 export interface AppVariables {
   calendarProvider: CalendarProvider;
@@ -58,14 +61,13 @@ export function defaultIdentityProvider(env: Env, provider: ProviderName = "goog
       clientId: env.MICROSOFT_OAUTH_CLIENT_ID ?? "",
       clientSecret: env.MICROSOFT_OAUTH_CLIENT_SECRET ?? "",
       tenant: env.MICROSOFT_TENANT,
-      mailReadScopeEnabled: env.MICROSOFT_MAIL_READ_SCOPE_ENABLED === "true",
+      ...microsoftScopeOptions(env),
     });
   }
   return new GoogleIdentityProvider({
     clientId: env.GOOGLE_OAUTH_CLIENT_ID,
     clientSecret: env.GOOGLE_OAUTH_CLIENT_SECRET,
-    aclScopeEnabled: env.GOOGLE_ACL_SCOPE_ENABLED === "true",
-    gmailReadScopeEnabled: env.GOOGLE_GMAIL_READ_SCOPE_ENABLED === "true",
+    ...googleScopeOptions(env),
   });
 }
 
@@ -76,9 +78,9 @@ export async function defaultCalendarProvider(
   const idp = defaultIdentityProvider(env, provider);
   const getToken = async (opts?: { forceRefresh?: boolean }) => getAccessToken(env, idp, subject, opts);
   if (provider === "microsoft") {
-    return new MicrosoftCalendarProvider({ getAccessToken: getToken });
+    return new MicrosoftCalendarProvider({ getAccessToken: getToken, deploymentId: deploymentIdFromEnv(env) });
   }
-  return new GoogleCalendarProvider({ calendarId: "primary", getAccessToken: getToken });
+  return new GoogleCalendarProvider({ calendarId: "primary", getAccessToken: getToken, deploymentId: deploymentIdFromEnv(env) });
 }
 
 export async function defaultNotificationProvider(
@@ -87,10 +89,15 @@ export async function defaultNotificationProvider(
   const provider = providerArg ?? await getSubjectProvider(env, subject);
   const idp = defaultIdentityProvider(env, provider);
   const getToken = async (opts?: { forceRefresh?: boolean }) => getAccessToken(env, idp, subject, opts);
+  // O9.8: every production notification provider is capped per subject per
+  // UTC day (mail/outbound-cap.ts). This and defaultProviders below are the
+  // only places a user-mailbox provider is constructed.
   if (provider === "microsoft") {
-    return new MicrosoftGraphNotificationProvider({ getAccessToken: getToken });
+    return withOutboundMailCap(env, subject, new MicrosoftGraphNotificationProvider({ getAccessToken: getToken }));
   }
-  return new GmailNotificationProvider({ getFrom: () => Promise.resolve(subject), getAccessToken: getToken });
+  return withOutboundMailCap(
+    env, subject, new GmailNotificationProvider({ getFrom: () => Promise.resolve(subject), getAccessToken: getToken }),
+  );
 }
 
 /**
@@ -124,12 +131,14 @@ export async function defaultProviders(
   const getToken = async (opts?: { forceRefresh?: boolean }) => getAccessToken(env, idp, subject, opts);
   if (provider === "microsoft") {
     return {
-      calendar: new MicrosoftCalendarProvider({ getAccessToken: getToken }),
-      notification: new MicrosoftGraphNotificationProvider({ getAccessToken: getToken }),
+      calendar: new MicrosoftCalendarProvider({ getAccessToken: getToken, deploymentId: deploymentIdFromEnv(env) }),
+      notification: withOutboundMailCap(env, subject, new MicrosoftGraphNotificationProvider({ getAccessToken: getToken })),
     };
   }
   return {
-    calendar: new GoogleCalendarProvider({ calendarId: "primary", getAccessToken: getToken }),
-    notification: new GmailNotificationProvider({ getFrom: () => Promise.resolve(subject), getAccessToken: getToken }),
+    calendar: new GoogleCalendarProvider({ calendarId: "primary", getAccessToken: getToken, deploymentId: deploymentIdFromEnv(env) }),
+    notification: withOutboundMailCap(
+      env, subject, new GmailNotificationProvider({ getFrom: () => Promise.resolve(subject), getAccessToken: getToken }),
+    ),
   };
 }

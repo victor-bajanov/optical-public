@@ -6,6 +6,7 @@ import type {
   UpdateEventOptions,
 } from "./calendar-provider";
 import type { CalendarEvent, IncrementalResult, Subscription } from "./types";
+import { scopeEventToDeployment, withDeploymentStamp } from "./deployment-scope";
 
 interface MockOptions {
   events?: CalendarEvent[];
@@ -13,6 +14,9 @@ interface MockOptions {
   /** Mirrors MicrosoftCalendarProvider: when true, exposes renewSubscription
    *  so subscription-manager tests can drive the in-place-renewal branch. */
   supportsRenew?: boolean;
+  /** Mirrors the real providers (CalendarProvider.deploymentId): stamp on
+   *  create, strip another deployment's ownership tags on every read. */
+  deploymentId?: string;
 }
 
 export class MockCalendarProvider implements CalendarProvider {
@@ -32,9 +36,11 @@ export class MockCalendarProvider implements CalendarProvider {
   /** Populated only when constructed with `supportsRenew: true`. */
   renewedChannelIds: string[] = [];
   renewSubscription?(channelId: string): Promise<{ expiresAt: string }>;
+  readonly deploymentId?: string;
 
   constructor(opts: MockOptions = {}) {
     this.events = [...(opts.events ?? [])];
+    this.deploymentId = opts.deploymentId;
     this.freeBusyFixture = opts.freeBusy ?? {};
     if (opts.supportsRenew) {
       this.renewSubscription = async (channelId: string) => {
@@ -96,9 +102,9 @@ export class MockCalendarProvider implements CalendarProvider {
   async fetchEventsInWindow(start: string, end: string, opts?: { syncToken?: boolean }) {
     const s = Date.parse(start);
     const e = Date.parse(end);
-    const events = this.events.filter(
-      (ev) => Date.parse(ev.start) >= s && Date.parse(ev.end) <= e,
-    );
+    const events = this.events
+      .filter((ev) => Date.parse(ev.start) >= s && Date.parse(ev.end) <= e)
+      .map((ev) => scopeEventToDeployment(ev, this.deploymentId));
     // Returning "" for nextSyncToken when the caller opts out mirrors
     // Microsoft's { syncToken: false } plain-read path
     // (fetchEventsInWindowPlain), not Google — Google's own provider ignores
@@ -122,7 +128,10 @@ export class MockCalendarProvider implements CalendarProvider {
       id,
       extendedProperties: {
         ...(event.extendedProperties ?? {}),
-        private: { ...(event.extendedProperties?.private ?? {}), ...schedulerMetadata },
+        private: {
+          ...(event.extendedProperties?.private ?? {}),
+          ...withDeploymentStamp(schedulerMetadata, this.deploymentId),
+        },
       },
     };
     this.events.push(stored);
@@ -158,7 +167,8 @@ export class MockCalendarProvider implements CalendarProvider {
   }
 
   async getEvent(eventId: string): Promise<CalendarEvent | null> {
-    return this.events.find((e) => e.id === eventId) ?? null;
+    const found = this.events.find((e) => e.id === eventId);
+    return found ? scopeEventToDeployment(found, this.deploymentId) : null;
   }
 
   async stopChannel(channelId: string, resourceId: string): Promise<void> {

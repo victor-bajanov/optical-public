@@ -2,6 +2,7 @@
 import { z } from "zod";
 import { ContextEnum, IanaZone, IsoDateTime, TimeOfDay, Uuid } from "./common";
 import { D } from "./descriptions";
+import { untrusted } from "./untrusted";
 
 const Chunk = z.object({ duration_minutes: z.number().int().positive().describe(D.task.chunks.duration_minutes) });
 const GroupPolicy = z.object({
@@ -25,7 +26,7 @@ const Dependency = z.discriminatedUnion("type", [
   z.object({ type: z.literal("before_event"), ref: z.string().describe(D.task.dependencies.ref), hard: z.boolean().describe(D.task.dependencies.hard) }),
 ]);
 const Source = z.object({
-  kind: z.enum(["mcp", "rest", "shortcut", "cron", "webhook"]).describe(D.task.source.kind),
+  kind: z.enum(["mcp", "rest", "shortcut", "cron", "webhook", "meeting"]).describe(D.task.source.kind),
   external_id: z.string().describe(D.task.source.external_id).nullable(),
 });
 
@@ -40,10 +41,10 @@ export const TaskResponse = z.object({
   status: z.enum(["pending", "scheduled", "committed", "done", "cancelled"]).describe(D.task.status),
   created_at: z.string().describe(D.response.created_at),
   updated_at: z.string().describe(D.response.updated_at),
-  title: z.string().min(1).max(500).describe(D.task.title),
+  title: untrusted(z.string().min(1).max(500).describe(D.task.title)),
   context: ContextEnum.describe(D.task.context),
   priority: z.number().int().min(0).max(100).describe(D.task.priority),
-  location: z.string().describe(D.task.location).nullable().optional(),
+  location: untrusted(z.string().describe(D.task.location).nullable().optional()),
   effort_estimate_confidence: z.enum(["low", "medium", "high"]).describe(D.task.effort_estimate_confidence).optional(),
   duration_minutes: z.number().int().positive().describe(D.task.duration_minutes).optional(),
   chunks: z.array(Chunk).describe(D.task.chunks.$).optional(),

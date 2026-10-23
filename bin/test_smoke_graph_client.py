@@ -191,6 +191,16 @@ def test_expand_filter_fetches_the_poll_id_extended_property():
     assert POLL_PROP in lib.GraphCalendarClient._EXPAND
 
 
+def test_expand_filter_pins_every_private_property_the_worker_writes():
+    # Mirrors worker expandOpticalProperties (microsoft-calendar-provider.ts):
+    # Graph returns only the named properties a read asks for.
+    want = {"scheduler_chunk_id", "optical_meeting_task_id", "optical_poll_id",
+            "optical_deployment", "optical_booking"}
+    assert set(lib._GRAPH_PRIVATE_PROPS) == want
+    for name in want:
+        assert lib.graph_prop_id(name) in lib.GraphCalendarClient._EXPAND
+
+
 # --- client verbs over a mock Graph -----------------------------------------
 
 class FakeScheduler:

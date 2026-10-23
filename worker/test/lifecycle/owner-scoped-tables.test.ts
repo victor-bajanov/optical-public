@@ -40,6 +40,25 @@ describe("owner-scoped table registry guard", () => {
     expect(missing, `owner-scoped tables missing from OWNER_SCOPED_TABLES: ${missing.join(", ")}`).toEqual([]);
   });
 
+  it("treats `owner` as an owner-scoping column, so future owner columns are caught", () => {
+    expect(OWNER_SCOPING_COLUMNS).toContain("owner");
+  });
+
+  it("registers solver_calls.owner for deletion on offboard (O3)", () => {
+    const entry = OWNER_SCOPED_TABLES.find((t) => t.table === "solver_calls");
+    expect(entry).toMatchObject({ table: "solver_calls", column: "owner", policy: "delete" });
+  });
+
+  it("keep reasons for users and audit_log state the purge window (decision F), not 'kept forever'", () => {
+    const reason = (t: string) => {
+      const e = OWNER_SCOPED_TABLES.find((x) => x.table === t);
+      return e && e.policy === "keep" ? e.reason : "";
+    };
+    expect(reason("users")).toMatch(/DELETED_ACCOUNT_RETENTION_DAYS/);
+    expect(reason("audit_log")).toMatch(/DELETED_ACCOUNT_RETENTION_DAYS/);
+    expect(reason("audit_log")).toMatch(/pseudonymis/);
+  });
+
   it("every registered table exists and carries its declared scoping column", async () => {
     for (const t of OWNER_SCOPED_TABLES) {
       const cols = await columnsOf(t.table);

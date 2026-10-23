@@ -7,3 +7,10 @@ zone_name             = "yourdomain.example"
 operator_email        = "you@yourdomain.example"
 # Second identity for the ISOLATED dev Access app only (multi-user smoke harness).
 sandbox_operator_email = "sandbox@gmail.example"
+test_operator_email    = "test@gmail.example"
+
+# Hosted trial (optional). Leave both unset to plan no trial resources; set
+# both to manage the trial zone's WAF ruleset (cloudflare_ruleset.trial_skip_bic_api).
+# Before the first apply, see the entrypoint/import note above that resource in main.tf.
+# trial_zone_id  = "REPLACE_WITH_TRIAL_ZONE_ID"
+# trial_hostname = "app.yourdomain.example"

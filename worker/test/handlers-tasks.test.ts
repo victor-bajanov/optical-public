@@ -526,3 +526,107 @@ describe("PATCH /v1/tasks/:id — scheduled_for invalidation", () => {
     expect(await stampOf(id)).toBe("2026-06-09T09:00:00Z");
   });
 });
+
+describe("/v1/tasks — source.kind 'meeting' is server-owned (O9.5)", () => {
+  // A meeting-kind row is what the resolve promotes to a MOVABLE meeting (moved
+  // with sendUpdates=all on commit). Only the meetings sync (meetings/sync.ts)
+  // may write one, and only for an event isOwnedMovableMeeting accepts. If a
+  // client could set the kind itself, it could point external_id at any event
+  // id it can read (a poll-booked event via getMeetingPoll.gcalEventId, a
+  // booking via listBookings.google_event_id) and have Optical move it.
+  beforeEach(async () => { await seed(); });
+
+  const MEETING_SOURCE = { kind: "meeting", external_id: "evt-real-meeting" };
+
+  async function seedMeetingRow(): Promise<string> {
+    const id = crypto.randomUUID();
+    const now = "2026-05-18T00:00:00.000Z";
+    const body = {
+      id, title: "1:1 with Alex", context: "meeting", priority: 100, duration_minutes: 30,
+      must_include: true, earliest_start: "2026-05-20T03:00:00.000Z",
+      source: MEETING_SOURCE, status: "pending", created_at: now, updated_at: now,
+    };
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, owner_subject, body, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+    ).bind(id, "seed@org", JSON.stringify(body), "pending", now, now).run();
+    return id;
+  }
+
+  async function sourceOf(id: string): Promise<unknown> {
+    const row = await env.DB.prepare("SELECT json_extract(body, '$.source') AS s FROM tasks WHERE id = ?")
+      .bind(id).first<{ s: string | null }>();
+    return row?.s ? JSON.parse(row.s) : null;
+  }
+
+  async function patch(id: string, body: unknown): Promise<Response> {
+    return SELF.fetch(`https://x/v1/tasks/${id}`, { method: "PATCH", headers: authedHeaders, body: JSON.stringify(body) });
+  }
+
+  it("POST rejects a client-supplied source.kind 'meeting' with 400 invalid_source and writes nothing", async () => {
+    const r = await SELF.fetch("https://x/v1/tasks", {
+      method: "POST", headers: authedHeaders,
+      body: JSON.stringify({ ...atomicTask, source: { kind: "meeting", external_id: "poll-booked-evt" } }),
+    });
+    expect(r.status).toBe(400);
+    expect(((await r.json()) as { error: string }).error).toBe("invalid_source");
+    const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM tasks").first<{ n: number }>();
+    expect(n!.n).toBe(0);
+  });
+
+  it("POST still accepts every other source kind", async () => {
+    for (const kind of ["mcp", "rest", "shortcut", "cron", "webhook"]) {
+      const r = await SELF.fetch("https://x/v1/tasks", {
+        method: "POST", headers: authedHeaders,
+        body: JSON.stringify({ ...atomicTask, source: { kind, external_id: `x-${kind}` } }),
+      });
+      expect(r.status, kind).toBe(201);
+    }
+  });
+
+  it("PATCH rejects promoting an ordinary task to source.kind 'meeting'", async () => {
+    const c = await SELF.fetch("https://x/v1/tasks", {
+      method: "POST", headers: authedHeaders,
+      body: JSON.stringify({ ...atomicTask, source: { kind: "mcp", external_id: "e1" } }),
+    });
+    const t = (await c.json()) as { id: string };
+    const r = await patch(t.id, { source: { kind: "meeting", external_id: "poll-booked-evt" } });
+    expect(r.status).toBe(400);
+    expect(((await r.json()) as { error: string }).error).toBe("invalid_source");
+    expect(await sourceOf(t.id)).toEqual({ kind: "mcp", external_id: "e1" });
+  });
+
+  it("PATCH rejects re-pointing a meeting row's external_id at another event", async () => {
+    const id = await seedMeetingRow();
+    const r = await patch(id, { source: { kind: "meeting", external_id: "poll-booked-evt" } });
+    expect(r.status).toBe(400);
+    expect(((await r.json()) as { error: string }).error).toBe("invalid_source");
+    expect(await sourceOf(id)).toEqual(MEETING_SOURCE);
+  });
+
+  it("PATCH rejects changing a meeting row's source to another kind", async () => {
+    const id = await seedMeetingRow();
+    const r = await patch(id, { source: { kind: "mcp", external_id: null } });
+    expect(r.status).toBe(400);
+    expect(((await r.json()) as { error: string }).error).toBe("invalid_source");
+    expect(await sourceOf(id)).toEqual(MEETING_SOURCE);
+  });
+
+  it("PATCH on a meeting row still changes the user-tunable fields (priority, must_include, attendee_enforcement)", async () => {
+    const id = await seedMeetingRow();
+    const r = await patch(id, { priority: 60, must_include: false, attendee_enforcement: "not_declined" });
+    expect(r.status).toBe(200);
+    const b = (await r.json()) as { priority: number; must_include: boolean; attendee_enforcement: string; source: unknown };
+    expect(b).toMatchObject({ priority: 60, must_include: false, attendee_enforcement: "not_declined" });
+    expect(b.source).toEqual(MEETING_SOURCE);
+  });
+
+  it("PATCH on a meeting row accepts the stored source echoed back unchanged (GET-modify-PATCH round trip)", async () => {
+    const id = await seedMeetingRow();
+    const got = (await (await SELF.fetch(`https://x/v1/tasks/${id}`, { headers: { Authorization: "Bearer tok" } })).json()) as {
+      source: unknown;
+    };
+    const r = await patch(id, { priority: 70, source: got.source });
+    expect(r.status).toBe(200);
+    expect(await sourceOf(id)).toEqual(MEETING_SOURCE);
+  });
+});

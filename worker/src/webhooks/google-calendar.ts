@@ -19,9 +19,11 @@ import { loadCompletionsByTask } from "../db/chunk-completions";
 import { applyManualMoveStmt, getTaskRow } from "../db/d1";
 import { debugLog } from "../log";
 import { detectBookingDeclines } from "../booking/decline-cancel";
+import { externaliseUnprovenChunks } from "../planning/scheduler-chunks";
 import { SCHEDULER_CHUNK_ID_KEY } from "../providers/types";
 import type { Change, CalendarEvent } from "../providers/types";
 import { D } from "../schema/descriptions";
+import { sendPlanAcceptEmailOnce } from "../confirm/plan-mail";
 
 type AppVars = { calendarProvider: CalendarProvider; notificationProvider: NotificationProvider };
 
@@ -54,6 +56,11 @@ export interface ReplanArgs {
   windowDays?: number;
   // Optional override for the invite title used in the email subject.
   triggerInviteTitle?: string;
+  // Decision L: replanNow only. Send each plan's accept email at most once
+  // while its link is live, counted toward the owner's decision-K live cap
+  // and system-fallback limit (confirm/plan-mail.ts). Webhook pushes and the
+  // Monday cron leave it off: they mail on every real calendar change.
+  dedupeMail?: boolean;
 }
 
 export type ReplanResult =
@@ -61,13 +68,22 @@ export type ReplanResult =
   | { kind: "no_diff" }
   | { kind: "unsat"; unsatCore: unknown }
   | { kind: "solver_error"; status: number; detail: string }
-  | { kind: "replanned"; planHash: string; sent: boolean; model: ReplanEmailModel };
+  | {
+      kind: "replanned";
+      planHash: string;
+      sent: boolean;
+      model: ReplanEmailModel;
+      /** dedupeMail only: why no email went out (absent when sent or dry run). */
+      mailSkipped?: "duplicate" | "too_many_pending_actions" | "undeliverable";
+    };
 
 /** A calendar week to re-resolve, plus a representative human invite title for
  *  the diff email subject. Keyed elsewhere by window.start. */
 interface AffectedWeek {
   window: { start: string; end: string };
   inviteTitle: string;
+  /** inviteTitle is the user's own text (O9.6 API redaction keeps it). */
+  inviteOrganizedBySelf: boolean;
   triggerEventIds: string[];
 }
 
@@ -103,6 +119,7 @@ export async function runWebhookReplan(args: ReplanArgs): Promise<ReplanResult> 
     forceResolve = false,
     windowDays = DEFAULT_DETECT_DAYS,
     triggerInviteTitle,
+    dedupeMail = false,
   } = args;
 
   const sync = await getCalendarSync(env.DB, accountEmail, PRIMARY_CALENDAR_ID);
@@ -140,6 +157,11 @@ export async function runWebhookReplan(args: ReplanArgs): Promise<ReplanResult> 
     newSyncToken = full.nextSyncToken;
     rawEvents = full.events;
   }
+  // Unproven legacy chunks (unstamped, task not a tasks row here) are ordinary
+  // busy time to resolve (runResolve applies the same externaliseUnprovenChunks
+  // to its window read), so a change to one is an ordinary external change
+  // here too: it replans its week instead of being filtered as our own echo.
+  rawEvents = await externaliseUnprovenChunks(env.DB, accountEmail, rawEvents);
   // Scheduler-owned events are normally filtered out (feedback-loop guard), BUT
   // a chunk painted the user's DONE color is a real signal — it is how the user
   // marks a task finished. Let those through so the recolour triggers its week's
@@ -345,13 +367,19 @@ export async function runWebhookReplan(args: ReplanArgs): Promise<ReplanResult> 
     if (existing) {
       existing.triggerEventIds.push(e.id);
     } else {
-      weeks.set(window.start, { window, inviteTitle: triggerInviteTitle ?? e.summary, triggerEventIds: [e.id] });
+      weeks.set(window.start, {
+        window,
+        inviteTitle: triggerInviteTitle ?? e.summary,
+        // A caller-supplied title is the caller's own text; else the event's.
+        inviteOrganizedBySelf: triggerInviteTitle !== undefined || e.organizer?.self === true,
+        triggerEventIds: [e.id],
+      });
     }
   }
   if (weeks.size === 0) {
     // forceResolve with no detected human change → resolve the current week.
     const window = localWeekWindow(detectStart, tz);
-    weeks.set(window.start, { window, inviteTitle: triggerInviteTitle ?? "manual replan", triggerEventIds: [] });
+    weeks.set(window.start, { window, inviteTitle: triggerInviteTitle ?? "manual replan", inviteOrganizedBySelf: true, triggerEventIds: [] });
   }
 
   debugLog(env, "dbg_webhook_weeks", {
@@ -367,7 +395,7 @@ export async function runWebhookReplan(args: ReplanArgs): Promise<ReplanResult> 
   const results: ReplanResult[] = [];
   for (const week of weeks.values()) {
     results.push(
-      await resolveWeek({ env, calendar, notify, accountEmail, oauthIssuer, dryRun, week, tz }),
+      await resolveWeek({ env, calendar, notify, accountEmail, oauthIssuer, dryRun, week, tz, dedupeMail }),
     );
   }
 
@@ -394,8 +422,9 @@ async function resolveWeek(args: {
   week: AffectedWeek;
   /** The subject's effective tz — the tz that produced `week.window`. */
   tz: string;
+  dedupeMail: boolean;
 }): Promise<ReplanResult> {
-  const { env, calendar, notify, accountEmail, oauthIssuer, dryRun, week, tz } = args;
+  const { env, calendar, notify, accountEmail, oauthIssuer, dryRun, week, tz, dedupeMail } = args;
 
   const result = await runResolve({
     env,
@@ -455,20 +484,38 @@ async function resolveWeek(args: {
     externalEvents: result.externalEvents,
     window: result.body.window,
     tz,
-    trigger: { kind: "webhook", inviteTitle: week.inviteTitle },
+    trigger: { kind: "webhook", inviteTitle: week.inviteTitle, inviteOrganizedBySelf: week.inviteOrganizedBySelf },
     triggerEventIds: week.triggerEventIds,
     warnings: result.body.warnings ?? [],
     meetingTaskIds: result.meetingTaskIds,
   });
   await attachRenderSnapshot(env.DB, result.planHash, model);
 
-  let sent = false;
-  if (!dryRun) {
+  if (dryRun) return { kind: "replanned", planHash: result.planHash, sent: false, model };
+  if (!dedupeMail) {
     await notify.sendReplanNotification(accountEmail, model, { acceptUrl, planHash: result.planHash });
-    sent = true;
+    return { kind: "replanned", planHash: result.planHash, sent: true, model };
   }
-
-  return { kind: "replanned", planHash: result.planHash, sent, model };
+  const mailed = await sendPlanAcceptEmailOnce(env, {
+    owner: accountEmail,
+    planHash: result.planHash,
+    expiresAt: new Date(Date.now() + ACCEPT_TTL_SECONDS * 1000).toISOString(),
+    logOp: "replanNow",
+    viaProvider: () => notify.sendReplanNotification(accountEmail, model, { acceptUrl, planHash: result.planHash }),
+    // Static copy and the link only: no titles through the third-party
+    // system mailer; the page behind the link shows them.
+    viaSystem: {
+      subject: "Review a proposed plan for your calendar",
+      text:
+        "Optical has a proposed plan for your calendar.\n\n" +
+        "Nothing has changed yet. Review the plan and accept it here:\n" +
+        `${acceptUrl}\n\n` +
+        "If you don't want it, ignore this email and nothing will change.\n",
+    },
+  });
+  if (mailed.kind === "sent") return { kind: "replanned", planHash: result.planHash, sent: true, model };
+  const mailSkipped = mailed.kind === "capped" ? "too_many_pending_actions" : mailed.kind;
+  return { kind: "replanned", planHash: result.planHash, sent: false, model, mailSkipped };
 }
 
 export function mountGoogleCalendarWebhookRoute(

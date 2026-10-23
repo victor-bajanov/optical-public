@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { Hono } from "hono";
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -740,4 +740,251 @@ describe("POST /v1/plans/:hash/accept", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
   });
+  // O10a: a verified capability accept is real use, so it bumps last_seen
+  // (UPDATE-only, active-only, throttled; never fails the accept). The GET
+  // confirm page does NOT bump: mail link scanners (Safe Links, Gmail) prefetch
+  // emailed GET links, which would keep an abandoned account alive forever.
+  describe("last_seen bump on the capability path (O10a)", () => {
+    const SUBJ = "operator@example.com";
+    const OLD = "2026-01-01T00:00:00.000Z";
+    const seedUser = (isActive = 1) =>
+      env.DB.prepare("INSERT INTO users (subject, role, is_active, last_seen, created_at) VALUES (?, 'member', ?, ?, '2026-01-01T00:00:00Z')")
+        .bind(SUBJ, isActive, OLD).run();
+    const lastSeen = async () =>
+      (await env.DB.prepare("SELECT is_active, last_seen FROM users WHERE subject = ?").bind(SUBJ)
+        .first<{ is_active: number; last_seen: string | null }>()) ?? null;
+    const capToken = () =>
+      signCapability({ planHash: "h1", subject: SUBJ, purpose: "accept", ttlSeconds: 300 }, env.TOKEN_HASH_PEPPER);
+    const postCap = async (t: string, e: typeof env = env) =>
+      makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/h1/accept",
+        { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: `t=${encodeURIComponent(t)}` },
+        e,
+      );
+
+    beforeEach(async () => {
+      await env.DB.prepare("DELETE FROM users").run();
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    it("a capability accept moves a stale last_seen to now", async () => {
+      await seedUser();
+      const res = await postCap(await capToken());
+      expect(res.status).toBe(200);
+      const row = await lastSeen();
+      expect(row!.last_seen).not.toBe(OLD);
+      expect(Date.parse(row!.last_seen!)).toBeGreaterThan(Date.now() - 60_000);
+    });
+
+    it("a capability accept of a superseded hash (409) still counts as use", async () => {
+      await seedUser();
+      await env.DB.prepare("DELETE FROM proposed_plans WHERE plan_hash = 'h1'").run();
+      const res = await postCap(await capToken());
+      expect(res.status).toBe(409);
+      expect((await lastSeen())!.last_seen).not.toBe(OLD);
+    });
+
+    it("an invalid capability token does not bump", async () => {
+      await seedUser();
+      const res = await postCap("not-a-token");
+      expect(res.status).toBe(401);
+      expect((await lastSeen())!.last_seen).toBe(OLD);
+    });
+
+    it("never reactivates an offboarded subject", async () => {
+      await seedUser(0);
+      await postCap(await capToken());
+      expect(await lastSeen()).toEqual({ is_active: 0, last_seen: OLD });
+    });
+
+    it("never creates a users row for an unknown subject", async () => {
+      await postCap(await capToken());
+      expect(await lastSeen()).toBeNull();
+    });
+
+    it("a bump failure still commits and logs last_seen_bump_failed", async () => {
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
+      await seedUser();
+      const db = new Proxy(env.DB, {
+        get(target, prop) {
+          if (prop === "prepare") {
+            return (q: string) => {
+              if (/UPDATE\s+users\s+SET\s+last_seen/i.test(q)) throw new Error("D1_ERROR: simulated");
+              return target.prepare(q);
+            };
+          }
+          const v = Reflect.get(target, prop);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+      const res = await postCap(await capToken(), { ...env, DB: db });
+      expect(res.status).toBe(200);
+      expect(await committedAtOf("h1")).not.toBeNull();
+      expect(err).toHaveBeenCalledWith("last_seen_bump_failed", expect.objectContaining({ subject: SUBJ }));
+    });
+
+    it("the GET confirm page (prefetchable by mail scanners) does not bump", async () => {
+      await seedUser();
+      const res = await makeApp(new MockCalendarProvider()).request(
+        `/v1/plans/h1/accept?t=${encodeURIComponent(await capToken())}`, { method: "GET" }, env,
+      );
+      expect(res.status).toBe(200);
+      expect((await lastSeen())!.last_seen).toBe(OLD);
+    });
+  });
+
+  // O9.1 self-confirm guard: the capability (email-link) branch is the human
+  // confirmation channel, and a browser form POST never carries Authorization.
+  // The codemode proxy always attaches one, so a capability POST that also
+  // carries Authorization is an agent trying to click the human's link: 403,
+  // nothing committed, whichever of form field or query string carries `t`.
+  describe("capability branch refuses requests carrying Authorization (O9.1)", () => {
+    const capToken = () =>
+      signCapability({ planHash: "h1", subject: "operator@example.com", purpose: "accept", ttlSeconds: 300 }, env.TOKEN_HASH_PEPPER);
+
+    it("form-field token + Authorization: 403 authorization_not_allowed, nothing committed", async () => {
+      await seedBearer("guard-bearer", "operator@example.com");
+      const cal = new MockCalendarProvider();
+      const res = await makeApp(cal).request(
+        "/v1/plans/h1/accept",
+        {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded", Authorization: "Bearer guard-bearer" },
+          body: `t=${encodeURIComponent(await capToken())}`,
+        },
+        env,
+      );
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: "authorization_not_allowed" });
+      expect(cal.getCreated()).toHaveLength(0);
+      expect(await committedAtOf("h1")).toBeNull();
+    });
+
+    it("query-string token + Authorization: 403, nothing committed", async () => {
+      const cal = new MockCalendarProvider();
+      const res = await makeApp(cal).request(
+        `/v1/plans/h1/accept?t=${encodeURIComponent(await capToken())}`,
+        { method: "POST", headers: { Authorization: "Bearer anything" } },
+        env,
+      );
+      expect(res.status).toBe(403);
+      expect(await committedAtOf("h1")).toBeNull();
+    });
+
+    it("an invalid token + Authorization is still 403 (the guard runs before verification)", async () => {
+      const res = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/h1/accept",
+        { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", Authorization: "Bearer x" }, body: "t=garbage" },
+        env,
+      );
+      expect(res.status).toBe(403);
+    });
+
+    for (const site of ["cross-site", "same-site", "none"]) {
+      it(`capability POST with Sec-Fetch-Site: ${site} is refused 403 cross_site_not_allowed, nothing committed`, async () => {
+        const cal = new MockCalendarProvider();
+        const res = await makeApp(cal).request(
+          "/v1/plans/h1/accept",
+          {
+            method: "POST",
+            headers: { "content-type": "application/x-www-form-urlencoded", "Sec-Fetch-Site": site },
+            body: `t=${encodeURIComponent(await capToken())}`,
+          },
+          env,
+        );
+        expect(res.status).toBe(403);
+        expect(await res.json()).toEqual({ error: "cross_site_not_allowed" });
+        expect(cal.getCreated()).toHaveLength(0);
+        expect(await committedAtOf("h1")).toBeNull();
+      });
+    }
+
+    it("capability POST with Sec-Fetch-Site: same-origin (the accept page's own form) commits", async () => {
+      const res = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/h1/accept",
+        {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded", "Sec-Fetch-Site": "same-origin", accept: "application/json" },
+          body: `t=${encodeURIComponent(await capToken())}`,
+        },
+        env,
+      );
+      expect(res.status).toBe(200);
+      expect(await committedAtOf("h1")).not.toBeNull();
+    });
+
+    it("a confirm-action token is not an accept token: 401, nothing committed", async () => {
+      const t = await signCapability({ purpose: "confirm-action", actionId: "h1", subject: "operator@example.com", ttlSeconds: 300 }, env.TOKEN_HASH_PEPPER);
+      const post = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/h1/accept",
+        { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: `t=${encodeURIComponent(t)}` },
+        env,
+      );
+      expect(post.status).toBe(401);
+      const get = await makeApp(new MockCalendarProvider()).request(`/v1/plans/h1/accept?t=${encodeURIComponent(t)}`, { method: "GET" }, env);
+      expect(get.status).toBe(400);
+      expect(await committedAtOf("h1")).toBeNull();
+    });
+
+    // Decision C: a delisted user's emailed link commits nothing on their
+    // grant. With an allow-list set and the subject off it, the capability
+    // branch answers like an invalid token, before the commit and the
+    // last_seen bump.
+    describe("delisted subject (MEMBERSHIP_ALLOWLIST set, subject not on it)", () => {
+      const DELISTED = { MEMBERSHIP_ALLOWLIST: "someone-else@example.com", OPERATOR_EMAIL: "" };
+      const OLD = "2026-01-01T00:00:00.000Z";
+      beforeEach(async () => {
+        await env.DB.prepare("DELETE FROM users").run();
+        await env.DB.prepare("INSERT INTO users (subject, role, is_active, last_seen, created_at) VALUES ('operator@example.com', 'member', 1, ?, '2026-01-01T00:00:00Z')")
+          .bind(OLD).run();
+      });
+
+      it("capability POST: 401 invalid_token, nothing committed, last_seen untouched", async () => {
+        const cal = new MockCalendarProvider();
+        const res = await makeApp(cal).request(
+          "/v1/plans/h1/accept",
+          { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: `t=${encodeURIComponent(await capToken())}` },
+          { ...env, ...DELISTED },
+        );
+        expect(res.status).toBe(401);
+        expect(await res.json()).toEqual({ error: "invalid_token" });
+        expect(cal.getCreated()).toHaveLength(0);
+        expect(await committedAtOf("h1")).toBeNull();
+        const u = await env.DB.prepare("SELECT last_seen FROM users WHERE subject = 'operator@example.com'").first<{ last_seen: string }>();
+        expect(u?.last_seen).toBe(OLD);
+      });
+
+      it("GET confirm page: the invalid-link page, no plan shown", async () => {
+        const res = await makeApp(new MockCalendarProvider()).request(
+          `/v1/plans/h1/accept?t=${encodeURIComponent(await capToken())}`, { method: "GET" }, { ...env, ...DELISTED },
+        );
+        expect(res.status).toBe(400);
+        expect(await res.text()).not.toContain("<form");
+      });
+
+      it("a listed subject is unaffected", async () => {
+        const res = await makeApp(new MockCalendarProvider()).request(
+          "/v1/plans/h1/accept",
+          { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: `t=${encodeURIComponent(await capToken())}` },
+          { ...env, MEMBERSHIP_ALLOWLIST: "operator@example.com", OPERATOR_EMAIL: "" },
+        );
+        expect(res.status).toBe(200);
+      });
+    });
+
+    it("the bearer branch (no token) is unaffected", async () => {
+      await seedBearer("guard-bearer-2", "operator@example.com");
+      const res = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/h1/accept",
+        { method: "POST", headers: { Authorization: "Bearer guard-bearer-2" } },
+        env,
+      );
+      expect(res.status).toBe(200);
+    });
+  });
 });
+
+async function committedAtOf(hash: string): Promise<string | null> {
+  const r = await env.DB.prepare("SELECT committed_at FROM proposed_plans WHERE plan_hash = ?").bind(hash).first<{ committed_at: string | null }>();
+  return r?.committed_at ?? null;
+}

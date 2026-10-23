@@ -483,3 +483,63 @@ describe("fixtures sanity", () => {
     expect(rows.map((r) => r.google_event_id)).toContain("gcal-sanity");
   });
 });
+
+// Card C (decision C, O14b #3): a delisted-but-not-offboarded owner's due
+// rows are left exactly as found (still stamped, still confirmed) while an
+// allow-list is configured — no calendar read, no event delete, no mail from
+// their mailbox. They count as skipped (not attempted), like an owner whose
+// provider could not be built; re-listing processes them on the next tick.
+describe("runBookingDeclineSweep — delisted owner (card C)", () => {
+  async function seedBothOwners() {
+    const delistedId = await seedDueBooking("gcal-delisted", "2026-08-19T00:00:00Z");
+    const listedId = await seedDueBooking("gcal-listed", "2026-08-19T00:00:00Z", {
+      ownerSubject: OWNER2,
+      startUtc: "2026-08-19T05:00:00Z", endUtc: "2026-08-19T05:30:00Z",
+      guardStartUtc: "2026-08-19T05:00:00Z", guardEndUtc: "2026-08-19T05:40:00Z",
+    });
+    const cal = new MockCalendarProvider({
+      events: [
+        declinedEvent("gcal-delisted", delistedId),
+        declinedEvent("gcal-listed", listedId, { start: "2026-08-19T05:00:00Z", end: "2026-08-19T05:30:00Z" }),
+      ],
+    });
+    return { delistedId, listedId, cal };
+  }
+
+  it("leaves a delisted owner's rows untouched and builds no provider for them; a listed owner is processed", async () => {
+    const { delistedId, listedId, cal } = await seedBothOwners();
+    const notify = new MockNotificationProvider();
+    const makeCalendar = vi.fn(() => cal);
+    const makeNotification = vi.fn(() => notify);
+    const info = vi.spyOn(console, "info");
+
+    const result = await runBookingDeclineSweep(
+      { ...TEST_ENV, MEMBERSHIP_ALLOWLIST: OWNER2, OPERATOR_EMAIL: "" },
+      new Date("2026-08-19T00:11:00Z"),
+      { makeCalendar, makeNotification },
+    );
+
+    expect(makeCalendar).not.toHaveBeenCalledWith(OWNER);
+    expect(makeNotification).not.toHaveBeenCalledWith(OWNER);
+    expect(cal.getDeleted()).toEqual(["gcal-listed"]);
+    expect(notify.sentPollEmails.map((e) => e.to)).not.toContain(OWNER);
+    expect(await statusOf(delistedId)).toBe("confirmed");
+    expect(await stampOf(delistedId)).not.toBeNull();
+    expect(await statusOf(listedId)).toBe("cancelled");
+    expect(result).toMatchObject({ checked: 1, cancelled: 1, skippedOwners: 1, skippedRows: 1, failed: 0 });
+    expect(info).toHaveBeenCalledWith("delisted_skip", { path: "booking_decline_sweep" });
+    info.mockRestore();
+  });
+
+  it("processes every owner when no allow-list is set (prod parity)", async () => {
+    const { delistedId, listedId, cal } = await seedBothOwners();
+    const notify = new MockNotificationProvider();
+    await runBookingDeclineSweep(
+      { ...TEST_ENV, MEMBERSHIP_ALLOWLIST: undefined, OPERATOR_EMAIL: "" },
+      new Date("2026-08-19T00:11:00Z"),
+      deps(cal, notify),
+    );
+    expect(await statusOf(delistedId)).toBe("cancelled");
+    expect(await statusOf(listedId)).toBe("cancelled");
+  });
+});

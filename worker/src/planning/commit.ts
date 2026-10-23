@@ -2,14 +2,17 @@ import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
 import type { Env } from "../env";
 import type { CalendarProvider } from "../providers/calendar-provider";
 import type { AppVariables } from "../index-providers";
-import { SCHEDULER_CHUNK_ID_KEY } from "../providers/types";
-import { SCHEDULER_HORIZON_MS } from "./scheduler-chunks";
+import { SCHEDULER_CHUNK_ID_KEY, type CalendarEvent } from "../providers/types";
+import { legacyStampPatch } from "../providers/deployment-scope";
+import { SCHEDULER_HORIZON_MS, deletableChunks } from "./scheduler-chunks";
 import { requireOwner } from "../middleware/owner-gate";
 import { defaultCalendarProvider } from "../index-providers";
-import { getProposedPlan, markProposedPlanCommittedStmt, planProducedInTz } from "./proposed-plans";
+import { getProposedPlan, markProposedPlanCommittedStmt, planProducedInTz, type ProposedPlanRow } from "./proposed-plans";
 import { syncBookingTime } from "../db/bookings";
 import { D } from "../schema/descriptions";
 import { getHomeTz } from "../db/users";
+import { confirmationRequired } from "../confirm/gate";
+import { deferPlanCommit, planConfirmResponses, planNotReviewableResponse } from "./commit-confirm";
 
 const CommitBodySchema = z.object({ plan_hash: z.string().describe(D.response.plan_hash) });
 
@@ -77,38 +80,61 @@ export interface CommitOptions {
   currentTz?: { tz: string; schedulerTz: string };
 }
 
+export type CommitResult = { status: number; body: unknown };
+
+/** Every refusal commitPlan makes BEFORE touching the calendar or D1, in the
+ *  same order and with the same answers: unknown or foreign hash 404, already
+ *  committed 200 (idempotent), stale-tz 404, expired 410. `ok` hands back the
+ *  committable (owned, pending, current-tz, unexpired) plan. Shared with the
+ *  agent-confirm deferral (O9.2), which must refuse exactly what a direct
+ *  commit would and mail only for a plan that could be committed now. */
+export async function checkPlanCommittable(
+  db: D1Database,
+  planHash: string,
+  ownerSubject: string,
+  opts: Pick<CommitOptions, "currentTz"> = {},
+): Promise<{ ok: true; plan: ProposedPlanRow } | { ok: false; result: CommitResult }> {
+  const plan = await getProposedPlan(db, planHash);
+  if (!plan) return { ok: false, result: { status: 404, body: { error: "not_found" } } };
+  // OS1: owner-scope BEFORE any calendar/DB side effect. A foreign or legacy
+  // NULL-subject plan_hash must mutate nothing and is indistinguishable from
+  // "not found" (no existence leak). markProposedPlanCommitted's owner predicate
+  // in commitPlan stays as defense-in-depth.
+  if (plan.subject !== ownerSubject) return { ok: false, result: { status: 404, body: { error: "not_found" } } };
+  if (plan.committed_at) {
+    return { ok: false, result: { status: 200, body: { plan_hash: planHash, already_committed: true } } };
+  }
+  if (opts.currentTz && !planProducedInTz(plan, opts.currentTz.tz, opts.currentTz.schedulerTz)) {
+    return { ok: false, result: { status: 404, body: { error: "not_found" } } };
+  }
+  if (Date.parse(plan.expires_at) < Date.now()) {
+    return { ok: false, result: { status: 410, body: { error: "plan_expired" } } };
+  }
+  return { ok: true, plan };
+}
+
 export async function commitPlan(
   db: D1Database,
   cal: CalendarProvider,
   planHash: string,
   ownerSubject: string,
   opts: CommitOptions = {},
-): Promise<{ status: number; body: unknown }> {
-  const plan = await getProposedPlan(db, planHash);
-  if (!plan) return { status: 404, body: { error: "not_found" } };
-  // OS1: owner-scope BEFORE any calendar/DB side effect. A foreign or legacy
-  // NULL-subject plan_hash must mutate nothing and is indistinguishable from
-  // "not found" (no existence leak). markProposedPlanCommitted's owner predicate
-  // below stays as defense-in-depth.
-  if (plan.subject !== ownerSubject) return { status: 404, body: { error: "not_found" } };
-  if (plan.committed_at) {
-    return { status: 200, body: { plan_hash: planHash, already_committed: true } };
-  }
-  if (opts.currentTz && !planProducedInTz(plan, opts.currentTz.tz, opts.currentTz.schedulerTz)) {
-    return { status: 404, body: { error: "not_found" } };
-  }
-  if (Date.parse(plan.expires_at) < Date.now()) {
-    return { status: 410, body: { error: "plan_expired" } };
-  }
+): Promise<CommitResult> {
+  const check = await checkPlanCommittable(db, planHash, ownerSubject, opts);
+  if (!check.ok) return check.result;
+  const plan = check.plan;
 
   const schedule = plan.body.schedule as ScheduleEntry[];
 
   const windowStart = (plan.body.window as { start: string; end: string }).start;
   const windowEnd = (plan.body.window as { start: string; end: string }).end;
   const existing = await cal.fetchEventsInWindow(windowStart, windowEnd, { syncToken: false });
+  // Another deployment's chunks never get here: the provider strips their
+  // chunk tag on read (providers/deployment-scope.ts), so they are ordinary
+  // external events — never moved, deleted or counted as strays below.
   const existingByChunk = new Map<
     string,
-    { eventId: string; start: string; end: string; summary: string }
+    { eventId: string; start: string; end: string; summary: string; event: CalendarEvent }
   >();
   for (const e of existing.events) {
     const chunkId = e.extendedProperties?.private?.[SCHEDULER_CHUNK_ID_KEY];
@@ -118,6 +144,7 @@ export async function commitPlan(
         start: e.start,
         end: e.end,
         summary: e.summary,
+        event: e,
       });
     }
   }
@@ -160,7 +187,7 @@ export async function commitPlan(
   // done/revive scans. Sweep a wide window around the plan and index any such
   // strays so the reconcile below MOVES them instead of minting duplicates.
   // One extra fetch, and only when at least one chunk would otherwise be created.
-  const strayByChunk = new Map<string, { eventId: string }[]>();
+  const strayByChunk = new Map<string, { eventId: string; event: CalendarEvent }[]>();
   const missingChunkIds = [...proposedByChunk.keys()].filter((id) => !existingByChunk.has(id));
   if (missingChunkIds.length > 0) {
     const missing = new Set(missingChunkIds);
@@ -172,7 +199,7 @@ export async function commitPlan(
       if (!chunkId || !missing.has(chunkId)) continue;
       if (existingByChunk.get(chunkId)?.eventId === e.id) continue; // in-window copy, already indexed
       const list = strayByChunk.get(chunkId) ?? [];
-      list.push({ eventId: e.id });
+      list.push({ eventId: e.id, event: e });
       strayByChunk.set(chunkId, list);
     }
   }
@@ -187,13 +214,20 @@ export async function commitPlan(
         Date.parse(current.start) !== Date.parse(proposed.start) ||
         Date.parse(current.end) !== Date.parse(proposed.end) ||
         current.summary !== proposed.title;
+      // A legacy (pre-stamp) chunk of a task in OUR plan is provably ours:
+      // stamp it, once, so another deployment on the same calendar stops
+      // treating it as its own. Otherwise extendedProperties is omitted so the
+      // stored chunk_id and per-event state survive.
+      const stamp = legacyStampPatch(current.event, cal.deploymentId);
       if (differs) {
-        // Omit extendedProperties so the stored chunk_id and per-event state survive.
         await cal.updateEvent(current.eventId, {
           start: proposed.start,
           end: proposed.end,
           summary: proposed.title,
+          ...stamp,
         });
+      } else if (stamp) {
+        await cal.updateEvent(current.eventId, stamp);
       }
       continue;
     }
@@ -215,6 +249,7 @@ export async function commitPlan(
         // Microsoft, so the next scan would immediately flip the relocated
         // (open) task back to done.
         colorId: cal.undoneColorId ?? opts.createColorId ?? "5",
+        ...legacyStampPatch(keep!.event, cal.deploymentId),
       });
       for (const extra of extras) await cal.deleteEvent(extra.eventId);
       console.info("commit_stray_chunk_relocated", { chunk: chunkId, kept: keep!.eventId, deleted: extras.length });
@@ -234,10 +269,11 @@ export async function commitPlan(
       { [SCHEDULER_CHUNK_ID_KEY]: chunkId },
     );
   }
-  for (const [chunkId, current] of existingByChunk) {
-    if (!proposedByChunk.has(chunkId)) {
-      await cal.deleteEvent(current.eventId);
-    }
+  // An unstamped (legacy) chunk is deleted only when its task is ours in D1:
+  // it may be another deployment's pre-stamp block (deletableChunks).
+  const unplanned = [...existingByChunk].filter(([chunkId]) => !proposedByChunk.has(chunkId)).map(([, c]) => c.event);
+  for (const e of await deletableChunks(db, ownerSubject, unplanned)) {
+    await cal.deleteEvent(e.id);
   }
 
   // Meeting moves: patch the REAL event time and notify attendees. Only when the
@@ -336,8 +372,8 @@ export function mountCommitRoute(
     method: "post",
     path: "/commit",
     operationId: "commit",
-    summary: "Commit a proposed plan to Google Calendar.",
-    description: "Commit a proposed plan (by plan_hash) to Google Calendar, creating/updating the corresponding events. Irreversible from the API's perspective. Tasks listed as dropped in the plan are reset to status 'pending' with their placement stamp cleared, so they re-enter the backlog for future resolves. Schedule entries whose task is no longer live at commit time (deleted, done, or cancelled between resolve and commit) are skipped: no event is created and any existing event for that chunk is removed, releasing its slot. The 'committed' count reflects only the live tasks committed. A pending plan produced under a timezone other than the caller's current effective timezone (a resolve that raced a timezone change) is answered 404 not_found, exactly as if it had vanished; re-resolve to get a plan for the new timezone.",
+    summary: "Apply a proposed plan to the user's calendar, notifying attendees of any moved meeting.",
+    description: "Apply a proposed plan (by plan_hash) to the user's calendar (Google or Outlook). For an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) nothing is applied: after the same 404/410/already-committed checks below, the user is emailed the plan's accept email (the diff with an Accept button) and the call answers 202 awaiting_confirmation (action_id = plan_hash); the plan is committed only if the user accepts it on that email's page, which re-checks it then (a plan superseded or produced under an older timezone by then commits nothing). A gated commit of a plan with no reviewable changes (an empty diff, or resolved by a non-gated client) is 409 plan_not_reviewable; if the email can't be sent it is 503 confirmation_unavailable. Every other client's commit is applied at once, with no confirmation step: any pending plan_hash the caller owns is applied, including one emailed to the user for review that they have not clicked. It creates, moves and deletes the user's own task-chunk events (no attendees). When owned movable meetings are enabled, it also moves each owned meeting the plan relocates to its new time and NOTIFIES THAT MEETING'S ATTENDEES (Google sendUpdates=all; Microsoft Graph always notifies), and the move typically resets their RSVPs; a moved meeting that is a booking-page booking also has its booking time updated. Irreversible from the API's perspective: attendee notifications cannot be recalled. Tasks listed as dropped in the plan are reset to status 'pending' with their placement stamp cleared, so they re-enter the backlog for future resolves. Schedule entries whose task is no longer live at commit time (deleted, done, or cancelled between resolve and commit) are skipped: no event is created and any existing event for that chunk is removed, releasing its slot. The 'committed' count reflects only the live tasks committed. A pending plan produced under a timezone other than the caller's current effective timezone (a resolve that raced a timezone change) is answered 404 not_found, exactly as if it had vanished; re-resolve to get a plan for the new timezone.",
     security: [{ BearerAuth: [] }],
     request: {
       body: { content: { "application/json": { schema: CommitBodySchema } }, required: true },
@@ -363,6 +399,8 @@ export function mountCommitRoute(
         content: { "application/json": { schema: z.object({ error: z.string() }) } },
         description: "Token carries no subject (no_subject)",
       },
+      409: planNotReviewableResponse,
+      ...planConfirmResponses,
     },
   });
 
@@ -370,11 +408,20 @@ export function mountCommitRoute(
     const owner = await requireOwner(c);
     if (owner instanceof Response) return owner as any;
     const parsed = c.req.valid("json");
+    // Same stale-tz refusal as the accept path (planning/accept.ts).
+    const currentTz = { tz: await getHomeTz(c.env.DB, owner, c.env.SCHEDULER_TZ), schedulerTz: c.env.SCHEDULER_TZ };
+    if (confirmationRequired(c)) {
+      // O9.2: an agent-confirm client commits nothing. The same refusals a
+      // direct commit would make come first (no mail for them); a committable
+      // plan is emailed to the user to accept (planning/commit-confirm.ts).
+      const check = await checkPlanCommittable(c.env.DB, parsed.plan_hash, owner, { currentTz });
+      if (!check.ok) return c.json(check.result.body as Record<string, unknown>, check.result.status as 200 | 404 | 410);
+      return deferPlanCommit(c, check.plan, owner, "commit") as any;
+    }
     const cal = c.var.calendarProvider ?? await defaultCalendarProvider(c.env, owner);
     const result = await commitPlan(c.env.DB, cal, parsed.plan_hash, owner, {
       createColorId: c.env.CREATE_COLOR_ID,
-      // Same stale-tz refusal as the accept path (planning/accept.ts).
-      currentTz: { tz: await getHomeTz(c.env.DB, owner, c.env.SCHEDULER_TZ), schedulerTz: c.env.SCHEDULER_TZ },
+      currentTz,
     });
     return c.json(result.body as Record<string, unknown>, result.status as 200 | 400 | 404 | 410);
   });

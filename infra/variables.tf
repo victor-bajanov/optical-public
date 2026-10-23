@@ -33,3 +33,17 @@ variable "test_operator_email" {
   description = "Third identity allowed on the ISOLATED dev Access app only (multi-user smoke harness). Never added to the prod operator policy."
   type        = string
 }
+
+# Hosted trial (internal design notes). Both default to null, which
+# plans no trial resources; set both to manage the trial zone's WAF ruleset.
+variable "trial_zone_id" {
+  description = "Cloudflare zone ID of the hosted-trial deployment's zone. null (default) plans no trial resources."
+  type        = string
+  default     = null
+}
+
+variable "trial_hostname" {
+  description = "Hostname of the hosted-trial worker on trial_zone_id (e.g. \"app.yourdomain.example\"). Required when trial_zone_id is set."
+  type        = string
+  default     = null
+}

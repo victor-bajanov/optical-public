@@ -8,6 +8,7 @@ import { sweepInactiveUsers } from "../lifecycle/sweep-inactive";
 import { defaultProviders } from "../index-providers";
 import { listSubjects } from "../auth/identity-store";
 import { writeAudit } from "../db/audit";
+import { isActiveMember } from "../auth/membership";
 
 interface Handlers {
   monday: (...args: unknown[]) => Promise<unknown>;
@@ -47,6 +48,9 @@ export async function dispatchScheduled(
         // the others, so each resolve is independently try/caught.
         for (const subject of subjects) {
           try {
+            // Card C: a delisted-but-not-offboarded subject gets no resolve,
+            // no calendar read and no replan email while an allow-list is set.
+            if (!(await isActiveMember(env, subject, "monday_resolve"))) continue;
             if (injected) {
               await injected.monday(subject);
               await writeAudit(env.DB, { subject, action: "monday_resolve", source: "cron" });
@@ -80,8 +84,11 @@ export async function dispatchScheduled(
         console.error("subscription-renewal sweep failed", e),
       ),
     );
-    // Inactive-user retention sweep (Plan 6 brief C). Strictly gated inside
-    // sweepInactiveUsers: a no-op unless RETENTION_DAYS is a positive integer.
+    // Inactive-user retention sweep (Plan 6 brief C). Its own gates live inside
+    // sweepInactiveUsers: idle-user warning/offboard runs only when
+    // RETENTION_DAYS is a positive integer, and the deactivated-row purge only
+    // when DELETED_ACCOUNT_RETENTION_DAYS > 0. Deliberately NOT gated on
+    // membership (card C): it must still reach delisted users.
     ctx.waitUntil(
       sweepInactiveUsers(env, new Date()).catch((e: unknown) =>
         console.error("inactive-user sweep failed", e),

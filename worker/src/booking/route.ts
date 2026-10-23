@@ -1,11 +1,14 @@
 import type { Hono } from "hono";
 import type { Env } from "../env";
 import type { AppVariables } from "../index-providers";
-import { defaultCalendarProvider } from "../index-providers";
+import { defaultCalendarProvider, defaultNotificationProvider } from "../index-providers";
+import { getHomeTz } from "../db/users";
+import { renderBookingOwnerNotifiedEmail } from "./emails";
 import type { CalendarEvent } from "../providers/types";
 import { hashToken } from "../auth/tokens";
 import { hashingKey } from "../auth/crypto-keys";
 import { findOwnerBySlug, loadBookingPage } from "../db/booking-page";
+import { isActiveMember } from "../auth/membership";
 import {
   claimSlot,
   confirmBooking,
@@ -143,6 +146,9 @@ export function mountBookingRoutes(app: Hono<{ Bindings: Env; Variables: AppVari
     if (!owner) return null;
     const config = await loadBookingPage(c.env.DB, owner);
     if (!config.enabled) return null;
+    // Card C: a delisted owner's page is the same opaque 404 (no calendar
+    // read, no invitation from their account) while an allow-list is set.
+    if (!(await isActiveMember(c.env, owner, "booking_page"))) return null;
     return { owner, config, slug };
   }
 
@@ -508,6 +514,46 @@ export function mountBookingRoutes(app: Hono<{ Bindings: Env; Variables: AppVari
       console.error("booking calendar write failed:", String(err));
       await failBooking(c.env.DB, claim.id, new Date());
       return json({ error: "calendar_write_failed" }, 502);
+    }
+
+    // The invitation above goes to the booker only: Google doesn't email you
+    // about an event created on your own calendar, so the owner hears from
+    // Optical instead — from and to their own mailbox, which the outbound cap
+    // never counts (to === subject). Fired as soon as the event exists, so a
+    // failed confirm below still tells them, and best-effort: everything,
+    // provider construction included, is inside one self-swallowing promise,
+    // so a mail failure can never fail the booking or change the 201.
+    const ownerNotice = (async () => {
+      try {
+        const notify = c.get("notificationProvider") ?? await defaultNotificationProvider(c.env, page.owner);
+        const ownerTz = await getHomeTz(c.env.DB, page.owner, c.env.SCHEDULER_TZ);
+        await notify.sendPollEmail({
+          to: page.owner,
+          ...renderBookingOwnerNotifiedEmail({
+            bookerName: safeName,
+            bookerEmail: email,
+            startUtc: requested,
+            durationMinutes: duration,
+            ownerTz,
+            locationKind,
+            // The owner's own fixed text for custom; otherwise what the booker gave.
+            locationDetail: locationKind === "custom" ? placement.location ?? null : safeDetail,
+            note: safeNote || null,
+          }),
+        });
+        console.info("booking_owner_notified", { ok: true, bookingId: claim.id });
+      } catch (err) {
+        // Booking id only — never an address (repo logging rule R1-F6).
+        console.error("booking_owner_notified", { ok: false, bookingId: claim.id, error: String(err) });
+      }
+    })();
+    try {
+      c.executionCtx.waitUntil(ownerNotice);
+    } catch {
+      // No real ExecutionContext (`app.request()` in tests): the promise
+      // swallows its own errors, so awaiting it inline is safe. Same fallback
+      // idiom as polls/route.ts.
+      await ownerNotice;
     }
 
     try {

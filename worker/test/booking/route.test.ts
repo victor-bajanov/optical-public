@@ -3,6 +3,8 @@ import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 import { Hono } from "hono";
 import { mountBookingRoutes, MAX_CLAIM_BODY_BYTES } from "../../src/booking/route";
 import { MockCalendarProvider } from "../../src/providers/mock-calendar-provider";
+import { MockNotificationProvider } from "../../src/providers/mock-notification-provider";
+import { withOutboundMailCap } from "../../src/mail/outbound-cap";
 import { saveBookingPage } from "../../src/db/booking-page";
 import { hashToken } from "../../src/auth/tokens";
 import { hashingKey } from "../../src/auth/crypto-keys";
@@ -22,10 +24,16 @@ const HOURS = {
   end: "16:00",
 } as BusinessHours;
 
-function appWith(provider: MockCalendarProvider): App {
+/** `notifier` null leaves the notification provider unset, so the route
+ *  builds the real one for the owner (which has no stored grant here). */
+function appWith(
+  provider: MockCalendarProvider,
+  notifier: MockNotificationProvider | null = new MockNotificationProvider(),
+): App {
   const app: App = new Hono<{ Bindings: Env; Variables: AppVariables }>();
   app.use("*", async (c, next) => {
     c.set("calendarProvider", provider);
+    if (notifier) c.set("notificationProvider", notifier);
     await next();
   });
   mountBookingRoutes(app);
@@ -415,6 +423,113 @@ describe("POST /book/:slug", () => {
       .first<{ status: string; google_event_id: string }>();
     expect(row!.status).toBe("confirmed");
     expect(row!.google_event_id).toBe(created.id);
+  });
+
+  it("emails the owner, from and to their own mailbox, once the event is created", async () => {
+    // Google sends the invitation to the booker only; the owner hears nothing
+    // about an event created on their own calendar unless Optical tells them.
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO users (subject, home_tz, created_at) VALUES (?, 'America/New_York', '2026-05-01T00:00:00Z')",
+    ).bind(OWNER).run();
+    try {
+      const notifier = new MockNotificationProvider();
+      const app = appWith(new MockCalendarProvider({ events: [] }), notifier);
+      const start = await firstSlot(app);
+      const info = vi.spyOn(console, "info");
+
+      const res = await app.request("/book/routes", claimBody(start, { note: "<b>see you</b>" }), ON);
+      expect(res.status).toBe(201);
+      const { booking_id } = (await res.json()) as { booking_id: string };
+
+      expect(notifier.sentPollEmails).toHaveLength(1);
+      const mail = notifier.sentPollEmails[0]!;
+      expect(mail.to).toBe(OWNER);
+      expect(mail.subject).toContain("Sam");
+      expect(mail.text).toContain("sam@x.com");
+      expect(mail.text).toContain("(America/New_York)");
+      expect(mail.text).toContain("30 minutes");
+      expect(mail.text).toContain("Video call");
+      expect(mail.text).toContain("their own words");
+      expect(mail.html).not.toContain("<b>see you");
+      // Booking id only — no address or name on the log line.
+      expect(info).toHaveBeenCalledWith("booking_owner_notified", { ok: true, bookingId: booking_id });
+    } finally {
+      await env.DB.prepare("DELETE FROM users WHERE subject = ?").bind(OWNER).run();
+    }
+  });
+
+  it("still books, and logs the failure, when the owner's email cannot be sent", async () => {
+    const notifier = new MockNotificationProvider();
+    notifier.sendPollEmail = async () => {
+      throw new Error("gmail down");
+    };
+    const provider = new MockCalendarProvider({ events: [] });
+    const app = appWith(provider, notifier);
+    const start = await firstSlot(app);
+    const err = vi.spyOn(console, "error");
+
+    const res = await app.request("/book/routes", claimBody(start), ON);
+    expect(res.status).toBe(201);
+    expect(provider.getCreated()).toHaveLength(1);
+    expect((await bookingRows()).map((r) => r.status)).toEqual(["confirmed"]);
+    const { booking_id } = (await res.json()) as { booking_id: string };
+    expect(err).toHaveBeenCalledWith("booking_owner_notified", {
+      ok: false,
+      bookingId: booking_id,
+      error: "Error: gmail down",
+    });
+  });
+
+  it("still books when the owner's notification provider cannot even be built", async () => {
+    // No notifier injected: the route builds the owner's real provider, and
+    // this owner has no stored grant to build it from.
+    const app = appWith(new MockCalendarProvider({ events: [] }), null);
+    const start = await firstSlot(app);
+    const err = vi.spyOn(console, "error");
+
+    const res = await app.request("/book/routes", claimBody(start), ON);
+    expect(res.status).toBe(201);
+    expect(err).toHaveBeenCalledWith(
+      "booking_owner_notified",
+      expect.objectContaining({ ok: false }),
+    );
+  });
+
+  it("does not count the owner's notice against the outbound mail cap", async () => {
+    // Self-addressed (to === the owner's subject), so even the "0" kill switch,
+    // which refuses all third-party mail, lets it through.
+    const capped: Env = { ...ON, OUTBOUND_MAIL_DAILY_CAP: "0" };
+    const notifier = withOutboundMailCap(capped, OWNER, new MockNotificationProvider());
+    const app = appWith(new MockCalendarProvider({ events: [] }), notifier);
+    const start = await firstSlot(app);
+
+    expect((await app.request("/book/routes", claimBody(start), capped)).status).toBe(201);
+    expect(notifier.sentPollEmails.map((m) => m.to)).toEqual([OWNER]);
+  });
+
+  it("sends the owner nothing when the calendar write fails", async () => {
+    const notifier = new MockNotificationProvider();
+    const provider = new MockCalendarProvider({ events: [] });
+    const app = appWith(provider, notifier);
+    const start = await firstSlot(app);
+    provider.createEvent = async () => {
+      throw new Error("google down");
+    };
+
+    expect((await app.request("/book/routes", claimBody(start), ON)).status).toBe(502);
+    expect(notifier.sentPollEmails).toEqual([]);
+  });
+
+  it("still tells the owner when the event exists but the confirm failed", async () => {
+    // The event is on their calendar and the booker was invited, whatever the
+    // row says — the owner needs to know about it all the more.
+    const notifier = new MockNotificationProvider();
+    const app = appWith(new MockCalendarProvider({ events: [] }), notifier);
+    const start = await firstSlot(app);
+    await blockConfirmWrites();
+
+    expect((await app.request("/book/routes", claimBody(start), ON)).status).toBe(502);
+    expect(notifier.sentPollEmails.map((m) => m.to)).toEqual([OWNER]);
   });
 
   it("accepts a claim on a mixed-case slug and stores the canonical one", async () => {
@@ -1105,5 +1220,45 @@ describe("POST /book/:slug — the booker's location choice", () => {
       .bind(OWNER)
       .first<{ location_kind: string; location_detail: string | null }>();
     expect(row).toEqual({ location_kind: "meet", location_detail: null });
+  });
+});
+
+// Card C (decision C, O14b #3): a delisted-but-not-offboarded owner's public
+// booking page reads as if it did not exist while an allow-list is set — the
+// shell, the slots (a calendar read with their grant) and the claim (an
+// invitation sent from their account) all 404, byte-identical to an unknown
+// slug, so the endpoint stays no slug oracle. Listed owners and allow-list-
+// less deployments (every other test in this file) are unchanged.
+describe("delisted owner (card C)", () => {
+  const DELISTED: Env = { ...ON, MEMBERSHIP_ALLOWLIST: "someone-else@org", OPERATOR_EMAIL: "" };
+  const LISTED: Env = { ...ON, MEMBERSHIP_ALLOWLIST: OWNER, OPERATOR_EMAIL: "" };
+
+  it("404s the page, slots and claim exactly like an unknown slug, with no calendar read or row", async () => {
+    const provider = new MockCalendarProvider({ events: [] });
+    const fetchSpy = vi.spyOn(provider, "fetchEventsInWindow");
+    const app = appWith(provider);
+    const info = vi.spyOn(console, "info");
+
+    const unknown = await app.request("/book/nosuch/slots?duration=30", {}, DELISTED);
+    const unknownText = await unknown.text();
+    for (const res of [
+      await app.request("/book/routes", {}, DELISTED),
+      await app.request("/book/routes/slots?duration=30", {}, DELISTED),
+      await app.request("/book/routes", claimBody("2026-08-03T00:00:00.000Z"), DELISTED),
+    ]) {
+      expect(res.status).toBe(404);
+      expect(await res.text()).toBe(unknownText);
+      expect(res.headers.get("content-type")).toBe(unknown.headers.get("content-type"));
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(provider.getCreated()).toEqual([]);
+    expect(await bookingRows()).toEqual([]);
+    expect(info).toHaveBeenCalledWith("delisted_skip", { path: "booking_page" });
+  });
+
+  it("serves a listed owner's page and slots", async () => {
+    const app = appWith(new MockCalendarProvider({ events: [] }));
+    expect((await app.request("/book/routes", {}, LISTED)).status).toBe(200);
+    expect((await app.request("/book/routes/slots?duration=30", {}, LISTED)).status).toBe(200);
   });
 });

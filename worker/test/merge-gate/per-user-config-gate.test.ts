@@ -156,9 +156,11 @@ describe("merge gate: inactive-user sweep", () => {
     expect((await getUser(env.DB, A))?.is_active).toBe(1);
   });
 
-  it("(iv) offboards a user past retention and leaves a recently-seen user intact", async () => {
+  it("(iv) offboards a warned user past retention and leaves a recently-seen user intact", async () => {
     await upsertUser(env.DB, A);
     await touchLastSeen(env.DB, A, "2026-04-01T00:00:00Z"); // stale
+    // O10b: deletion needs a retention warning at least 14 days old.
+    await env.DB.prepare("UPDATE users SET retention_warned_at = ? WHERE subject = ?").bind("2026-05-01T00:00:00Z", A).run();
     await upsertUser(env.DB, B);
     await touchLastSeen(env.DB, B, "2026-05-31T00:00:00Z"); // recent
     await env.DB.prepare("INSERT INTO tasks (id, owner_subject, body, status, created_at, updated_at) VALUES (?,?,?,?,?,?)")

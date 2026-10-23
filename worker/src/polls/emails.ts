@@ -30,7 +30,7 @@ function parts(iso: string, tz: string): Record<string, string> {
 
 // "Wed 19 August, 4:00 AM" in `tz` when given; else the same in UTC with an
 // explicit "UTC" label so a bare instant is never ambiguous about its zone.
-function formatDateTime(iso: string, tz?: string): string {
+export function formatDateTime(iso: string, tz?: string): string {
   const zone = tz ?? "UTC";
   const p = parts(iso, zone);
   const period = (p.dayPeriod ?? "").toUpperCase();

@@ -21,3 +21,27 @@ describe("capability window claim", () => {
     expect(claims?.window).toBeUndefined();
   });
 });
+
+describe("confirm-action capability (O9.1)", () => {
+  it("round-trips actionId and subject under purpose confirm-action", async () => {
+    const t = await signCapability(
+      { purpose: "confirm-action", actionId: "act-1", subject: "a@x.com", ttlSeconds: 300 },
+      PEPPER,
+    );
+    const claims = await verifyCapability(t, PEPPER);
+    expect(claims?.purpose).toBe("confirm-action");
+    if (claims?.purpose !== "confirm-action") throw new Error("narrow");
+    expect(claims.actionId).toBe("act-1");
+    expect(claims.subject).toBe("a@x.com");
+    // Nothing from the other purposes leaks into the claims.
+    expect(claims).not.toHaveProperty("planHash");
+    expect(claims).not.toHaveProperty("pollId");
+  });
+
+  it("an accept token never carries an actionId", async () => {
+    const t = await signCapability(BASE, PEPPER);
+    const claims = await verifyCapability(t, PEPPER);
+    expect(claims?.purpose).toBe("accept");
+    expect(claims).not.toHaveProperty("actionId");
+  });
+});

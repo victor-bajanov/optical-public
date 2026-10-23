@@ -3,6 +3,81 @@
 Curated notes for each public release, newest first. The full commit list for
 a release is in that release's PR on the public repository.
 
+## v1.2.0
+
+Hardening for running Optical for people other than its operator: agents act
+only with the user's confirmation, mail and accounts have lifecycle limits,
+and sign-in and token handling are stricter.
+
+- **Upgrading:** apply migrations **0041–0045** before deploying, in every
+  environment.
+  - Without 0041, every bearer call fails.
+  - Without 0043, every sign-in fails.
+  - Without 0042 and 0045, a `replanNow` that sends mail returns 500.
+
+  Refresh tokens are now single-use (below). If an MCP front end such as
+  codemode-mcp refreshes in parallel, upgrade it to a release with
+  single-flight refresh (codemode-mcp v1.2.0) *before* deploying this one,
+  or its connector breaks on the first parallel refresh and has to be
+  re-authorised.
+- **Agent confirmation** (`AGENT_CONFIRM_CLIENT_IDS`, default: no client
+  is gated). For the OAuth clients listed, consequential operations answer
+  `202 awaiting_confirmation` and run only after the user clicks a
+  single-use link emailed to them. These operations are:
+  - `commit`, and `acceptPlan` called with a bearer token;
+  - the poll operations that email or book;
+  - poll title and location edits on an open poll;
+  - publishing the booking page;
+  - `deleteAccount`.
+
+  Each user can have at most 20 actions waiting for confirmation. If the
+  user's own mailbox can't send a confirmation, a system-mail fallback
+  sends at most 3 per user per day.
+- **Outbound mail cap:** at most 50 third-party recipients per user per UTC
+  day from the user's own mailbox (`OUTBOUND_MAIL_DAILY_CAP`; `"0"` turns
+  third-party mail off). Over the cap, poll create, nudge and update return
+  `429 mail_cap_exceeded` before writing anything.
+- **`replanNow`** sends each plan's accept email at most once while its link
+  is live, for every client. When it skips the email it still answers 200,
+  with `email_sent: false` and `email_skipped`.
+- **Untrusted text:** response fields that carry third-party text are
+  tagged `x-optical-untrusted: true` in the spec. Plan views returned over
+  the API show other people's event titles as "Busy".
+- **Membership and account lifecycle:**
+  - A non-empty `MEMBERSHIP_ALLOWLIST` is now authoritative. A user who
+    isn't on it is refused at sign-in and at token refresh, and every cron,
+    webhook replan and public page skips them.
+  - `RETENTION_DAYS` emails a warning before deleting an idle account, and
+    deletes it only once the warning is at least 14 days old.
+  - `DELETED_ACCOUNT_RETENTION_DAYS` sets how long after an offboard the
+    deactivated user row is purged and the audit log pseudonymised.
+  - Self-serve account deletion, `DELETE /v1/account`, is behind
+    `SELF_SERVE_DELETE_ENABLED`.
+  - A first-party system mailer (SMTP2GO) is behind `SYSTEM_MAIL_ENABLED`.
+  - With `UPSTREAM_REVOKE_ENABLED`, offboarding also revokes the user's
+    grant at the identity provider.
+- **OAuth and sign-in:**
+  - Refresh tokens are single-use, enforced with a compare-and-set. Of a
+    concurrent burst presenting one token, exactly one succeeds.
+  - A sign-in that grants only some of the requested scopes is refused
+    (`REQUIRE_EXACT_PROVIDER_SCOPES`).
+  - `REFUSE_PROVIDER_REBIND` refuses a sign-in that would rebind an
+    account to a different provider identity.
+  - The admin scope is re-checked on every refresh.
+  - The provider chooser can show a consent disclosure with privacy and
+    terms links (`PRIVACY_URL`, `TERMS_URL`).
+- **Calendar sync:**
+  - Push channels are created at sign-in, and by a daily sweep for any
+    grant holder who has none.
+  - Every event a deployment creates is stamped with its origin
+    (`optical_deployment`), so two deployments never treat each other's
+    events as their own.
+- **Smaller changes:**
+  - Booking-page owners get a "New booking" email.
+  - An accept-link POST that carries `Authorization` is refused.
+  - Task writes with `source.kind: "meeting"` return 400.
+  - Public pages redirect a trailing slash with a 301.
+
 ## v1.1.1
 
 - **Security (solver dependency):** the solver's `certifi` is bumped to

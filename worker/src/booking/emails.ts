@@ -8,6 +8,7 @@
 import { escText as esc } from "../util/html-escape";
 import type { PollEmail } from "../providers/notification-provider";
 import { emailShell, ctaButton } from "../polls/emails";
+import type { LocationKind } from "./location";
 
 /** What a renderer produces: everything but the recipient address. */
 export type BookingEmailContent = Omit<PollEmail, "to">;
@@ -104,6 +105,64 @@ export function renderBookingDeclineCancelledOwnerEmail(
   const html = emailShell(
     `<p>${esc(bookerName)}'s booking for <strong>${esc(when)}</strong> was cancelled after they declined the calendar invite.</p>` +
       `<p>They were invited to book a new time via the booking page.</p>`,
+  );
+
+  return { subject, text, html };
+}
+
+export interface BookingOwnerNotifiedEmailParams {
+  /** Booker-typed, so untrusted: escaped in the html body. */
+  bookerName: string;
+  bookerEmail: string;
+  startUtc: string;
+  durationMinutes: number;
+  /** Owner's effective tz (getHomeTz); UTC, labelled, when absent. */
+  ownerTz?: string;
+  locationKind: LocationKind;
+  /** The booker's number (phone) or place (in_person), or the owner's own
+   *  fixed text (custom); null for meet. */
+  locationDetail: string | null;
+  /** The booker's note, untrusted third-party text; null when none. */
+  note: string | null;
+}
+
+// A video link isn't known when this is sent: Google mints Meet links
+// asynchronously and neither provider's createEvent surfaces one, so point at
+// the event rather than promise a URL (same wording rule as the poll
+// organiser's booked email).
+function locationLine(kind: LocationKind, detail: string | null): string {
+  if (kind === "meet") return "Video call (the join link is on the calendar event)";
+  if (kind === "phone") return `Phone call: ${detail ?? ""}`;
+  if (kind === "in_person") return `In person: ${detail ?? ""}`;
+  return detail ?? "";
+}
+
+/** Sent to the booking-page owner, from and to their own mailbox, when a
+ *  booker claims a slot. The calendar invitation goes only to the booker —
+ *  Google doesn't email you about an event on your own calendar — so without
+ *  this the owner hears nothing. */
+export function renderBookingOwnerNotifiedEmail(params: BookingOwnerNotifiedEmailParams): BookingEmailContent {
+  const { bookerName, bookerEmail, startUtc, durationMinutes, ownerTz, locationKind, locationDetail, note } = params;
+  const when = formatSlotTime(startUtc, ownerTz);
+  const how = locationLine(locationKind, locationDetail);
+  const noteLabel = `Note from ${bookerName} (their own words, not checked by Optical):`;
+
+  const subject = `New booking: ${bookerName}, ${when}`;
+
+  const textLines = [
+    `${bookerName} <${bookerEmail}> booked ${when} (${durationMinutes} minutes) through your booking page.`,
+    `How: ${how}`,
+  ];
+  if (note) textLines.push(``, noteLabel, note);
+  textLines.push(``, `It's on your calendar, and ${bookerName} has been sent the invitation.`);
+  const text = textLines.join("\n");
+
+  const html = emailShell(
+    `<p><strong>${esc(bookerName)}</strong> &lt;${esc(bookerEmail)}&gt; booked <strong>${esc(when)}</strong> (${durationMinutes} minutes) through your booking page.<br>How: ${esc(how)}</p>` +
+      (note
+        ? `<p>${esc(noteLabel)}</p><blockquote style="white-space:pre-wrap;margin:0 0 16px;padding-left:12px;border-left:3px solid #ccc">${esc(note)}</blockquote>`
+        : ``) +
+      `<p>It's on your calendar, and ${esc(bookerName)} has been sent the invitation.</p>`,
   );
 
   return { subject, text, html };

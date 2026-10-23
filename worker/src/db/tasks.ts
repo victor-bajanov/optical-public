@@ -19,6 +19,30 @@ export async function getDoneTaskIds(
   return new Set((r.results ?? []).map((row) => row.id));
 }
 
+/** Of the given task ids, the subset that still has a row (any status) owned by
+ *  this subject. A same-id row under another owner does not count. De-dups ids;
+ *  queries in slices so a long plan stays under D1's bound-parameter limit.
+ *  Empty input → empty Set with no DB round-trip. */
+export async function getExistingTaskIds(
+  db: D1Database,
+  ownerSubject: string,
+  taskIds: string[],
+): Promise<Set<string>> {
+  const ids = [...new Set(taskIds)];
+  const found = new Set<string>();
+  const SLICE = 90;
+  for (let i = 0; i < ids.length; i += SLICE) {
+    const slice = ids.slice(i, i + SLICE);
+    const placeholders = slice.map(() => "?").join(", ");
+    const r = await db
+      .prepare(`SELECT id FROM tasks WHERE owner_subject = ? AND id IN (${placeholders})`)
+      .bind(ownerSubject, ...slice)
+      .all<{ id: string }>();
+    for (const row of r.results ?? []) found.add(row.id);
+  }
+  return found;
+}
+
 /** Load specific task bodies by id for this owner, with NO status filter (we
  *  need to load tasks that are currently 'done'). Owner-scoped, de-dups ids.
  *  Empty input → []. Mirrors loadPendingTasks's row→Task merge: spread the

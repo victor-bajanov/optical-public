@@ -80,3 +80,54 @@ describe("GoogleIdentityProvider.fetchIdentity", () => {
     await expect(idp.fetchIdentity("at")).rejects.toThrow("no_subject_in_userinfo");
   });
 });
+
+describe("GoogleIdentityProvider.revokeGrant", () => {
+  const idp = new GoogleIdentityProvider({ clientId: "cid", clientSecret: "sec" });
+  const stub = (res: () => Response) => {
+    const f = vi.fn(async () => res());
+    vi.stubGlobal("fetch", f);
+    return f;
+  };
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("POSTs the token form-encoded to Google's revoke endpoint", async () => {
+    const f = stub(() => new Response("{}", { status: 200 }));
+    await idp.revokeGrant("1//refresh-abc");
+    expect(f).toHaveBeenCalledTimes(1);
+    const [url, init] = f.mock.calls[0]! as unknown as [string, RequestInit];
+    expect(url).toBe("https://oauth2.googleapis.com/revoke");
+    expect(init.method).toBe("POST");
+    expect(new Headers(init.headers).get("content-type")).toBe("application/x-www-form-urlencoded");
+    const body = new URLSearchParams(String(init.body));
+    expect([...body.keys()]).toEqual(["token"]);
+    expect(body.get("token")).toBe("1//refresh-abc");
+  });
+
+  it("accepts an access token as well (the callback revokes a fresh grant before any refresh token is stored)", async () => {
+    const f = stub(() => new Response("{}", { status: 200 }));
+    await idp.revokeGrant("ya29.access-xyz");
+    const [, init] = f.mock.calls[0]! as unknown as [string, RequestInit];
+    expect(new URLSearchParams(String(init.body)).get("token")).toBe("ya29.access-xyz");
+  });
+
+  it("treats 400 invalid_token (already revoked / expired) as done", async () => {
+    stub(() => new Response(JSON.stringify({ error: "invalid_token", error_description: "Token expired or revoked" }), { status: 400 }));
+    await expect(idp.revokeGrant("gone")).resolves.toBeUndefined();
+  });
+
+  it("throws on any other 400 error code", async () => {
+    stub(() => new Response(JSON.stringify({ error: "invalid_request" }), { status: 400 }));
+    await expect(idp.revokeGrant("t")).rejects.toThrow(/google revoke failed: 400 invalid_request/);
+  });
+
+  it("throws on a 5xx", async () => {
+    stub(() => new Response("upstream sad", { status: 503 }));
+    await expect(idp.revokeGrant("t")).rejects.toThrow(/google revoke failed: 503/);
+  });
+
+  it("never puts the token in the thrown error", async () => {
+    stub(() => new Response("echo secret-tok", { status: 500 }));
+    const err = await idp.revokeGrant("secret-tok").catch((e: unknown) => e);
+    expect(String(err)).not.toContain("secret-tok");
+  });
+});

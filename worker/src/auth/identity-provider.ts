@@ -29,6 +29,15 @@ export interface IdentityProvider {
      *  returns one). When present the caller MUST persist it. */
     refreshToken?: string;
   }>;
+  /** Revoke this app's grant upstream so the provider stops honouring it.
+   *  `token` may be a refresh token (offboard) or an access token (the OAuth
+   *  callback refusing a fresh grant before any refresh token is stored);
+   *  Google's revoke endpoint accepts either and revokes the whole grant.
+   *  Resolves when the grant is gone (an already-revoked/expired token counts
+   *  as gone); rejects on any other failure. Implementations MUST NOT put the
+   *  token in a thrown error. Microsoft has no per-app revoke for a delegated
+   *  grant, so its implementation is a documented no-op. */
+  revokeGrant(token: string): Promise<void>;
 }
 
 // Test seam: lets tests swap in a MockIdentityProvider (mirrors

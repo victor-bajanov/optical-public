@@ -9,6 +9,8 @@ import { D } from "../schema/descriptions";
 import { IsoDateTime } from "../schema/common";
 import type { SolverWeights } from "./build-problem";
 import { runResolve } from "./resolve-internal";
+import { confirmationRequired } from "../confirm/gate";
+import { attachAgentReviewSnapshot } from "./commit-confirm";
 
 // Maximum solvable window span. The solver builds its CP-SAT model with one pass
 // per 15-minute slot across the whole window, OUTSIDE the 30s solve time-limit,
@@ -62,7 +64,7 @@ export function mountResolveRoute(
     path: "/resolve",
     operationId: "resolve",
     summary: "Solve the optimal weekly schedule for a window and return a proposed plan hash.",
-    description: "Run the solver over a date window and return a proposed plan: a plan_hash plus the schedule and any dropped tasks. Does not modify the calendar — inspect the plan, then accept or commit it.",
+    description: "Run the solver over a date window and return a proposed plan: a plan_hash plus the schedule and any dropped tasks. It never moves, creates or deletes calendar events and never notifies attendees or emails anyone; applying the plan is a separate accept or commit. It does write state: it stores the proposed plan (and supersedes the caller's other pending plans for the same week), syncs task state from the calendar (chunks painted done, recurring occurrences materialised as tasks), and, when owned movable meetings are enabled, imports newly seen owned meetings as tasks and tags each such calendar event with a private extended property (optical_meeting_task_id). That tag is a silent metadata write on the event, not a time change.",
     security: [{ BearerAuth: [] }],
     // Note: middleware field omitted — v0.19.10 causes TypeScript union-type
     // mismatch when requireBearer's Variables: Vars conflicts with AppVars.
@@ -129,6 +131,17 @@ export function mountResolveRoute(
       if (result.kind === "unsat") return c.json(result.unsatCore as Record<string, unknown>, 422) as any;
       if (result.kind === "solver_error") {
         return c.json({ error: "solver_failed" as const, status: result.status, detail: result.detail }, 502) as any;
+      }
+      if (confirmationRequired(c)) {
+        // O9.2: an agent-confirm client can only get this plan applied by the
+        // user accepting its emailed diff, which needs the review snapshot.
+        // Best effort: without it, a gated commit answers 409
+        // plan_not_reviewable rather than failing this resolve.
+        try {
+          await attachAgentReviewSnapshot(c.env, owner, result);
+        } catch (e) {
+          console.error("resolve_review_snapshot_failed", { error: e instanceof Error ? e.name : "unknown" });
+        }
       }
       return c.json(
         {

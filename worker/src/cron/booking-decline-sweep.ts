@@ -20,6 +20,7 @@ import {
 } from "../db/bookings";
 import { getHomeTz } from "../db/users";
 import { isAllDeclined } from "../booking/decline-cancel";
+import { isActiveMember } from "../auth/membership";
 import {
   renderBookingDeclineCancelledEmail,
   renderBookingDeclineCancelledOwnerEmail,
@@ -57,9 +58,10 @@ export interface BookingDeclineSweepResult {
   // actually attempted (counted in `checked`) and failed.
   failed: number;
   // Provider construction failed for this owner (e.g. a kill-switch-disabled
-  // Microsoft account, or a transient D1 error resolving their provider) —
-  // their whole row set was skipped WITHOUT being attempted, so it's tracked
-  // separately from `failed` rather than overloading that counter.
+  // Microsoft account, or a transient D1 error resolving their provider), or
+  // the owner is delisted (card C; logged as `delisted_skip`) — their whole
+  // row set was skipped WITHOUT being attempted, so it's tracked separately
+  // from `failed` rather than overloading that counter.
   skippedOwners: number;
   skippedRows: number;
 }
@@ -147,7 +149,15 @@ async function sweepOneRow(
       oauthIssuer,
     }),
   };
-  await notify.sendPollEmail(bookerEmail);
+  // A failed booker send (e.g. O9.8 mail cap) must not swallow the owner's
+  // self-addressed heads-up below; the error is rethrown after it so the row
+  // still counts as failed.
+  let bookerErr: unknown = null;
+  try {
+    await notify.sendPollEmail(bookerEmail);
+  } catch (err) {
+    bookerErr = err;
+  }
 
   const ownerEmail: PollEmail = {
     to: owner,
@@ -158,6 +168,7 @@ async function sweepOneRow(
     }),
   };
   await notify.sendPollEmail(ownerEmail);
+  if (bookerErr !== null) throw bookerErr;
 
   return "cancelled";
 }
@@ -193,6 +204,15 @@ export async function runBookingDeclineSweep(
   let skippedRows = 0;
 
   for (const [owner, ownerRows] of byOwner) {
+    // Card C: a delisted-but-not-offboarded owner's rows are left exactly as
+    // found (still stamped) while an allow-list is set: no calendar read, no
+    // delete, no mail from their mailbox. Counted as skipped (not attempted),
+    // like a provider-construction failure; re-listing processes them.
+    if (!(await isActiveMember(env, owner, "booking_decline_sweep"))) {
+      skippedOwners += 1;
+      skippedRows += ownerRows.length;
+      continue;
+    }
     let cal: CalendarProvider;
     let notify: NotificationProvider;
     try {

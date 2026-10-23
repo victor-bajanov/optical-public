@@ -43,49 +43,70 @@ function positionalAnchorMs(a: TaskAnchors): number | null {
   return null;
 }
 
+export type WindowVerdict = "in" | "past" | "future" | "unclaimed";
+
 /**
- * True when the task belongs to the resolve window [windowStartMs, windowEndMs).
+ * Why a task does or does not belong to the resolve window
+ * [windowStartMs, windowEndMs):
  *
- * - With a positional anchor: included iff the anchor falls inside the window
- *   (deadline is irrelevant — the task is claimed for this week, replan handles
- *   it).
- * - Without a positional anchor: excluded ("overdue") iff it has a deadline
- *   strictly before the window start; otherwise included (live backlog, or
- *   working ahead of a future deadline) — EXCEPT in a window that has not
- *   started yet (windowStartMs > nowMs). A future-week resolve (e.g. a webhook
- *   replan triggered by a new invite weeks out) must not capture the live
- *   backlog: accepting that plan stamps `scheduled_for` into the future week,
- *   which then excludes the task from every current-week resolve (prod
- *   2026-08-12, "Gym" exported to a week four weeks out). A task claims a
- *   future window only explicitly: a deadline at/after the window start
- *   (work-ahead), or an `earliest_start` floor at/after the window start
- *   (combined with the futureness guard above, a floor inside the window).
+ * - "future": its `earliest_start` floor is at/after the window end (a
+ *   read-time futureness guard that overrides any anchor), or its positional
+ *   anchor is at/after the window end.
+ * - "past": its positional anchor is before the window start, or it has no
+ *   anchor and a deadline strictly before the window start (overdue).
+ * - "unclaimed": live backlog (no anchor, no deadline) in a window that has not
+ *   started yet (windowStartMs > nowMs), with no `earliest_start` floor at/after
+ *   the window start. Neither past nor future: it belongs to the running week.
+ * - "in": everything else — an anchor inside the window, live backlog in a
+ *   started window, or working ahead of a future deadline.
+ *
+ * With a positional anchor the deadline is irrelevant: the task is claimed for
+ * the anchor's week and replan handles it. A future-week resolve (e.g. a
+ * webhook replan triggered by a new invite weeks out) must not capture the live
+ * backlog: accepting that plan stamps `scheduled_for` into the future week,
+ * which then excludes the task from every current-week resolve (prod
+ * 2026-08-12, "Gym" exported to a week four weeks out). A task claims a future
+ * window only explicitly: a deadline at/after the window start (work-ahead), or
+ * an `earliest_start` floor at/after the window start (combined with the
+ * futureness guard, a floor inside the window).
  */
-export function taskBelongsInWindow(
+export function taskWindowVerdict(
   a: TaskAnchors,
   windowStartMs: number,
   windowEndMs: number,
   nowMs: number,
-): boolean {
+): WindowVerdict {
   // Read-time futureness guard, symmetric to the past-deadline guard below: a
   // task whose earliest_start floor is at/after the window end cannot run this
   // week, so it never belongs here — even if a stale in-window scheduled_for
   // stamp would otherwise anchor it. Applies to all tasks (one-off and
   // recurring) and overrides the positional anchor.
   const earliestMs = toMs(a.earliest_start);
-  if (earliestMs !== null && earliestMs >= windowEndMs) return false;
+  if (earliestMs !== null && earliestMs >= windowEndMs) return "future";
 
   const anchor = positionalAnchorMs(a);
   if (anchor !== null) {
-    return anchor >= windowStartMs && anchor < windowEndMs;
+    if (anchor < windowStartMs) return "past";
+    if (anchor >= windowEndMs) return "future";
+    return "in";
   }
   const deadlineMs = toMs(a.deadline?.at);
-  if (deadlineMs !== null && deadlineMs < windowStartMs) return false;
+  if (deadlineMs !== null && deadlineMs < windowStartMs) return "past";
   if (windowStartMs > nowMs && deadlineMs === null) {
     // Pure backlog in a not-yet-started window: only an earliest_start floor
     // targeting the window keeps it (>= start; the guard above already shed
     // floors at/after the window end).
-    return earliestMs !== null && earliestMs >= windowStartMs;
+    return earliestMs !== null && earliestMs >= windowStartMs ? "in" : "unclaimed";
   }
-  return true;
+  return "in";
+}
+
+/** True when the task belongs to the resolve window (`taskWindowVerdict` is "in"). */
+export function taskBelongsInWindow(
+  a: TaskAnchors,
+  windowStartMs: number,
+  windowEndMs: number,
+  nowMs: number,
+): boolean {
+  return taskWindowVerdict(a, windowStartMs, windowEndMs, nowMs) === "in";
 }

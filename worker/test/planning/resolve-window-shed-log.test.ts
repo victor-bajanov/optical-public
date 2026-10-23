@@ -18,6 +18,9 @@ describe("resolve window-shed log line", () => {
     );
     expect(src).toContain('console.info("resolve_window_shed"');
     expect(src).toContain("excluded_past:");
+    expect(src).toContain("excluded_future:");
+    expect(src).toContain("excluded_unclaimed:");
+    expect(src).toContain("window_start:");
     expect(src).toContain("kept:");
     expect(src).not.toContain("resolve.task_shedding");
   });

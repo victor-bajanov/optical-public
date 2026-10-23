@@ -4,13 +4,16 @@ import type { AppVariables } from "../index-providers";
 import { defaultCalendarProvider } from "../index-providers";
 import { requireBearer } from "../middleware/auth-bearer";
 import { verifyCapabilityWithEnv } from "../auth/capability";
-import { commitPlan } from "./commit";
+import { confirmationRequired, isForeignFetchSite } from "../confirm/gate";
+import { isActiveMember } from "../auth/membership";
+import { checkPlanCommittable, commitPlan, type CommitResult } from "./commit";
+import { deferPlanCommit, planConfirmResponses } from "./commit-confirm";
 import { getCommittedPlansForSubject, getPendingPlansForSubject, getProposedPlan, planProducedInTz, type ProposedPlanRow } from "./proposed-plans";
 import type { ReplanEmailModel } from "../diff/email-model";
 import { renderConfirmPage, renderAcceptedPage, renderNoticePage, renderErrorPage, type WeekTab } from "../web/accept-page";
 import { formatLocalDate } from "../diff/format-local";
 import { localWeekWindow } from "./datetime";
-import { getHomeTz } from "../db/users";
+import { getHomeTz, bumpLastSeenBestEffort } from "../db/users";
 import { D } from "../schema/descriptions";
 
 /** Local-calendar-week identity: the Monday-00:00 instant (in `tz`, the
@@ -109,12 +112,14 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
     method: "post", path: "/plans/{plan_hash}/accept", tags: ["internal"],
     operationId: "acceptPlan",
     summary: "Accept (commit) the proposed plan identified by {plan_hash}.",
-    description: "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer. If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. A pending plan produced under a timezone other than the subject's current effective timezone (a resolve that raced a timezone change) is treated the same way as a superseded hash. Idempotent on an already-committed hash.",
+    description: "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer, never both: a request carrying a capability token AND an Authorization header is refused 403 `authorization_not_allowed` (the emailed link is the user's own confirmation, which an agent may not click for them). If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. A pending plan produced under a timezone other than the subject's current effective timezone (a resolve that raced a timezone change) is treated the same way as a superseded hash. Idempotent on an already-committed hash. Bearer calls from an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) commit nothing: after the same checks (409 plan_superseded, 410, idempotent 200), the user is emailed this plan's accept email and the call answers 202 awaiting_confirmation (action_id = plan_hash); only the user's own accept on that email's page (the capability branch) commits it. A gated call on a plan with no reviewable changes is 409 plan_not_reviewable; if the email can't be sent, 503 confirmation_unavailable.",
     responses: {
       200: { content: { "application/json": { schema: z.object({ ok: z.boolean() }) } }, description: "Committed (idempotent on an already-committed plan)" },
-      401: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "Unauthenticated" },
-      409: { content: { "application/json": { schema: z.object({ error: z.string(), latest_plan_hash: z.string().optional().describe(D.response.latest_plan_hash) }) } }, description: "Superseded — the plan no longer exists; nothing was committed" },
+      401: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "Unauthenticated: missing/invalid bearer, or an invalid capability token (including one whose subject is no longer on MEMBERSHIP_ALLOWLIST)" },
+      403: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "authorization_not_allowed: a capability token (form field or query `t`) sent together with an Authorization header; or cross_site_not_allowed: a capability POST whose Sec-Fetch-Site is present and not same-origin. The capability path is for the accept page's own form only; nothing was committed." },
+      409: { content: { "application/json": { schema: z.object({ error: z.string(), latest_plan_hash: z.string().optional().describe(D.response.latest_plan_hash) }) } }, description: "plan_superseded: the plan no longer exists (or was produced under an older timezone); nothing was committed. Or, for an agent-confirm client's bearer call only, plan_not_reviewable: the plan has no reviewable changes to email; nothing was committed." },
       410: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "Expired" },
+      ...planConfirmResponses,
     },
   });
 
@@ -126,11 +131,36 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
     const isBearerPath = !c.req.header("content-type")?.includes("application/x-www-form-urlencoded") && !c.req.query("t");
     const form = await c.req.parseBody().catch(() => ({} as Record<string, unknown>));
     const cap = typeof form.t === "string" ? form.t : c.req.query("t");
+    // O9.1 self-confirm guard: the capability branch is the human's channel
+    // (the emailed link's form POST), and a browser form never carries
+    // Authorization. The codemode proxy always attaches one, so a token AND an
+    // Authorization header means an agent is trying to click the human's
+    // link. Refused before the token is even verified, so the response says
+    // nothing about the token.
+    if (cap && c.req.header("authorization") !== undefined) {
+      return c.json({ error: "authorization_not_allowed" }, 403);
+    }
+    // Cross-site guard: the only legitimate capability POST is the accept
+    // page's own form (Sec-Fetch-Site: same-origin); see isForeignFetchSite.
+    if (cap && isForeignFetchSite(c.req.header("sec-fetch-site"))) {
+      return c.json({ error: "cross_site_not_allowed" }, 403);
+    }
     if (cap) {
       const claims = await verifyCapabilityWithEnv(cap, c.env);
       if (!claims || claims.purpose !== "accept") return c.json({ error: "invalid_token" }, 401);
+      // Decision C: a delisted user's emailed link commits nothing on their
+      // grant (and bumps nothing): answered exactly like an invalid token.
+      if (!(await isActiveMember(c.env, claims.subject, "accept_link"))) {
+        return c.json({ error: "invalid_token" }, 401);
+      }
       subject = claims.subject;
       capWindow = claims.window;
+      // O10a: submitting the emailed accept form is real use (whatever the
+      // commit outcome), so it keeps the account clear of the retention sweep.
+      // Only this POST counts, never the GET confirm page: mail link scanners
+      // prefetch emailed GET links, which would keep an abandoned account
+      // alive forever. (The bearer path bumps inside requireBearer.)
+      await bumpLastSeenBestEffort(c.env.DB, subject, "accept_link");
     } else {
       const r = await requireBearer(c as any, async () => undefined as any);
       if (r) return r as any;
@@ -146,14 +176,27 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
     // (webhook, cron, resolve) bucketed their plans' weeks in.
     const tz = await getHomeTz(c.env.DB, subject, c.env.SCHEDULER_TZ);
 
-    const cal = c.var.calendarProvider ?? await defaultCalendarProvider(c.env, subject);
-    // Commit EXACTLY the hash in the path — never pre-resolve "latest". A vanished
-    // hash surfaces below as 409, so a stale link can never silently apply a
-    // different plan.
-    const result = await commitPlan(c.env.DB, cal, pathHash, subject, {
-      createColorId: c.env.CREATE_COLOR_ID,
-      currentTz: { tz, schedulerTz: c.env.SCHEDULER_TZ },
-    });
+    const currentTz = { tz, schedulerTz: c.env.SCHEDULER_TZ };
+    let result: CommitResult;
+    if (!cap && confirmationRequired(c)) {
+      // O9.2: an agent-confirm client's bearer accept commits nothing. The
+      // refusals a direct commit would make come first and are answered below
+      // exactly as before (409 plan_superseded, 410, idempotent 200), with no
+      // mail; a committable plan is emailed to the user, whose click on it
+      // comes back through the capability branch above.
+      const check = await checkPlanCommittable(c.env.DB, pathHash, subject, { currentTz });
+      if (check.ok) return deferPlanCommit(c, check.plan, subject, "acceptPlan") as any;
+      result = check.result;
+    } else {
+      const cal = c.var.calendarProvider ?? await defaultCalendarProvider(c.env, subject);
+      // Commit EXACTLY the hash in the path — never pre-resolve "latest". A vanished
+      // hash surfaces below as 409, so a stale link can never silently apply a
+      // different plan.
+      result = await commitPlan(c.env.DB, cal, pathHash, subject, {
+        createColorId: c.env.CREATE_COLOR_ID,
+        currentTz,
+      });
+    }
 
     if (result.status === 200) {
       if (wantsJson) return c.json({ ok: true }, 200);
@@ -243,7 +286,7 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
   v1.get("/plans/:plan_hash/accept", async (c) => {
     const cap = c.req.query("t") ?? "";
     const claims = cap ? await verifyCapabilityWithEnv(cap, c.env) : null;
-    if (!claims || claims.purpose !== "accept") {
+    if (!claims || claims.purpose !== "accept" || !(await isActiveMember(c.env, claims.subject, "accept_link"))) {
       return c.html(renderErrorPage(COPY.invalidLink), 400);
     }
     // Subject's effective tz: see the POST handler.

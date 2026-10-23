@@ -2,7 +2,19 @@ import type { PlanDiff, ScheduleEntry } from "./compute-diff";
 import type { ExternalEvent } from "../planning/resolve-internal";
 import { localDayKey } from "./format-local";
 
-export type Trigger = "monday-cron" | { kind: "webhook"; inviteTitle: string };
+// inviteOrganizedBySelf: whether inviteTitle is the user's own text (their own
+// event, "manual replan", or a caller-supplied trigger) rather than someone
+// else's invite title. Absent on snapshots persisted before O9.6 — the API
+// redaction (diff/redact-snapshot.ts) treats absent as NOT own (fail closed).
+// "api": an agent-confirm client (O9.2) asked to commit/accept this plan, and
+// the user is emailed it to accept themselves.
+export type Trigger = "monday-cron" | "api" | { kind: "webhook"; inviteTitle: string; inviteOrganizedBySelf?: boolean };
+
+// Where an entry's title came from, so the API can redact text the user did
+// not write (O9.6): "task" = a scheduler chunk (the user's own task title);
+// "own_event" = a non-scheduler calendar event the user organises;
+// "others_event" = one someone else organises (or of unknown organiser).
+export type EntryOrigin = "task" | "own_event" | "others_event";
 
 export type EntryRole =
   | "moved-from" | "moved-to" | "added" | "removed" | "existing" | "new-clash";
@@ -14,6 +26,7 @@ export interface TimelineEntry {
   role: EntryRole;
   movedFrom?: string;   // ISO-Z, only on "moved-to"
   isMeeting?: boolean;  // true when the backing task is an owned meeting row (source.kind === "meeting")
+  origin?: EntryOrigin; // always set by buildReplanEmailModel; absent only on pre-O9.6 snapshots
 }
 
 export interface DayView {
@@ -75,19 +88,21 @@ export function buildReplanEmailModel(input: BuildReplanEmailModelInput): Replan
   const externalRole = (id: string): EntryRole => (triggerIds.has(id) ? "new-clash" : "existing");
   const externalEntries: TimelineEntry[] = externalEvents.map((e): TimelineEntry => ({
     title: e.title, start: e.start, end: e.end, role: externalRole(e.id),
+    origin: e.organizedBySelf === true ? "own_event" : "others_event",
   }));
 
   const beforeScheduler: TimelineEntry[] = priorEvents.map((e): TimelineEntry => ({
     title: titleOf(titles, e.task_id), start: e.start, end: e.end,
     role: movedChunks.has(e.chunk_id) ? "moved-from" : removedChunks.has(e.chunk_id) ? "removed" : "existing",
+    origin: "task",
     ...(isMeetingTask(e.task_id) ? { isMeeting: true } : {}),
   }));
   const afterScheduler: TimelineEntry[] = proposedSchedule.map((e): TimelineEntry => {
     const meetingFlag = isMeetingTask(e.task_id) ? { isMeeting: true } : {};
     if (movedChunks.has(e.chunk_id)) {
-      return { title: titleOf(titles, e.task_id), start: e.start, end: e.end, role: "moved-to", movedFrom: movedFromStart.get(e.chunk_id), ...meetingFlag };
+      return { title: titleOf(titles, e.task_id), start: e.start, end: e.end, role: "moved-to", movedFrom: movedFromStart.get(e.chunk_id), origin: "task", ...meetingFlag };
     }
-    return { title: titleOf(titles, e.task_id), start: e.start, end: e.end, role: addedChunks.has(e.chunk_id) ? "added" : "existing", ...meetingFlag };
+    return { title: titleOf(titles, e.task_id), start: e.start, end: e.end, role: addedChunks.has(e.chunk_id) ? "added" : "existing", origin: "task", ...meetingFlag };
   });
 
   const before = [...beforeScheduler, ...externalEntries];

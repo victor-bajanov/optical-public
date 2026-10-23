@@ -7,6 +7,7 @@ import type {
 } from "./calendar-provider";
 import { SyncTokenInvalidatedError } from "./calendar-provider";
 import type { CalendarEvent, Change, IncrementalResult, Subscription } from "./types";
+import { scopeEventToDeployment, withDeploymentStamp } from "./deployment-scope";
 
 type TokenFetcher = (opts?: { forceRefresh?: boolean }) => Promise<string>;
 
@@ -14,6 +15,8 @@ export interface GoogleCalendarProviderOptions {
   calendarId: string;
   getAccessToken: TokenFetcher;
   fetch?: typeof fetch;
+  /** See CalendarProvider.deploymentId. */
+  deploymentId?: string;
 }
 
 interface GoogleEvent {
@@ -100,9 +103,11 @@ export class GoogleCalendarProvider implements CalendarProvider {
   private readonly calendarId: string;
   private readonly getAccessToken: TokenFetcher;
   private readonly fetchFn: typeof fetch;
+  readonly deploymentId?: string;
 
   constructor(opts: GoogleCalendarProviderOptions) {
     this.calendarId = opts.calendarId;
+    this.deploymentId = opts.deploymentId;
     this.getAccessToken = opts.getAccessToken;
     // Wrap global fetch in a closure so calling `this.fetchFn(...)` doesn't
     // bind `this` to the class instance (which Workers rejects as
@@ -124,6 +129,12 @@ export class GoogleCalendarProvider implements CalendarProvider {
       });
     }
     return res;
+  }
+
+  /** Every read maps through here, so another deployment's event never
+   *  surfaces with its ownership tags (providers/deployment-scope.ts). */
+  private toEvent(g: GoogleEvent): CalendarEvent {
+    return scopeEventToDeployment(toCalendarEvent(g), this.deploymentId);
   }
 
   async fetchEventsInWindow(start: string, end: string) {
@@ -157,7 +168,7 @@ export class GoogleCalendarProvider implements CalendarProvider {
         nextSyncToken?: string;
       };
       for (const it of body.items ?? []) {
-        if (isBusyEvent(it)) events.push(toCalendarEvent(it));
+        if (isBusyEvent(it)) events.push(this.toEvent(it));
       }
       pageToken = body.nextPageToken;
       if (body.nextSyncToken) nextSyncToken = body.nextSyncToken;
@@ -240,7 +251,7 @@ export class GoogleCalendarProvider implements CalendarProvider {
         if (it.status === "cancelled") {
           changes.push({ kind: "delete", eventId: it.id });
         } else if (isBusyEvent(it)) {
-          changes.push({ kind: "upsert", event: toCalendarEvent(it) });
+          changes.push({ kind: "upsert", event: this.toEvent(it) });
         }
       }
       pageToken = body.nextPageToken;
@@ -296,7 +307,10 @@ export class GoogleCalendarProvider implements CalendarProvider {
       start: { dateTime: event.start },
       end: { dateTime: event.end },
       extendedProperties: {
-        private: { ...(event.extendedProperties?.private ?? {}), ...schedulerMetadata },
+        private: {
+          ...(event.extendedProperties?.private ?? {}),
+          ...withDeploymentStamp(schedulerMetadata, this.deploymentId),
+        },
         shared: event.extendedProperties?.shared,
       },
     };
@@ -377,7 +391,7 @@ export class GoogleCalendarProvider implements CalendarProvider {
     if (res.status === 404 || res.status === 410) return null;
     if (!res.ok) throw new Error(`Google get failed: ${res.status} ${await res.text()}`);
     const body = (await res.json()) as GoogleEvent;
-    return toCalendarEvent(body);
+    return this.toEvent(body);
   }
   async stopChannel(channelId: string, resourceId: string): Promise<void> {
     const url = "https://www.googleapis.com/calendar/v3/channels/stop";

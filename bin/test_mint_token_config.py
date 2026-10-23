@@ -290,5 +290,48 @@ def test_token_export_lines_with_expected_account_appends_it():
     ]
 
 
+# access_denied comes from the worker's membership gate, which admits a
+# MEMBERSHIP_ALLOWLIST match or an OPERATOR_EMAIL identity (hosted-trial O5);
+# the hint must name both, and the provider actually used.
+@pytest.mark.parametrize("provider,name", [("google", "Google"), ("microsoft", "Microsoft")])
+def test_access_denied_hint_names_both_lists_and_the_provider(provider, name):
+    hint = mint.access_denied_hint(provider)
+    assert "MEMBERSHIP_ALLOWLIST or OPERATOR_EMAIL" in hint
+    assert name in hint
+
+
+def test_login_prompt_names_both_lists():
+    prompt = mint.login_prompt("microsoft")
+    assert "MEMBERSHIP_ALLOWLIST or OPERATOR_EMAIL" in prompt
+    assert "Microsoft" in prompt
+
+
+# Hosted-trial O4: a non-member no longer gets an access_denied redirect. The
+# worker renders a 403 "Invitation only" page in the browser and never calls
+# the localhost listener back, so the listener must time out instead of
+# blocking forever, and the no-callback message must explain the refusal.
+@pytest.mark.parametrize("provider,name", [("google", "Google"), ("microsoft", "Microsoft")])
+def test_no_callback_hint_explains_the_invitation_only_page(provider, name):
+    hint = mint.no_callback_hint(provider, 300)
+    assert "No callback received within 300s" in hint
+    assert "Invitation only" in hint
+    assert "MEMBERSHIP_ALLOWLIST or OPERATOR_EMAIL" in hint
+    assert name in hint
+
+
+def test_callback_server_times_out_instead_of_blocking_forever():
+    server = mint.make_callback_server(0, 7.5)
+    try:
+        assert server.timeout == 7.5
+        assert server.query is None
+        assert server.expected_path == "/callback"
+    finally:
+        server.server_close()
+
+
+def test_callback_timeout_flag_defaults_to_five_minutes():
+    assert mint.DEFAULT_CALLBACK_TIMEOUT_S == 300
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

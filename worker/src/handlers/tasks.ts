@@ -12,8 +12,37 @@ import { deleteTaskChunks, SCHEDULER_HORIZON_MS } from "../planning/scheduler-ch
 import { localWeekWindow } from "../planning/datetime";
 import { recordChunkCompletionStmt, deleteTaskCompletions, deleteTaskCompletionsStmt } from "../db/chunk-completions";
 import { chunkIdsOfTask } from "../planning/chunk-ids";
+import { MEETING_SOURCE_KIND } from "../meetings/identify";
 
 type Vars = { ownerSubject: string; calendarProvider?: CalendarProvider };
+
+// source.kind "meeting" is server-owned (O9.5). A meeting-kind row is what the
+// resolve promotes to a MOVABLE meeting, which a commit then moves with
+// sendUpdates=all. Only meetings/sync.ts writes one, and only for an event
+// isOwnedMovableMeeting accepts. A client that could set the kind, or re-point a
+// meeting row's external_id, could make any event it can name movable: a
+// poll-booked event (getMeetingPoll.gcalEventId), a booking, someone else's
+// meeting. So a client may never write a meeting source and may never change the
+// source of a meeting row. Echoing a meeting row's stored source back unchanged
+// is a no-op and is accepted, so a GET-modify-PATCH round trip still works.
+type SourceLike = { kind?: unknown; external_id?: unknown } | null | undefined;
+
+const INVALID_SOURCE_MESSAGE =
+  "source.kind 'meeting' is server-owned: it cannot be set by a client, and a meeting task's source cannot be changed";
+
+function invalidSourceBody() {
+  return { error: "invalid_source", issues: [{ path: ["source"], message: INVALID_SOURCE_MESSAGE }] };
+}
+
+function isMeetingSource(s: SourceLike): boolean {
+  return s?.kind === MEETING_SOURCE_KIND;
+}
+
+/** True when a PATCH's `source` would forge or alter a meeting source. */
+function patchForgesMeetingSource(patched: SourceLike, stored: SourceLike): boolean {
+  if (!isMeetingSource(patched) && !isMeetingSource(stored)) return false;
+  return !(patched?.kind === stored?.kind && patched?.external_id === stored?.external_id);
+}
 
 export const tasksApp = new OpenAPIHono<{ Bindings: Env; Variables: Vars }>();
 
@@ -24,7 +53,7 @@ const postTaskRoute = createRoute({
   path: "/",
   operationId: "createTask",
   summary: "Create a new task in optical's planner.",
-  description: "Create a task for the planner. The request body is the full constraint surface: timing (deadline, earliest_start, preferred_windows, pinned_at), shape (duration_minutes XOR chunks + group_policy), and relationships (dependencies, project_id). Returns the created task with its server-assigned id.",
+  description: "Create a task for the planner. The request body is the full constraint surface: timing (deadline, earliest_start, preferred_windows, pinned_at), shape (duration_minutes XOR chunks + group_policy), and relationships (dependencies, project_id). Returns the created task with its server-assigned id. source.kind 'meeting' is server-owned (only the owned-meetings sync writes it) and is refused with 400 invalid_source.",
   security: [{ BearerAuth: [] }],
   request: {
     body: { content: { "application/json": { schema: TaskCreate } }, required: true },
@@ -40,7 +69,7 @@ const postTaskRoute = createRoute({
           schema: z.object({ error: z.string(), issues: z.array(z.unknown()).optional() }),
         },
       },
-      description: "Validation error",
+      description: "Validation error ('validation_failed' with a zod issue list), or 'invalid_source' when the body sets source.kind 'meeting' (server-owned).",
     },
   },
 });
@@ -48,6 +77,7 @@ const postTaskRoute = createRoute({
 tasksApp.openapi(postTaskRoute, async (c) => {
   const ownerSubject = c.get("ownerSubject") as string;
   const parsed = c.req.valid("json");
+  if (isMeetingSource(parsed.source)) return c.json(invalidSourceBody(), 400);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const status = parsed.status ?? "pending";
@@ -135,7 +165,7 @@ const patchTaskRoute = createRoute({
   path: "/{id}",
   operationId: "updateTask",
   summary: "Update fields on an existing task.",
-  description: "Patch fields on an existing task. Only provided fields change; the duration_minutes/chunks/group_policy invariant is re-checked on the merged result. A pending→done transition also best-effort recolors the task's scheduler calendar chunks to the done color (scanning 28 days back and forward of the current week), and each chunk's completion is color-confirmed only when its event was actually reached — so the un-done-by-color revive can only ever be triggered by repainting that exact verified event. Patching any timing field (pinned_at, earliest_start, preferred_windows, deadline — including setting one to null) clears the system placement stamp left by the last committed plan, so the task re-enters the backlog for the resolve window implied by its new constraints; this is the supported way to bring a dropped or past-week task forward (no delete-and-re-create needed).",
+  description: "Patch fields on an existing task. Only provided fields change; the duration_minutes/chunks/group_policy invariant is re-checked on the merged result. A pending→done transition also best-effort recolors the task's scheduler calendar chunks to the done color (scanning 28 days back and forward of the current week), and each chunk's completion is color-confirmed only when its event was actually reached — so the un-done-by-color revive can only ever be triggered by repainting that exact verified event. Patching any timing field (pinned_at, earliest_start, preferred_windows, deadline — including setting one to null) clears the system placement stamp left by the last committed plan, so the task re-enters the backlog for the resolve window implied by its new constraints; this is the supported way to bring a dropped or past-week task forward (no delete-and-re-create needed). source is server-owned on a meeting row: setting source.kind 'meeting' on any task, or changing a meeting row's source, is refused with 400 invalid_source; echoing the stored source back unchanged is accepted.",
   security: [{ BearerAuth: [] }],
   request: {
     body: { content: { "application/json": { schema: TaskPatch } }, required: true },
@@ -151,7 +181,7 @@ const patchTaskRoute = createRoute({
           schema: z.object({ error: z.string(), issues: z.array(z.unknown()).optional() }),
         },
       },
-      description: "Validation error",
+      description: "Validation error ('validation_failed' with a zod issue list), or 'invalid_source' when the body sets source.kind 'meeting' (server-owned).",
     },
     404: {
       content: { "application/json": { schema: z.object({ error: z.string() }) } },
@@ -167,6 +197,9 @@ tasksApp.openapi(patchTaskRoute, async (c) => {
   if (!existing) return c.json({ error: "not_found" }, 404) as any;
   const patch = c.req.valid("json");
   const { id: _id, created_at: _ca, updated_at: _ua, ...existingBody } = existing.body as Record<string, unknown>;
+  if ("source" in patch && patchForgesMeetingSource(patch.source, existingBody.source as SourceLike)) {
+    return c.json(invalidSourceBody(), 400) as any;
+  }
   const merged = { ...existingBody, ...patch };
   const reparsed = TaskCreate.safeParse(merged);
   if (!reparsed.success) return c.json({ error: "validation_failed", issues: reparsed.error.issues }, 400) as any;

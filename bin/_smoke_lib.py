@@ -923,7 +923,15 @@ OPTICAL_DONE_CATEGORY = "Optical Done"
 # optical_poll_id: stamped by worker/src/polls/booking.ts on a poll's booked
 # event — the harness needs it read back to confirm a Microsoft-organiser
 # poll booked the right event (bin/poll-smoke.py's WP2 provider coverage).
-_GRAPH_PRIVATE_PROPS = ("scheduler_chunk_id", "optical_meeting_task_id", "optical_poll_id")
+# optical_deployment: the creating deployment's OAUTH_ISSUER origin
+# (worker/src/providers/deployment-scope.ts); L7 checks it on a Microsoft run
+# too. Absent on events from pre-stamp deployments.
+# optical_booking: stamped by worker/src/booking/route.ts on a booking-page
+# booking's event. The full tuple mirrors the worker's expandOpticalProperties.
+_GRAPH_PRIVATE_PROPS = (
+    "scheduler_chunk_id", "optical_meeting_task_id", "optical_poll_id", "optical_deployment",
+    "optical_booking",
+)
 _GRAPH_RESPONSE_MAP = {
     "accepted": "accepted", "declined": "declined",
     "tentativelyAccepted": "tentative", "organizer": "accepted",

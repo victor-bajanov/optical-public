@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { storeIdentityTokens, resolveSubject } from "../src/auth/identity-store";
+import { storeIdentityTokens, resolveSubject, ProviderRebindRefusedError, ACCESS_PREFIX } from "../src/auth/identity-store";
 
 const tokens = { refreshToken: "r", accessToken: "a", expiresIn: 3600, scope: "s" };
 
@@ -191,3 +191,119 @@ describe("rule 6 conflict: subject row wins over an unrelated email row under th
     expect(rowB).toEqual({ account_email: "b@x.com", provider_subject: "tid:oid-B" }); // untouched
   });
 });
+
+// Decision D (trial): REFUSE_PROVIDER_REBIND exactly "true" refuses to rebind
+// an account whose stored provider_subject is set to a DIFFERENT IdP identity
+// (another subject, or another provider). Nothing is written or reset.
+describe("storeIdentityTokens with REFUSE_PROVIDER_REBIND", () => {
+  const on = () => ({ ...env, REFUSE_PROVIDER_REBIND: "true" }) as typeof env;
+  const seedSync = (owner: string) => env.DB.prepare(
+    "INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url) VALUES (?,?,?,?,?,?,?,?)",
+  ).bind(owner, "primary", "SYNC-TOKEN", "chan-1", "tok-1", "2027-01-01T00:00:00Z", "res-1", "https://x/cb").run();
+  const seedBound = async (email: string, provider: string, providerSubject: string | null) => {
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject) VALUES (?,?,?,?,?,?)",
+    ).bind(email, new Uint8Array([7, 7]).buffer, "stored", "2026-01-01T00:00:00Z", provider, providerSubject).run();
+    await env.DB.prepare("INSERT INTO users (subject, role, is_active, last_seen, created_at, done_color_id) VALUES (?,?,?,?,?,?)")
+      .bind(email, "member", 1, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00Z", "11").run();
+  };
+  const snapshot = async (email: string) => ({
+    tokens: await env.DB.prepare("SELECT hex(refresh_token_encrypted) AS enc, scopes, updated_at, provider, provider_subject FROM identity_tokens WHERE account_email = ?")
+      .bind(email).first(),
+    user: await env.DB.prepare("SELECT role, is_active, last_seen, done_color_id FROM users WHERE subject = ?").bind(email).first(),
+    sync: await env.DB.prepare("SELECT next_sync_token, channel_id FROM calendar_sync WHERE owner_subject = ?").bind(email).first(),
+    cached: await env.GOOGLE_TOKEN_CACHE.get(ACCESS_PREFIX + email),
+  });
+
+  for (const provider of ["google", "microsoft"] as const) {
+    const other = provider === "google" ? "microsoft" : "google";
+
+    it(`${provider}: same provider, different stored provider_subject -> ProviderRebindRefusedError (mismatch subject), nothing written`, async () => {
+      await seedBound("own@x.com", provider, "owner-sub");
+      await seedSync("own@x.com");
+      const before = await snapshot("own@x.com");
+      const err = await storeIdentityTokens(on(), "own@x.com", tokens, provider, "intruder-sub").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ProviderRebindRefusedError);
+      expect((err as ProviderRebindRefusedError).mismatch).toBe("subject");
+      expect(await snapshot("own@x.com")).toEqual(before);
+    });
+
+    it(`${provider}: stored under the OTHER provider with a provider_subject -> refused (mismatch provider), no sync reset, done colour kept`, async () => {
+      await seedBound("own@x.com", other, "owner-sub");
+      await seedSync("own@x.com");
+      const before = await snapshot("own@x.com");
+      const err = await storeIdentityTokens(on(), "own@x.com", tokens, provider, "owner-sub").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ProviderRebindRefusedError);
+      expect((err as ProviderRebindRefusedError).mismatch).toBe("provider");
+      expect(await snapshot("own@x.com")).toEqual(before);
+      expect(before.sync).toEqual({ next_sync_token: "SYNC-TOKEN", channel_id: "chan-1" });
+    });
+
+    it(`${provider}: the same bound identity signs in again -> stored normally`, async () => {
+      await seedBound("own@x.com", provider, "owner-sub");
+      await storeIdentityTokens(on(), "own@x.com", tokens, provider, "owner-sub");
+      const row = await env.DB.prepare("SELECT scopes, provider_subject FROM identity_tokens WHERE account_email = ?")
+        .bind("own@x.com").first();
+      expect(row).toEqual({ scopes: "s", provider_subject: "owner-sub" });
+    });
+
+    it(`${provider}: legacy row with NULL provider_subject still binds (backfill)`, async () => {
+      await seedBound("legacy@x.com", provider, null);
+      await storeIdentityTokens(on(), "legacy@x.com", tokens, provider, "first-sub");
+      const row = await env.DB.prepare("SELECT provider, provider_subject FROM identity_tokens WHERE account_email = ?")
+        .bind("legacy@x.com").first();
+      expect(row).toEqual({ provider, provider_subject: "first-sub" });
+    });
+
+    it(`${provider}: no prior row -> first sign-in stores`, async () => {
+      await storeIdentityTokens(on(), "new@x.com", tokens, provider, "new-sub");
+      expect(await env.DB.prepare("SELECT provider_subject FROM identity_tokens WHERE account_email = ?").bind("new@x.com").first())
+        .toEqual({ provider_subject: "new-sub" });
+    });
+
+    it(`${provider}: a concurrent first bind that lands between the pre-check and the write is refused by the guarded upsert`, async () => {
+      // Two first sign-ins for one email race: both pre-checks see no row.
+      // Simulate the loser: its pre-check read is stale (null) while the
+      // winner's row is already committed. The upsert itself must refuse.
+      await seedBound("race@x.com", provider, "winner-sub");
+      const before = await snapshot("race@x.com");
+      const err = await storeIdentityTokens(staleReadEnv(on()), "race@x.com", tokens, provider, "loser-sub").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ProviderRebindRefusedError);
+      expect(await snapshot("race@x.com")).toEqual(before);
+    });
+  }
+
+  it("flag off (unset, \"TRUE\", \"1\"): today's rebind behaviour, overwrites the stored provider_subject", async () => {
+    for (const v of [undefined, "TRUE", "1", "false"]) {
+      await env.DB.prepare("DELETE FROM identity_tokens").run();
+      await env.DB.prepare("DELETE FROM users").run();
+      await seedBound("own@x.com", "google", "owner-sub");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await storeIdentityTokens({ ...env, REFUSE_PROVIDER_REBIND: v } as typeof env, "own@x.com", tokens, "google", "other-sub");
+      } finally {
+        warn.mockRestore();
+      }
+      expect(await env.DB.prepare("SELECT provider_subject FROM identity_tokens WHERE account_email = ?").bind("own@x.com").first(), String(v))
+        .toEqual({ provider_subject: "other-sub" });
+    }
+  });
+});
+
+/** env whose D1 answers the storeIdentityTokens pre-check read with null (a
+ *  stale view), every other statement passing through to the real D1. */
+function staleReadEnv(e: typeof env): typeof env {
+  const db = e.DB;
+  const DB = new Proxy(db, {
+    get(target, prop) {
+      if (prop === "prepare") {
+        return (sql: string) => sql.includes("SELECT provider, provider_subject FROM identity_tokens")
+          ? { bind: () => ({ first: async () => null }) }
+          : target.prepare(sql);
+      }
+      const v = Reflect.get(target, prop) as unknown;
+      return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+  return { ...e, DB } as typeof env;
+}
