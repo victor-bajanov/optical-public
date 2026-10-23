@@ -15,6 +15,34 @@ function coerceProvider(v: string | null | undefined): ProviderName {
   return v && isProviderName(v) ? v : "google";
 }
 
+/** REFUSE_PROVIDER_REBIND (decision D, trial only): exactly "true" refuses a
+ *  rebind; anything else keeps the documented provider switch. */
+export function refuseProviderRebind(env: Pick<Env, "REFUSE_PROVIDER_REBIND">): boolean {
+  return env.REFUSE_PROVIDER_REBIND === "true";
+}
+
+/** Thrown by storeIdentityTokens, before any write, when REFUSE_PROVIDER_REBIND
+ *  is on and the account_email is already bound to a different IdP identity.
+ *  `mismatch` says which part differed; it carries no email or subject. */
+export class ProviderRebindRefusedError extends Error {
+  constructor(readonly mismatch: "provider" | "subject") {
+    super("provider_rebind_refused");
+    this.name = "ProviderRebindRefusedError";
+  }
+}
+
+/** How a stored binding differs from the incoming identity, or null when it
+ *  may (re)bind: no row, a legacy row with NULL provider_subject, or the same
+ *  (provider, provider_subject). */
+function rebindMismatch(
+  prior: { provider: string | null; provider_subject: string | null } | null,
+  provider: ProviderName, providerSubject: string | undefined,
+): "provider" | "subject" | null {
+  if (!prior || !prior.provider_subject) return null;
+  if (coerceProvider(prior.provider) !== provider) return "provider";
+  return prior.provider_subject !== (providerSubject ?? null) ? "subject" : null;
+}
+
 export async function storeIdentityTokens(
   env: Env, subject: string, t: UpstreamTokens, provider: ProviderName = "google", providerSubject?: string,
 ): Promise<void> {
@@ -22,10 +50,21 @@ export async function storeIdentityTokens(
   // Provider switch (same email, other IdP): the stored sync token, push
   // channel and done marker are all provider-shaped and would poison the new
   // provider — reset them before the credential flips. Nothing stops a user
-  // doing this; "one provider per user" means one AT A TIME.
+  // doing this (unless REFUSE_PROVIDER_REBIND, below); "one provider per
+  // user" means one AT A TIME.
   const prior = await env.DB.prepare(
     `SELECT provider, provider_subject FROM identity_tokens WHERE account_email = ?`,
   ).bind(subject).first<{ provider: string | null; provider_subject: string | null }>();
+  // REFUSE_PROVIDER_REBIND (trial): an account already bound to one IdP
+  // identity is never handed to another — not a second account at the same
+  // IdP, not the same email at the other IdP. Refused before the provider-
+  // switch reset below, so nothing is written. The guarded upsert further
+  // down is the actual serialization point for two racing first sign-ins.
+  const refuse = refuseProviderRebind(env);
+  if (refuse) {
+    const mismatch = rebindMismatch(prior, provider, providerSubject);
+    if (mismatch) throw new ProviderRebindRefusedError(mismatch);
+  }
   if (prior && coerceProvider(prior.provider) !== provider) {
     await resetCalendarSyncForOwner(env.DB, subject);
     await clearDoneColorId(env.DB, subject);
@@ -59,7 +98,12 @@ export async function storeIdentityTokens(
   // that being every caller forever — upserting only on account_email means
   // a genuine (provider, provider_subject) collision under a DIFFERENT
   // account_email throws `UNIQUE constraint failed` instead of deleting data.
-  await env.DB.prepare(
+  //
+  // With REFUSE_PROVIDER_REBIND the DO UPDATE only applies while the stored
+  // row is unbound (NULL provider_subject) or bound to this same identity, so
+  // a concurrent first sign-in that committed after the pre-check read above
+  // wins and this write changes nothing (0 rows): refused, as above.
+  const res = await env.DB.prepare(
     `INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject)
      VALUES (?,?,?,?,?,?)
      ON CONFLICT(account_email) DO UPDATE SET
@@ -67,8 +111,20 @@ export async function storeIdentityTokens(
        scopes = excluded.scopes,
        updated_at = excluded.updated_at,
        provider = excluded.provider,
-       provider_subject = excluded.provider_subject`,
+       provider_subject = excluded.provider_subject` +
+    (refuse
+      ? `
+     WHERE identity_tokens.provider_subject IS NULL
+        OR (identity_tokens.provider_subject = excluded.provider_subject
+            AND COALESCE(identity_tokens.provider, 'google') = excluded.provider)`
+      : ""),
   ).bind(subject, enc, t.scope, new Date().toISOString(), provider, providerSubject ?? null).run();
+  if (refuse && (res.meta?.changes ?? 0) === 0) {
+    const now = await env.DB.prepare(
+      `SELECT provider, provider_subject FROM identity_tokens WHERE account_email = ?`,
+    ).bind(subject).first<{ provider: string | null; provider_subject: string | null }>();
+    throw new ProviderRebindRefusedError(rebindMismatch(now, provider, providerSubject) ?? "subject");
+  }
   // Storing a credential implies an active user. Idempotent; never downgrades a
   // pre-existing admin (upsertUser without a role keeps the existing role).
   await upsertUser(env.DB, subject);
@@ -109,6 +165,34 @@ export async function resolveSubject(
     return bySubject.account_email;
   }
   return email;
+}
+
+/**
+ * Does this login's identity already hold a stored upstream grant for
+ * `provider`? Resolves the subject exactly as the callback would
+ * (resolveSubject: provider_subject first, else the email), then checks for
+ * an identity_tokens row under it whose provider matches (a legacy NULL
+ * provider counts as google, as in getSubjectProvider) and whose
+ * provider_subject is this identity's (a legacy NULL one counts as a match).
+ *
+ * The O6 partial-grant refusal uses this to skip the upstream revoke: Google
+ * revokes the whole user-app grant, so revoking a returning member's partial
+ * re-consent would also kill the refresh token Optical already stores.
+ * `email` must already be normalised (trim + lower-case).
+ */
+export async function hasStoredGrant(
+  env: Env, provider: ProviderName, providerSubject: string, email: string,
+): Promise<boolean> {
+  const subject = await resolveSubject(env, provider, providerSubject, email);
+  const row = await env.DB.prepare(
+    `SELECT provider, provider_subject FROM identity_tokens WHERE account_email = ?`,
+  ).bind(subject).first<{ provider: string | null; provider_subject: string | null }>();
+  // The stored grant must be THIS upstream account's: a row bound to another
+  // provider_subject belongs to a different account, whose grant revoking
+  // this one cannot touch. A legacy NULL provider_subject can't be told
+  // apart, so it counts as a match (skip the revoke, as before).
+  return row !== null && coerceProvider(row.provider) === provider &&
+    (row.provider_subject === null || row.provider_subject === providerSubject);
 }
 
 /** The IdP this subject signed in with. Unknown subjects default to google —
@@ -153,6 +237,18 @@ export async function getAccessToken(
   }
   await env.GOOGLE_TOKEN_CACHE.put(ACCESS_PREFIX + subject, t.accessToken, { expirationTtl: Math.max(60, t.expiresIn - 60) });
   return t.accessToken;
+}
+
+/** The subject's decrypted upstream refresh token, or null when no credential
+ *  is stored. Throws when the stored ciphertext cannot be decrypted (same
+ *  posture as getAccessToken) — callers decide whether that is fatal. Used by
+ *  offboard to revoke the grant upstream before the row is deleted. */
+export async function readRefreshToken(env: Env, subject: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT refresh_token_encrypted FROM identity_tokens WHERE account_email = ?`,
+  ).bind(subject).first<{ refresh_token_encrypted: ArrayBuffer }>();
+  if (!row) return null;
+  return decryptString(row.refresh_token_encrypted, encryptionKey(env), "identity-refresh");
 }
 
 // Canonical active-user source is the users table (Plan 4 brief A).

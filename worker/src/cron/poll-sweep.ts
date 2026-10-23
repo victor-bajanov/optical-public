@@ -11,6 +11,7 @@
 import type { Env } from "../env";
 import type { NotificationProvider, PollEmail } from "../providers/notification-provider";
 import { defaultNotificationProvider } from "../index-providers";
+import { reserveOutboundMail } from "../mail/outbound-cap";
 import { listSubjects } from "../auth/identity-store";
 import {
   listOpenPollsDue,
@@ -24,6 +25,7 @@ import { renderNudgeEmail } from "../polls/emails";
 import { signCapabilityWithEnv } from "../auth/capability";
 import { hashToken } from "../auth/tokens";
 import { hashingKey } from "../auth/crypto-keys";
+import { isActiveMember } from "../auth/membership";
 
 // T9's booking module (worker/src/polls/booking.ts) is a parallel Wave-2 task
 // and may not exist yet in a given worktree — this file deliberately never
@@ -97,6 +99,11 @@ async function nudgeNonResponders(
   const nonResponders = nonDropped.filter((i) => i.respondedAt === null);
   const respondedCount = nonDropped.length - nonResponders.length;
   const totalCount = nonDropped.length;
+  // O9.8: reserve every non-responder's mail BEFORE rotating any token. All
+  // or nothing: a refusal throws OutboundMailCapExceeded before any link is
+  // touched, so the sweep's per-poll catch leaves the poll un-stamped and
+  // the old links working; the next tick retries once budget frees up.
+  await reserveOutboundMail(env, poll.subject, notification, nonResponders.map((i) => i.email));
   for (const invitee of nonResponders) {
     const inviteeUrl = await mintAndStoreInviteeUrl(env, poll, invitee, now);
     const content = renderNudgeEmail({
@@ -188,6 +195,10 @@ export async function runPollSweep(env: Env, now: Date, deps: PollSweepDeps): Pr
   // failure (a throwing bookAtDeadline, a notification-send error) must
   // never abort the sweep for the rest, same posture as the Monday cron.
   for (const subject of subjects) {
+    // Card C: a delisted-but-not-offboarded organiser's polls get no nudge
+    // (mail from their mailbox), no deadline booking and no escalation while
+    // an allow-list is set. Their polls stay open, so re-listing resumes them.
+    if (!(await isActiveMember(env, subject, "poll_sweep"))) continue;
     const polls = await listOpenPollsDue(env.DB, subject, nowIso);
     for (const poll of polls) {
       checked += 1;

@@ -58,4 +58,26 @@ describe("GmailDiffRenderer", () => {
     const full = renderer.render({ ...baseModel, trigger: "monday-cron" }, opts);
     expect(full.subject).toBe("Scheduler: weekly replan ready (abc1234)");
   });
+
+  // O9.2: an agent-confirm client's commit/accept is deferred to this email.
+  // The user must be able to tell it was their assistant asking, and that
+  // nothing has changed yet.
+  it("api trigger: the subject and an intro say the assistant asked and nothing changed yet", () => {
+    const out = renderer.render({ ...baseModel, trigger: "api" }, opts);
+    expect(out.subject).toBe("Scheduler: your assistant asked to apply a plan (abc1234)");
+    expect(out.html).toContain("Your assistant asked Optical to apply this plan to your calendar.");
+    expect(out.html).toContain("Nothing changes until you accept it.");
+    expect(out.plaintext.startsWith(
+      "Your assistant asked Optical to apply this plan to your calendar. Nothing changes until you accept it.",
+    )).toBe(true);
+    expect(out.plaintext).toContain("Accept this plan: https://s.example.com/v1/plans/abc1234def/accept?t=TOK");
+  });
+
+  it("non-api triggers carry no assistant intro", () => {
+    for (const trigger of ["monday-cron", { kind: "webhook", inviteTitle: "x" }] as const) {
+      const out = renderer.render({ ...baseModel, trigger }, opts);
+      expect(out.html).not.toContain("Your assistant asked");
+      expect(out.plaintext).not.toContain("Your assistant asked");
+    }
+  });
 });

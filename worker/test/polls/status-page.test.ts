@@ -204,6 +204,17 @@ describe("GET /poll/:id/status?t= (capability-token browser entry point)", () =>
     expect(res.status).toBe(404);
   });
 
+  it("an O9.1 confirm-action token presented as a status token 404s", async () => {
+    const poll = await seedPoll();
+    const confirmToken = await signCapabilityWithEnv(
+      { purpose: "confirm-action", actionId: poll.id, subject: OWNER, ttlSeconds: 3600 },
+      TEST_ENV,
+    );
+    const app = appWith();
+    const res = await app.request(`/poll/${poll.id}/status?t=${encodeURIComponent(confirmToken)}`, {}, ON);
+    expect(res.status).toBe(404);
+  });
+
   it("an INVITEE (poll-response) token presented as a status token 404s — the two purposes are not interchangeable", async () => {
     const poll = await seedPoll();
     const inviteeId = newInviteeId();

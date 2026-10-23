@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { runResolve } from "../../src/planning/resolve-internal";
 import { MockCalendarProvider } from "../../src/providers/mock-calendar-provider";
-import { SCHEDULER_CHUNK_ID_KEY } from "../../src/providers/types";
+import { OPTICAL_DEPLOYMENT_KEY, SCHEDULER_CHUNK_ID_KEY } from "../../src/providers/types";
 import type { Fetcher } from "@cloudflare/workers-types";
 import { seedMissingDefaultContexts } from "../fixtures/seed-contexts";
 
@@ -57,9 +57,17 @@ describe("runResolve externalEvents", () => {
   }
 
   it("returns non-scheduler calendar events as externalEvents", async () => {
+    // own1 is an unstamped (legacy) chunk: it counts as ours only because its
+    // task is a row of this D1 (externaliseUnprovenChunks). Done task: not
+    // placed, but it proves the chunk.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, owner_subject, body, status, created_at, updated_at) VALUES ('t1', 'op@example.com', '{}', 'done', '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')",
+    ).run();
     const calendar = new MockCalendarProvider({
       events: [
         { id: "ext1", summary: "Client call", start: "2026-06-15T01:00:00Z", end: "2026-06-15T02:00:00Z", extendedProperties: {} },
+        { id: "mine1", summary: "Dentist", start: "2026-06-16T01:00:00Z", end: "2026-06-16T02:00:00Z", extendedProperties: {},
+          organizer: { email: "op@example.com", self: true } },
         { id: "own1", summary: "BAS prep", start: "2026-06-15T01:30:00Z", end: "2026-06-15T03:30:00Z",
           extendedProperties: { private: { [SCHEDULER_CHUNK_ID_KEY]: "t1#0" } } },
       ],
@@ -75,8 +83,56 @@ describe("runResolve externalEvents", () => {
     expect(res.kind).toBe("ok");
     if (res.kind !== "ok") return;
     expect(res.externalEvents).toEqual([
-      { id: "ext1", title: "Client call", start: "2026-06-15T01:00:00.000Z", end: "2026-06-15T02:00:00.000Z" },
+      // organizedBySelf drives the O9.6 API redaction; no organizer = not own.
+      { id: "ext1", title: "Client call", start: "2026-06-15T01:00:00.000Z", end: "2026-06-15T02:00:00.000Z", organizedBySelf: false },
+      { id: "mine1", title: "Dentist", start: "2026-06-16T01:00:00.000Z", end: "2026-06-16T02:00:00.000Z", organizedBySelf: true },
     ]);
+  });
+
+  it("another Optical deployment's chunk on the same calendar blocks as busy time; this deployment's own does not", async () => {
+    const captured: { external_pinned: { id: string; duration_minutes: number; start: string }[] }[] = [];
+    const ME = "https://optical-a.example.com";
+    const calendar = new MockCalendarProvider({
+      deploymentId: ME,
+      events: [
+        { id: "own1", summary: "BAS prep", start: "2026-06-15T01:00:00Z", end: "2026-06-15T02:00:00Z",
+          extendedProperties: { private: { [SCHEDULER_CHUNK_ID_KEY]: "t1#0", [OPTICAL_DEPLOYMENT_KEY]: ME } } },
+        { id: "foreign1", summary: "Trial work block", start: "2026-06-16T01:00:00Z", end: "2026-06-16T02:00:00Z",
+          extendedProperties: { private: { [SCHEDULER_CHUNK_ID_KEY]: "t9#0", [OPTICAL_DEPLOYMENT_KEY]: "https://optical-b.example.com" } } },
+      ],
+    });
+    await runResolve({
+      env: { ...env, SOLVER: capturingSolver(captured) },
+      calendar,
+      windowStart: "2026-06-14T14:00:00Z",
+      windowEnd: "2026-06-21T14:00:00Z",
+      accountEmail: "op@example.com",
+      trigger: "api",
+    });
+    expect(captured[0]!.external_pinned.map((b) => b.id)).toEqual(["foreign1"]);
+  });
+
+  it("an unstamped chunk whose task is not in this D1 is external busy time, not one of ours", async () => {
+    const captured: { external_pinned: { id: string; duration_minutes: number; start: string }[] }[] = [];
+    const calendar = new MockCalendarProvider({
+      events: [
+        { id: "orphan", summary: "Deleted task's block", start: "2026-06-16T01:00:00Z", end: "2026-06-16T02:00:00Z",
+          extendedProperties: { private: { [SCHEDULER_CHUNK_ID_KEY]: "gone-task#0" } } },
+      ],
+    });
+    const res = await runResolve({
+      env: { ...env, SOLVER: capturingSolver(captured) },
+      calendar,
+      windowStart: "2026-06-14T14:00:00Z",
+      windowEnd: "2026-06-21T14:00:00Z",
+      accountEmail: "op@example.com",
+      trigger: "api",
+    });
+    expect(captured[0]!.external_pinned.map((b) => b.id)).toEqual(["orphan"]);
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") return;
+    expect(res.priorEvents).toEqual([]);
+    expect(res.externalEvents.map((e) => e.id)).toEqual(["orphan"]);
   });
 
   const makeTentativeCal = () =>

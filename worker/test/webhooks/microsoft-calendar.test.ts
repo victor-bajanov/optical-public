@@ -409,6 +409,10 @@ describe("POST /v1/webhook/microsoft-calendar", () => {
     // lifecycle branch passes force:true rather than relying on a stale
     // expiry or a mismatched callback to coincidentally trigger the rotate path.
     const farFuture = new Date(Date.now() + 6 * 24 * 3600 * 1000).toISOString();
+    // The owner's stored grant: the rotate's channel write needs one.
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject) VALUES (?,?,?,?,?,?)",
+    ).bind("primary", new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "microsoft", "sub-primary").run();
     await env.DB.prepare(
       "INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url) VALUES ('primary', 'primary', 'tok', 'sub-1', 'right', ?, 'res-1', 'https://scheduler.test/v1/webhook/microsoft-calendar')",
     ).bind(farFuture).run();
@@ -456,6 +460,54 @@ describe("POST /v1/webhook/microsoft-calendar", () => {
     expect(res.status).toBe(202);
     expect(notifyChange).toHaveBeenCalledTimes(1);
     expect(notifyChange).toHaveBeenCalledWith("primary");
+    expect(cal.getSubscribeCallCount()).toBe(1);
+  });
+});
+
+// Card C (decision C, O14b #3): a lifecycle re-ensure is a Graph call with the
+// owner's grant, so it is skipped for a delisted-but-not-offboarded owner
+// while an allow-list is set — the same call the daily renewal skips for
+// them. (A change notification still reaches the coordinator, whose runner
+// skips the replan itself; see resolve-coordinator-delisted.test.ts.)
+describe("POST /v1/webhook/microsoft-calendar — delisted owner (card C)", () => {
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM calendar_sync").run();
+    const farFuture = new Date(Date.now() + 6 * 24 * 3600 * 1000).toISOString();
+    await env.DB.prepare(
+      "INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url) VALUES ('owner@org', 'primary', 'tok', 'sub-1', 'right', ?, 'res-1', 'https://scheduler.test/v1/webhook/microsoft-calendar')",
+    ).bind(farFuture).run();
+  });
+
+  async function postLifecycle(allowlist: string) {
+    const cal = new MockCalendarProvider();
+    const { namespace } = fakeCoordinator();
+    const res = await makeApp(cal).request(
+      "/v1/webhook/microsoft-calendar",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          value: [{ subscriptionId: "sub-1", lifecycleEvent: "reauthorizationRequired", clientState: "right" }],
+        }),
+      },
+      { ...env, RESOLVE_COORDINATOR: namespace, MEMBERSHIP_ALLOWLIST: allowlist, OPERATOR_EMAIL: "" },
+    );
+    return { res, cal };
+  }
+
+  it("does not re-ensure a delisted owner's subscription", async () => {
+    const info = vi.spyOn(console, "info");
+    const { res, cal } = await postLifecycle("someone-else@org");
+    expect(res.status).toBe(202);
+    expect(cal.getSubscribeCallCount()).toBe(0);
+    expect((await getCalendarSync(env.DB, "owner@org", "primary"))?.channel_id).toBe("sub-1");
+    expect(info).toHaveBeenCalledWith("delisted_skip", { path: "ms_lifecycle_reensure" });
+    info.mockRestore();
+  });
+
+  it("still re-ensures a listed owner's subscription", async () => {
+    const { res, cal } = await postLifecycle("owner@org");
+    expect(res.status).toBe(202);
     expect(cal.getSubscribeCallCount()).toBe(1);
   });
 });

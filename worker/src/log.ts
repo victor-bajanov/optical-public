@@ -7,8 +7,9 @@ import type { Env } from "./env";
  * flow in Workers Observability, then turn it back off. The payload is
  * JSON-stringified INTO the message string on purpose: observability reliably
  * captures `console.*` message text, but the structured second argument was
- * observed NOT to survive logfwd (the `resolve_window_shed` `{excluded_past,
- * kept}` object never appeared in queries) — embedding it in the message is what
+ * observed NOT to survive logfwd (the `resolve_window_shed` `{window_start,
+ * excluded_past, excluded_future, excluded_unclaimed, kept}` object never
+ * appeared in queries) — embedding it in the message is what
  * makes it queryable. Prefix `dbg_` keeps these greppable and distinct from the
  * permanent `resolve_*` event lines.
  */

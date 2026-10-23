@@ -4,9 +4,9 @@
 # dependencies = ["httpx>=0.27", "tzdata>=2024.1"]
 # ///
 """Live smoke for the user-settable timezone (internal design notes,
-Card D). Runs against dev or ms with either provider's bearer; nothing here
-is provider-specific (the resolves land on whichever calendar the bearer
-belongs to, and only ever propose — no calendar writes).
+Card D). Runs against any non-prod env with either provider's bearer;
+nothing here is provider-specific (the resolves land on whichever calendar
+the bearer belongs to, and only ever propose — no calendar writes).
 
 Structured like bin/config-smoke.py: PEP 723 + uv, _smoke_lib's bearer
 client, secrets injected externally (never `op` inside this script):

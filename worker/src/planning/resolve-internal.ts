@@ -6,7 +6,7 @@ import { getCalendarSync, upsertCalendarSync, PRIMARY_CALENDAR_ID } from "../db/
 import { buildSolverProblem, realDurationsByChunkId } from "./build-problem";
 import { computePlacementFloor, isWeekFullyPast } from "./datetime";
 import { debugLog } from "../log";
-import { taskBelongsInWindow } from "./task-window";
+import { taskBelongsInWindow, taskWindowVerdict } from "./task-window";
 import type { SolverWeights, ContextConfig } from "./build-problem";
 import { parseSolution, parseUnsatCore } from "./parse-solution";
 import type { ParsedSolution } from "./parse-solution";
@@ -32,11 +32,12 @@ import type { Task } from "../types/task";
 import type { ObjectiveComponents, Problem, Solution, UnsatResponse } from "./solver-contract";
 import type { ScheduleEntry } from "../diff/compute-diff";
 import { SCHEDULER_CHUNK_ID_KEY } from "../providers/types";
+import { externaliseUnprovenChunks } from "./scheduler-chunks";
 import type { CalendarEvent } from "../providers/types";
 import { readMeetingConfig } from "../meetings/config";
 import { syncOwnedMeetings } from "../meetings/sync";
 import { computeAvailabilityWindows } from "../meetings/availability";
-import { attendeeCountForChurn, constrainingAttendeeEmails, MEETING_SOURCE_KIND } from "../meetings/identify";
+import { attendeeCountForChurn, constrainingAttendeeEmails, isOwnedMovableMeeting, MEETING_SOURCE_KIND } from "../meetings/identify";
 import type { AttendeeEnforcement } from "../meetings/identify";
 import { stampMovableVerdicts } from "../meetings/movable-verdict";
 import type { MovableVerdict, MovableVerdictReason } from "../meetings/movable-verdict";
@@ -844,7 +845,10 @@ export interface ResolveBody {
   warnings?: string[];
 }
 
-export interface ExternalEvent { id: string; title: string; start: string; end: string }
+// organizedBySelf: the provider says the signed-in user organises this event
+// (Google organizer.self / Graph isOrganizer). Optional so hand-built test
+// events still type-check; absent is treated as someone else's (O9.6).
+export interface ExternalEvent { id: string; title: string; start: string; end: string; organizedBySelf?: boolean }
 
 export type ResolveResult =
   // meetingTaskIds: task ids of the owned-meeting rows (source.kind ===
@@ -873,6 +877,10 @@ async function loadPendingTasks(
   windowEndMs: number,
   // The "now" window membership is judged at (ResolveArgs.upcomingWeek).
   membershipNowMs: number,
+  // Whether this load emits the resolve_window_shed line. runResolve loads
+  // twice when owned meetings are on and only the later load logs, so a
+  // resolve emits exactly one line.
+  opts: { logShed: boolean },
 ): Promise<Task[]> {
   if (!ownerSubject) throw new Error("owner_scope_missing");
   // id, created_at, updated_at, template_id, scheduled_for live in columns;
@@ -910,8 +918,9 @@ async function loadPendingTasks(
   // shed task is excluded from the solver input only — its status and DB row
   // are untouched, so it still appears in GET /v1/tasks. See
   // internal design notes.
-  const kept = rows.filter(({ task, template_id, scheduled_for }) =>
-    taskBelongsInWindow(
+  const counts = { past: 0, future: 0, unclaimed: 0 };
+  const kept = rows.filter(({ task, template_id, scheduled_for }) => {
+    const verdict = taskWindowVerdict(
       {
         pinned_at: task.pinned_at,
         scheduled_for,
@@ -922,16 +931,30 @@ async function loadPendingTasks(
       windowStartMs,
       windowEndMs,
       membershipNowMs,
-    ),
-  );
-
-  // One observability line per resolve. This counts PAST tasks excluded from
-  // the window (window-relative shedding), NOT solver drop-exploration.
-  // Non-dotted event name so Cloudflare logfwd does not mangle the fingerprint.
-  console.info("resolve_window_shed", {
-    excluded_past: rows.length - kept.length,
-    kept: kept.length,
+    );
+    if (verdict === "in") return true;
+    counts[verdict] += 1;
+    return false;
   });
+
+  // One observability line per resolve (opts.logShed), counting the tasks
+  // window-relative shedding excluded, by reason — NOT solver drop-exploration.
+  // past + future + unclaimed + kept === rows considered. window_start tells
+  // apart the per-week lines of a multi-week webhook replan. `kept` is the
+  // tasks that passed the window filter in THIS (logged) load, not the exact
+  // solved-task count: with owned meetings on it comes from the meeting reload,
+  // so a meeting row cancelled by syncOwnedMeetings (still in the initial
+  // load) and tasks revived by chunk reconciliation aren't reflected. Non-dotted event
+  // name so Cloudflare logfwd does not mangle the fingerprint.
+  if (opts.logShed) {
+    console.info("resolve_window_shed", {
+      window_start: new Date(windowStartMs).toISOString(),
+      excluded_past: counts.past,
+      excluded_future: counts.future,
+      excluded_unclaimed: counts.unclaimed,
+      kept: kept.length,
+    });
+  }
 
   return kept.map(({ task }) => task);
 }
@@ -1139,7 +1162,7 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
       db,
       env,
       ownerSubject,
-      pastRead.events,
+      await externaliseUnprovenChunks(db, ownerSubject, pastRead.events),
       Date.parse(windowStart),
       Date.parse(windowEnd),
       calendar.defaultDoneColorId ?? env.DONE_COLOR_ID ?? "",
@@ -1171,10 +1194,15 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
   // upcoming week counts as started even when it begins after fire time
   // (ResolveArgs.upcomingWeek). Placement is still floored separately.
   const membershipNowMs = args.upcomingWeek ? Math.max(Date.now(), windowStartMs) : Date.now();
+  // Pure env read, hoisted so the initial task load knows whether a meeting
+  // reload follows (and owns the resolve_window_shed line).
+  const meetingConfig = readMeetingConfig(env);
   const [weights, contexts, tasks, businessHours] = await Promise.all([
     loadWeights(db, ownerSubject),
     loadContexts(db, ownerSubject),
-    loadPendingTasks(db, ownerSubject, windowStartMs, windowEndMs, membershipNowMs),
+    loadPendingTasks(db, ownerSubject, windowStartMs, windowEndMs, membershipNowMs, {
+      logShed: !meetingConfig.enabled,
+    }),
     loadBusinessHours(db, ownerSubject),
   ]);
 
@@ -1183,6 +1211,10 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
   if (calRead.nextSyncToken && calRead.nextSyncToken !== sync?.next_sync_token) {
     await upsertCalendarSync(db, ownerSubject, PRIMARY_CALENDAR_ID, { next_sync_token: calRead.nextSyncToken });
   }
+  // A legacy (unstamped) chunk whose task isn't in this D1 — a task deleted
+  // mid-week, or another deployment's pre-stamp block — is ordinary busy
+  // time from here on, like a foreign-stamped chunk (externaliseUnprovenChunks).
+  const calEvents = await externaliseUnprovenChunks(db, ownerSubject, calRead.events);
 
   // --- Owned movable meetings (feature-gated) -------------------------------
   // syncOwnedMeetings mirrors owned movable meetings in the fetched window into
@@ -1190,8 +1222,8 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
   // already ran BEFORE the calendar fetch, so any rows the sweep just created are
   // not in `tasks` yet — re-load the meeting rows and stage them in
   // `extraMeetingRows` to merge into candidateTasks below. Solver inputs +
-  // diff-baseline are computed after solverTasks is known.
-  const meetingConfig = readMeetingConfig(env);
+  // diff-baseline are computed after solverTasks is known. (meetingConfig is
+  // read above, before the initial task load.)
   const meetingInputs: MeetingSolverInput[] = [];
   const meetingWarnings: string[] = [];
   // Meeting diff-baseline entries (current calendar position), keyed like a chunk
@@ -1204,14 +1236,17 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
       db,
       calendar,
       ownerSubject,
-      calRead.events,
+      calEvents,
       windowStartMs,
       windowEndMs,
       { churnMultiplierCap: meetingConfig.churnMultiplierCap },
     );
     // Re-load pending tasks to pick up meeting rows the sweep just created, and
     // keep only the meeting rows not already loaded into `tasks`.
-    const reloaded = await loadPendingTasks(db, ownerSubject, windowStartMs, windowEndMs, membershipNowMs);
+    // This later, more complete load owns the resolve_window_shed line.
+    const reloaded = await loadPendingTasks(db, ownerSubject, windowStartMs, windowEndMs, membershipNowMs, {
+      logShed: true,
+    });
     const haveIds = new Set(tasks.map((t) => t.id));
     extraMeetingRows = reloaded.filter(
       (t) => t.source?.kind === MEETING_SOURCE_KIND && !haveIds.has(t.id),
@@ -1220,7 +1255,7 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
 
   // The scheduler-owned events already on the calendar in this window are the
   // committed truth. They — not a global stored plan — are the diff baseline.
-  const priorEvents: ScheduleEntry[] = calRead.events
+  const priorEvents: ScheduleEntry[] = calEvents
     .filter((e) => e.extendedProperties?.private?.[SCHEDULER_CHUNK_ID_KEY])
     .map((e) => {
       const chunkId = e.extendedProperties!.private![SCHEDULER_CHUNK_ID_KEY]!;
@@ -1240,13 +1275,14 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
       };
     });
 
-  let externalEvents: ExternalEvent[] = calRead.events
+  let externalEvents: ExternalEvent[] = calEvents
     .filter((e) => !e.extendedProperties?.private?.[SCHEDULER_CHUNK_ID_KEY])
     .map((e) => ({
       id: e.id,
       title: e.summary,
       start: new Date(e.start).toISOString(),
       end: new Date(e.end).toISOString(),
+      organizedBySelf: e.organizer?.self === true,
     }));
 
   // Per-chunk completion reconcile (the SINGLE home for record + revive +
@@ -1258,7 +1294,7 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
     db,
     env,
     ownerSubject,
-    calRead.events,
+    calEvents,
     windowStartMs,
     windowEndMs,
     calendar.defaultDoneColorId ?? env.DONE_COLOR_ID ?? "",
@@ -1322,7 +1358,7 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
   // no MeetingSolverInput their event stays in external_pinned as a busy block.
   if (meetingConfig.enabled) {
     const meetingTasks = solverTasks.filter((t) => t.source?.kind === MEETING_SOURCE_KIND);
-    const eventById = new Map(calRead.events.map((e) => [e.id, e]));
+    const eventById = new Map(calEvents.map((e) => [e.id, e]));
     const nowMs = Date.now();
     const userMeetingPolicy = await loadMeetingPolicy(db, ownerSubject);
 
@@ -1359,6 +1395,18 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
       const event = task.source?.external_id ? eventById.get(task.source.external_id) : undefined;
       if (event == null) {
         freeze(task.id, "event_missing");
+        continue;
+      }
+      // Defence in depth (O9.5): a meeting-kind row is promoted only when its
+      // live event is one the meetings sync would itself import. The /v1 task
+      // routes refuse a client-written meeting source, but a row that reached D1
+      // another way (written before that guard, or whose event has since
+      // changed) must never make a poll-booked event, someone else's meeting or
+      // an attendee-less event movable. Logged permanently, without PII: the row
+      // id is enough to find it, and the freeze is otherwise silent.
+      if (!isOwnedMovableMeeting(event)) {
+        freeze(task.id, "not_owned_movable");
+        console.warn(`meeting_promotion_refused ${JSON.stringify({ task_id: task.id, reason: "not_owned_movable" })}`);
         continue;
       }
       // Both tests are the exact negation of the keep-predicates they replace,
@@ -1522,7 +1570,7 @@ export async function runResolve(args: ResolveArgs): Promise<ResolveResult> {
   const problem = buildSolverProblem({
     tasks: solverTasksForProblem,
     completedChunkIds,
-    externalEvents: calRead.events,
+    externalEvents: calEvents,
     previousSchedule,
     window: { start: windowStart, end: windowEnd },
     placementFloor,

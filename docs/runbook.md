@@ -15,9 +15,11 @@ route). All other `/admin/*` routes accept the bearer alone; a CF_Authorization
 cookie is not required and not checked.
 
 **Privileged OAuth scopes:**
-- `calendar:raw-token` — mint a raw Google access token via
+- `calendar:raw-token` — mint a raw upstream access token (Google or
+  Microsoft, whichever provider the subject signed in with) via
   `GET /v1/calendar-access-token`. Restricted to clients whose
-  `oauth_clients.allowed_scopes` lists this scope.
+  `oauth_clients.allowed_scopes` lists this scope; it is not role-gated, so
+  every user who signs in through such a client can mint one.
 - `admin` — reach cross-user `/admin/*` operations. Requires the subject to
   carry `role='admin'` in the `users` table; the `/auth/callback` handler
   narrows the granted scopes to `admin` only for subjects with that role.
@@ -147,11 +149,25 @@ letters.
    ```
    (Generates `TOKEN_HASH_PEPPER` and `WEBHOOK_CHANNEL_TOKEN`, pushes Google client secret. Idempotent.)
 
+   **Non-prod env (`--env <name>`):** run
+   `op run --env-file=<f> -- ./bin/bootstrap-secrets.sh --env <name>`. In this
+   mode every secret comes from an env var of the same name: nothing is
+   generated and nothing is prompted for, and a missing or empty var fails the
+   run before any `secret put`. Already-set secrets are skipped. Each env has a
+   fixed secret set in the script, and an env without one is refused. The run
+   fails closed if `wrangler secret list --env <name>` fails, so if the Worker
+   doesn't exist yet, deploy it first (step 4) and re-run. There is no
+   `--env prod`: prod is the top-level config, reached by omitting the flag.
+
 4. **Deploy:**
    ```bash
-   ./bin/deploy.sh
+   ./bin/deploy.sh                 # prod (top-level config)
+   ./bin/deploy.sh --env <name>    # an [env.<name>] block
    ```
-   Applies D1 migrations, deploys the Worker, tails logs for 30s.
+   Applies D1 migrations, then deploys the Worker. With `--env`, every wrangler
+   call carries `--env <name>` and the migration uses the binding form
+   (`d1 migrations apply DB --env <name>`), because a non-prod D1 only exists
+   under its `[env.<name>]` block. `--env prod` is refused.
 
    **Solver deployment is out of scope of this runbook.** See
    `worker/docs/plan-d-deploy.md` for the existing notes; the Worker assumes
@@ -184,6 +200,10 @@ letters.
    ```
    - Opens the browser and federates to Google. **Log in as an account listed in
      `OPERATOR_EMAIL`** — for a sandbox run, the Test User you added in Step A.3.
+   - A refused sign-in (not on `MEMBERSHIP_ALLOWLIST` / `OPERATOR_EMAIL`) shows an
+     "Invitation only" page in the browser and never redirects back, so the script's
+     localhost listener gives up after `--callback-timeout` seconds (default 300) and
+     prints a hint naming that page (Diagnostics).
    - On success the worker persists *that account's* Google refresh token in the
      `identity_tokens` table (encrypted with `TOKEN_HASH_PEPPER`) — this is what
      connects Calendar + Gmail — and the script prints `export` lines for
@@ -197,13 +217,20 @@ letters.
      above, the bearer will carry `scheduler:read scheduler:write calendar:raw-token
      admin`.
 
-7. **Subscribe to Google push notifications** (after Step B.6 connects Google):
+7. **Subscribe to Google push notifications** (optional: Step B.6 already did it).
+   Every successful sign-in ensures a push channel for that user in the
+   background (`webhooks/sign-in-subscribe.ts`, after the redirect), and the daily
+   renewal sweep creates one for any active grant holder still without one (see
+   "Automatic channel renewal"). Check for a `sign_in_subscribe
+   {provider, subscribed}` log line, or a `calendar_sync` row with a `channel_id`.
+   To subscribe by hand (idempotent; a fresh channel is left alone),
    `/admin/webhook/subscribe` is bearer-gated — supply the bearer from Step B.6:
    ```bash
    curl -X POST https://<subdomain>.<zone>/admin/webhook/subscribe \
      -H "authorization: Bearer $SCHEDULER_BEARER"
    ```
-   Expect `{"ok":true,"subscribed":true}`. A `calendar_sync` row with a `channel_id` is written.
+   Expect `{"ok":true,"subscribed":true}` the first time, `"subscribed":false` once
+   a fresh channel exists. A `calendar_sync` row with a `channel_id` is written.
 
 ## C. Smoke test (~5 min, proves the path works)
 
@@ -307,6 +334,13 @@ export EXPECTED_TEST_ACCOUNT=<the outlook.com account>
 export SMOKE_WRANGLER_ENV=dev   # the default; set explicitly to clear a stale value
 op run --env-file=.env -- bin/regression-smoke.py --provider microsoft >/tmp/microsoft-regsmoke.log 2>&1
 ```
+
+L7 checks the chunks it commits carry the target's deployment stamp (its
+`OAUTH_ISSUER` origin; an unstamped chunk from a pre-stamp deployment passes).
+A custom-domain `SCHEDULER_URL` is the issuer itself; for a `*.workers.dev`
+URL the harness looks the issuer host up in `bin/_env_hosts.py` by
+`SMOKE_WRANGLER_ENV`, so set that to the env you target (and the check is
+skipped for an env not listed there).
 
 Expect the owned-meetings level to report the degrade-to-immovable notice
 on a personal (outlook.com) account: Graph `getSchedule` is not available
@@ -420,14 +454,100 @@ a renewal sweep (`cron/renew-subscriptions.ts`): for every `calendar_sync` row
 that has a `channel_id`, it calls `ensureSubscription`, which re-subscribes when
 `channel_expires_at` is within **48 hours** (and is a cheap no-op otherwise). The
 48h threshold against a 24h cadence means two consecutive cron failures are
-needed before a channel can lapse. Rows without a `channel_id` are skipped — the
-sweep keeps existing subscriptions alive but never creates first-time ones;
-initial subscription remains an explicit caller-scoped
-`POST /admin/webhook/subscribe`.
+needed before a channel can lapse.
 
-Each sweep logs a `subscription_renewal` summary (`{checked, renewed, failed}`)
-plus a `subscription-renewal failed` line per failing owner; filter for these in
-Workers Observability to confirm the sweep is running.
+**First channels.** A user gets their first channel at sign-in: once
+`/auth/callback` has stored the grant, narrowed the client's scopes and written
+the authorization code (the sign-in has succeeded), it runs `ensureSubscription`
+for that subject on their provider, in `waitUntil` so the redirect never waits
+on it. It is best-effort and logs one line, `sign_in_subscribe {provider,
+subscribed}` or `sign_in_subscribe_failed {provider, error}` (no subject in
+either; `error` is redacted and capped as described below). A refused sign-in
+(not invited, partial grant, account bound, `invalid_scope`, `server_error`)
+never subscribes. A client asking for a scope outside its `allowed_scopes` is
+refused with `invalid_scope` before the IdP exchange, so nothing is stored for
+it either (no grant, no `users` row) and the create pass below has nothing to
+subscribe. A repeat sign-in with a fresh channel is a single D1 read. The same sweep is the backstop:
+after renewing, it **creates** a channel for every active user (`users.is_active
+= 1`) who holds a stored grant (`identity_tokens`) but has no channel — no
+`calendar_sync` row, or one with a NULL `channel_id` (sync-token only, or nulled
+by a provider switch). So a failed sign-in subscribe self-heals within a day.
+Delisted users are skipped in both passes (`delisted_skip
+{path:"subscription_renewal"}`), and a grant whose provider is switched off (the
+Microsoft kill switch) is skipped in the create pass rather than counted as a
+failure. `POST /admin/webhook/subscribe` and `subscribeWebhook` still work, and
+are idempotent.
+
+Each sweep logs a `subscription_renewal` summary (`{checked, renewed, created,
+create_failed, failed}`; `checked` counts both passes, `failed` is renew failures
+only, `create_failed` create failures) plus a `subscription-renewal failed` or
+`subscription-create failed` line per failing owner; filter for these in Workers
+Observability to confirm the sweep is running. A grant holder who revoked
+Optical's access at Google but was never offboarded shows up as a daily
+`subscription-create failed` (and `create_failed` ≥ 1): offboard them.
+
+The per-owner lines are `{subject, error}`, but `subject` is never the address:
+it is a keyed pseudonym, `subj:` + hex HMAC-SHA256 of `log-pseudonym:<subject>`
+under the deployment's hashing key (`HASHING_KEY`, or `TOKEN_HASH_PEPPER` when
+that is unset; `worker/src/util/log-redact.ts`). It is stable, so one owner's
+lines group together, and distinct from the `deleted:` audit pseudonym (a
+different label). `error` is the error text with every occurrence of the
+subject (any case) replaced by the same pseudonym and every whitespace run
+collapsed to one space (so a pretty-printed provider JSON body keeps its
+reason), capped at 200 characters; `sign_in_subscribe_failed`'s `error` is
+redacted the same way. To find a known user's lines, recompute it for the subject exactly
+as stored in `users.subject`, with the key from your secret store. Read the key
+with `read -rs` and pass it through the environment, never on a command line:
+
+```bash
+read -rs KEY; export KEY
+python3 -c 'import hashlib, hmac, os, sys; print("subj:" + hmac.new(os.environ["KEY"].encode(), ("log-pseudonym:" + sys.argv[1]).encode(), hashlib.sha256).hexdigest())' 'user@example.com'
+unset KEY
+```
+
+A deployment with no hashing key logs `subj:unavailable`.
+
+**Before deploying the create pass to an existing deployment.** The first daily
+sweep after the deploy creates a push channel for **every** active grant holder
+who has none, not only new sign-ins. A channel on a calendar that is also
+connected to another deployment makes this one replan on that calendar's
+changes (§I, "Still: connect one calendar to one deployment"). So before
+deploying, list that deployment's active grant holders with no channel (the
+same query as `listGrantHoldersWithoutChannel` in
+`worker/src/db/calendar-sync.ts`):
+
+```bash
+op run --env-file=../.env -- npx wrangler d1 execute DB --env <env> --remote --command \
+  "SELECT it.account_email, it.provider FROM identity_tokens it
+   JOIN users u ON u.subject = it.account_email AND u.is_active = 1
+   LEFT JOIN calendar_sync cs ON cs.owner_subject = it.account_email AND cs.calendar_id = 'primary'
+   WHERE cs.channel_id IS NULL ORDER BY it.account_email"
+```
+
+Pass the same `--env` as that deployment's other wrangler commands (none for
+the top-level deployment). Offboard (`bin/optical-admin.py offboard`) any
+listed account whose calendar is connected to another deployment, then deploy.
+
+Two writers can race to create or rotate the same owner's channel (a sign-in
+against the sweep, two quick sign-ins). `ensureSubscription` writes the new
+channel compare-and-set on the `channel_id` it read, so only the first write
+lands; the loser stops the channel it just made and logs `ensureSubscription:
+lost a concurrent write, stopping own channel {channelId}`. Seeing it
+occasionally is expected. A write for a subject with no stored grant (no
+`identity_tokens` row) is refused the same way and logs the same line. That
+covers an account offboarded while a sign-in subscribe or a sweep pass was in
+flight (any deployment with `RETENTION_DAYS` set runs the retention offboard
+in the same daily cron as renewal), so no
+`calendar_sync` row comes back for a gone subject. A Microsoft in-place renew
+that finds its channel no longer stored (offboarded, or replaced by a
+concurrent rotation) writes nothing and logs `ensureSubscription: renewed
+channel no longer stored, stopping it {channelId}`. Either way the orphaned
+channel is stopped best-effort. If the stop fails, the channel simply expires.
+Until then, its pushes get `404 unknown_channel` on Google, while the
+Microsoft webhook answers `202` and drops them. One gap remains: a channel
+write that lands after an offboard stopped the old channel, but before its
+batch delete, leaves the new channel live until it expires (the row itself is
+still deleted).
 
 Dev runs the same daily cleanup/renewal cron (its only cron — Monday resolves
 stay manual there). For an immediate out-of-band renewal in either env, use the
@@ -438,9 +558,12 @@ curl -X POST https://<subdomain>.<zone>/admin/renew-subscriptions \
   -H "authorization: Bearer $SCHEDULER_BEARER"
 ```
 
-Expect `200 {"ok":true,"checked":N,"renewed":M,"failed":0}` (HTTP 500 with the
-same shape if any owner failed). Unlike `/admin/webhook/subscribe` this is not
-caller-scoped — one call renews every subscribed owner.
+Expect `200 {"ok":true,"checked":N,"renewed":M,"created":C,"create_failed":0,"failed":0}`
+(HTTP 500 with the same shape if any renewal failed). Create failures alone stay
+`200` with `ok:true` and show only in `create_failed`, so one dead grant never
+fails the sweep (or `bin/multiuser-smoke.py` M8). Unlike `/admin/webhook/subscribe`
+this is not caller-scoped — one call renews every subscribed owner and creates
+every missing channel.
 
 **Cookie-free alternative** (no Access JWT needed — only the wrangler API
 token): a remote preview session runs the real cron dispatch against the real
@@ -464,8 +587,7 @@ proves end-to-end delivery.
 
 ### Clearing a stale push channel
 
-A push channel becomes stale if the worker was redeployed with a new
-`WEBHOOK_CHANNEL_TOKEN` secret, or if the Google subscription lapsed and
+A push channel becomes stale if the Google subscription lapsed and
 `/admin/webhook/subscribe` was called again without stopping the old one first.
 To clear a stale channel immediately without waiting for Google's 7-day expiry:
 
@@ -687,9 +809,30 @@ Shedding is stateless and read-time: it never changes a task's status and never
 deletes anything. Shed tasks still appear in `GET /v1/tasks`. To pull a slipped
 task into a current or future week, **PATCH any timing field** (e.g. set
 `earliest_start` to the target week) — that clears the placement stamp so the
-task re-enters the backlog. Each resolve emits one `console.info`
+task re-enters the backlog. Each resolve emits exactly one `console.info`
 entry — message `resolve_window_shed` with a structured payload
-`{ excluded_past: N, kept: M }` — visible via `wrangler tail` or Workers observability.
+`{ window_start, excluded_past, excluded_future, excluded_unclaimed, kept }` —
+visible via `wrangler tail` or Workers observability. The four counts sum to the
+tasks considered (`taskWindowVerdict` in `worker/src/planning/task-window.ts`):
+
+- `excluded_past`: the task's anchor is before the window, or it has no anchor
+  and a deadline before the window (overdue).
+- `excluded_future`: an `earliest_start` floor at or after the window end, or an
+  anchor at or after it.
+- `excluded_unclaimed`: live backlog (no anchor, no deadline) that a
+  not-yet-started week doesn't capture (the 2026-08-12 rule above). It is
+  neither past nor future; it belongs to the running week.
+- `kept`: the tasks that passed the window filter in the logged load (with
+  owned meetings on, the reload after the meeting sync, so newly imported
+  meeting rows are included). It isn't the exact solved-task count: a meeting
+  row the sync cancels and tasks revived by chunk reconciliation aren't
+  reflected.
+
+A multi-week webhook replan resolves each affected week, so it emits one line
+per week, told apart by `window_start` (ISO). Before 2026-10-16 `excluded_past`
+counted all three exclusion reasons (so a future-week resolve reported nearly
+the whole backlog as "past"), the line had no `window_start`, and a resolve with
+owned meetings on emitted two lines (one per task load).
 Grep for the `resolve_window_shed` message (non-dotted so Cloudflare logfwd does not
 mangle the fingerprint); the counts live in the payload, not concatenated into the
 message string.
@@ -1229,24 +1372,46 @@ The effect: a task that was pinned or placed on Monday is still selected and sol
 
 **Fully-past-week guard.** If `windowEnd <= now` (the entire week has elapsed), the resolve is skipped before any DB load or solver call. The callers — webhook replan and Monday cron — can reach a past week via a late-delivered push notification or a cron firing near midnight. Without the guard, `ceilToQuarter(now)` would exceed `windowEnd` and every task would be mass-dropped. The guard returns an empty plan that produces an empty diff, so callers naturally no-op without emitting an email or writing to `proposed_plans`. Current and future weeks (`windowEnd > now`) are unaffected.
 
-The observability log event `resolve_window_shed` (emitted once per resolve, visible via `wrangler tail`) reports `excluded_past` (tasks shed from the window by the window-relative shedding filter, not by the placement floor) and `kept`. The placement floor itself is not separately logged but is derivable from `ceilToQuarter(now)` at resolve time.
+The observability log event `resolve_window_shed` (emitted once per resolve, visible via `wrangler tail`) reports the tasks shed from the window by the window-relative shedding filter (not by the placement floor), split by reason — `excluded_past`, `excluded_future`, `excluded_unclaimed` — plus `kept` and the window's `window_start` (§F). The placement floor itself is not separately logged but is derivable from `ceilToQuarter(now)` at resolve time.
+
+### Which deployment owns an event (`optical_deployment`)
+
+Each Optical deployment (prod, dev, and any other env) is a separate worker with its own D1, but nothing stops one Google or Outlook calendar from being connected to two of them. Chunk identity (`scheduler_chunk_id`) carries no deployment, so before this stamp every deployment treated every chunk on the calendar as its own, and one deployment's commit could delete another's work blocks.
+
+Every event a deployment creates (task chunks, booking-page bookings, poll bookings) now also carries the private extended property `optical_deployment` = the **origin of that deployment's `OAUTH_ISSUER`** (e.g. `https://scheduler.example.com`; trailing slash, path and host case don't matter). No new var: the derivation is `deploymentIdFromEnv` in `worker/src/providers/deployment-scope.ts`. Outlook stores it as a `singleValueExtendedProperty` in the same GUID namespace as the chunk id, and every Graph read expands it.
+
+The rule lives at the provider boundary, so every path sees the same thing. On every read (window fetch, incremental sync, single-event get, both providers), an event stamped by a **different** deployment loses its `scheduler_chunk_id` and `optical_booking` tags. It then reads as ordinary busy time like any other external event: commit never moves, deletes or relocates it as a stray, the done-by-colour scans and the webhook pinhole never count it, recolour never touches it, the offboard sweep leaves it, and the solver avoids its slot. A change to it is an external change, so it triggers a replan in the other deployment like any calendar edit. `optical_poll_id` is **not** stripped: its only reader keeps a poll-booked meeting out of owned-meeting import, which must hold for every deployment. `optical_meeting_task_id` is not scoped either, since it marks the user's own meeting and import is keyed on the D1 row.
+
+**Legacy events.** An event with the chunk tag and no stamp (everything created before this change) needs proof before a deployment treats it as its own: its task id must be a `tasks` row of this deployment's D1 for that subject (task UUIDs never collide across deployments). A **proven** legacy chunk (the normal case for a deployment's own pre-stamp chunks) behaves exactly as before, so existing plans don't orphan. An **unproven** one (another deployment's pre-stamp block, or the leftover of a task deleted mid-week, since `DELETE /v1/tasks/{id}` only clears chunks from now on) is ordinary busy time: resolve drops its chunk tag on read (`externaliseUnprovenChunks`), so the solver avoids its slot and it never enters the diff baseline, the churn fallback or the done scans, and commit's delete loop and the offboard sweep leave it (`deletableChunks`; both in `worker/src/planning/scheduler-chunks.ts`). The webhook applies the same rule to every changed event before its scheduler-owned filter, so dragging an unproven chunk is an ordinary external change that replans its week; dragging a proven one is still a manual move, written back with no replan. Deleting either, like deleting any event, triggers no replan. A stamped chunk of this deployment needs no proof and is deleted as before, task row or not. The cost: an unproven leftover is never cleaned up automatically, so remove it by hand if it matters (a past-day one doesn't). Commit also stamps a legacy chunk the first time it reconciles it **as part of its own plan** (the task is in its plan, so the chunk is provably its own). The PATCH sends the event's whole private map plus the stamp, and rides along with a move when there is one. Proven legacy chunks that no commit reconciles again (past weeks, abandoned tasks) stay unstamped.
+
+**Changing `OAUTH_ISSUER`.** Its origin is a durable identity, not only a URL. Move a deployment to a new domain and every event it stamped under the old origin reads as another deployment's: the next commit mints duplicates beside the old chunks (which it can no longer move or delete), the done scans stop seeing them, and booking decline auto-cancel stops recognising its bookings. Before changing it, either keep stamping the old origin (serve the new domain as well, but leave `OAUTH_ISSUER` on the old one until the old chunks have aged out), or re-stamp: rewrite `extendedProperties.private.optical_deployment` (Outlook: the `optical_deployment` named property in the Optical GUID namespace) on the account's future chunk and booking events to the new origin, then deploy. Every `OAUTH_ISSUER` line in `worker/wrangler.toml` carries this warning.
+
+**Still: connect one calendar to one deployment.** The stamp stops one deployment destroying another's work blocks, but two deployments on one calendar still each see the other's blocks as busy time, both replan on every change, and both email plans. An owned meeting can be imported and moved by both. Use a separate test account per deployment.
 
 ## Diagnostics
 
 | Symptom | Likely cause | First check |
 |---|---|---|
 | 401 on `/v1/...` | Bearer missing/expired | The smoke harness auto-refreshes from `SCHEDULER_REFRESH_TOKEN` (sends `client_id`, default `smoke-cli`, overridable via `SCHEDULER_CLIENT_ID`, and adopts the rotated refresh token). If refresh also fails, re-mint via `./bin/mint-token.py` (Step B.6) |
-| 400 from `/oauth/token` during smoke | Refresh rejected: missing/mismatched `client_id`, or the refresh token was already rotated/revoked (provider rotates on every refresh) or expired (90-day TTL) | Ensure `SCHEDULER_CLIENT_ID` matches the mint client; if the stored refresh token was consumed by an earlier run, re-mint via `./bin/mint-token.py` and update `SCHEDULER_BEARER`/`SCHEDULER_REFRESH_TOKEN` |
-| `access_denied` on the `/auth/callback` redirect | The Google account you logged in as isn't in the `OPERATOR_EMAIL` allowlist | Add it (comma-separated) to `[vars].OPERATOR_EMAIL` and redeploy |
+| 400 from `/oauth/token` during smoke | Refresh rejected: missing/mismatched `client_id`, or the refresh token was already rotated/revoked (provider rotates on every refresh) or expired (90-day TTL) | Ensure `SCHEDULER_CLIENT_ID` matches the mint client; if the stored refresh token was consumed by an earlier run, re-mint via `./bin/mint-token.py` and update `SCHEDULER_BEARER`/`SCHEDULER_REFRESH_TOKEN`. Workers logs carry `oauth_refresh_refused {reason, client_id}` for every refused refresh. See §S "Single-use refresh rotation" for the reasons |
+| Browser shows "Invitation only" (403) after the IdP consent; `mint-token.py` ends with "No callback received within 300s" | The membership gate refused the account you logged in as: it matches neither `MEMBERSHIP_ALLOWLIST` nor `OPERATOR_EMAIL` (with an allow-list set, an existing active `users` row no longer admits; see Plan 4 cutover §1). The worker revokes the upstream grant it was just handed (only when `UPSTREAM_REVOKE_ENABLED="true"`), stores nothing and does not redirect back to the client | Add it (comma-separated) to `[vars].MEMBERSHIP_ALLOWLIST` (or `OPERATOR_EMAIL` for an admin) and redeploy |
+| `400 invalid_grant` `"not a member"` from `/oauth/token` on a refresh (log `oauth_refresh_refused`) | An allow-list is set and the token's subject is no longer on it (nor in `OPERATOR_EMAIL`); the presented refresh and its paired access token are revoked | Re-add the subject to `MEMBERSHIP_ALLOWLIST` and redeploy, then re-mint; or offboard them (Plan 4 cutover §4) if the removal was intended |
+| An MCP connector or other client starts failing with `400 invalid_grant` `"revoked"` right after a burst of parallel requests (log `oauth_refresh_refused` `reason:"lost_race"`) | The client sent the same refresh token more than once at the same time. Rotation is single-use, so only one request won | Fix the client to single-flight its refreshes, then re-mint its tokens |
 | 401 on `/admin/...` (non-dev-ui) | Bearer missing/expired, `admin` scope absent, or subject not `role='admin'` | Re-mint with `./bin/mint-token.py` after ensuring `smoke-cli` is registered with the `admin` scope (§B.5); confirm the subject's role in D1 |
 | 401/403 on `/admin/dev-ui` from browser | Access cookie expired or `ACCESS_TEAM_DOMAIN`/`ACCESS_POLICY_AUD` mismatch | Compare `wrangler.toml [vars]` to Cloudflare Zero Trust dashboard; this is the only `/admin` route still gated by CF Access |
-| Google webhook returns 401 to Google | `WEBHOOK_CHANNEL_TOKEN` mismatch between the secret and `calendar_sync.channel_token` | Re-subscribe via `/admin/webhook/subscribe` (Step B.6) |
+| Google webhook returns 401 to Google (`channel_token_mismatch`) | The notification's `X-Goog-Channel-Token` doesn't match `calendar_sync.channel_token`, the random per-channel token `ensureSubscription` generated (a stale channel after a rotation, or a spoof). The `WEBHOOK_CHANNEL_TOKEN` secret plays no part | Re-subscribe via `/admin/webhook/subscribe` (Step B.7) |
+| Browser shows "Permissions needed" (403) after the IdP consent | The user unticked a permission on Google's consent screen (or the token response lacked a required Microsoft scope); the callback refuses partial grants (log `auth_callback_missing_scopes {provider, missing}`), stores nothing ("Nothing from this sign-in was stored.") and, with `UPSTREAM_REVOKE_ENABLED="true"`, revokes the partial grant UNLESS the identity already holds a stored grant for that provider and the same provider subject (or a legacy NULL one): then `auth_callback_revoke_skipped {provider, reason:"existing_grant"}` is logged and nothing is revoked, so an existing member's working grant survives a botched re-consent, while a partial grant from a *different* account at the same IdP is still revoked | Have them press "Try again" and leave every box ticked; the check runs in every deployment. If a consent that ticked every box is still refused, see §S "Scope check valve" |
+| Browser shows "Account already linked" (403) after the IdP consent | Only with `REFUSE_PROVIDER_REBIND="true"`: the email already belongs to an account bound to a different IdP identity (another Google/Microsoft account with that address, a recreated Entra user, or the same email at the other provider). Log `auth_callback_rebind_refused {provider, mismatch:"provider"\|"subject"}`. Nothing was stored, and with `UPSTREAM_REVOKE_ENABLED="true"` the fresh grant was revoked best-effort (a successful revoke logs nothing; a failure logs `auth_callback_revoke_failed` with `reason:"account_bound"`) | Have them sign in with the account they used first. To move the account to the new identity, offboard it (Plan 4 cutover §4); their next sign-in binds fresh, with none of the old data. See §S "Provider rebind refusal" |
+| An agent's call answers `202 {"status":"awaiting_confirmation"}` and nothing happened | The calling OAuth client is listed in `AGENT_CONFIRM_CLIENT_IDS`, so the user was emailed a confirm link (§S "Agent-confirm") | The user confirms in their browser within 24 h. A retry of the same request returns the same 202 and sends no second email |
+| `429 {"error":"too_many_pending_actions"}` from a gated op | The user already has 20 agent actions waiting for confirmation (§S "Agent-confirm", decision K) | The user confirms or ignores the emailed links; slots free as they're confirmed or expire (24 h). A plan's accept email frees its slot as soon as the plan is accepted or superseded, else after 72 h |
+| `429 {"error":"mail_cap_exceeded"}` from a poll op | The subject has used today's `OUTBOUND_MAIL_DAILY_CAP` third-party recipients (§S "Outbound mail cap") | Retry after 00:00 UTC, or raise the cap and redeploy |
 | `/v1/resolve` returns 502/solver_error | Solver Worker not deployed/unreachable, **or** the container returned a 5xx on every attempt (cold/restarting and not ready within `SOLVER_MAX_ATTEMPTS`). A single cold-boot 5xx is now retried, so a 502 means the unready window outlasted the retry budget. | `wrangler tail --name weekly-scheduling-solver`; look for `not listening on 8080` / `VMStopped`. If the container idle-stopped, simply re-running the resolve once it is warm succeeds; if wedged, redeploy: `cd solver && wrangler deploy` |
 | `/v1/resolve` returns 502 with a solver 400 / a task duration not a multiple of 15 | Durations are reserved as quarter-hour blocks: the worker rounds each chunk **up** to the next 15 before sending to the solver, while the calendar event / diff email render the **real** requested duration. A genuinely invalid problem now returns a clean serialisable 400 (no longer a masked 500). If you still see this, the worker round-up is not being applied. | Confirm the worker is sending rounded durations — check `worker/src/planning/build-problem.ts`; the solver returns `{"error":"validation","details":[...]}` for any still-invalid problem. |
 | `/v1/resolve` returns 500 `{"error":"internal_error"}` | An unexpected exception inside `runResolve` (e.g. a malformed solver response failing Zod parse, a bad stored config row, or a template that fails materialisation) — distinct from a solver 502. | Grep Workers Logs for the `resolve_failed` message; the structured payload carries `error` + `stack`. Fix the offending data/code; this is a real bug, not a transient. |
 | `/v1/resolve` (or smoke) hangs ~90s then `ReadTimeout` | Solver container wedged/restarting; a solve landed during a down window | Check container metrics + `VMStopped` in the dashboard; redeploy the solver to get a fresh VM, then re-run |
 | 7-day re-consent prompts | Google OAuth app stuck in "Testing" mode | Publish the consent screen (requires verification) |
-| A past-week task is missing from a new plan | Window-relative shedding (expected): its anchor or deadline is before the window | Confirm via the `resolve_window_shed` log line; PATCH a timing field (e.g. `earliest_start`) to clear the stamp and bring it forward |
+| Work blocks vanish from the calendar, or a deployment replans/emails with tasks the user never added there | The calendar is connected to two Optical deployments. A block stamped `optical_deployment` by another deployment is left alone; an unstamped legacy block counts as a deployment's own only when its task is a row of that deployment's D1, so neither deletes the other's blocks; each still reads the other's as busy time, replans on its changes and emails plans | Check `extendedProperties.private.optical_deployment` on the events. Offboard the account from the deployment it doesn't belong to: the offboard sweep deletes only that deployment's stamped blocks and legacy blocks whose task is in its own D1, so the other deployment's blocks survive (§I, "Which deployment owns an event") |
+| A past-week task is missing from a new plan | Window-relative shedding (expected): its anchor or deadline is before the window | Confirm via the `resolve_window_shed` log line (`excluded_past` for that window's `window_start`); PATCH a timing field (e.g. `earliest_start`) to clear the stamp and bring it forward |
 | A pure-backlog task (no anchor, no deadline) is absent from a far-future week's resolve | Window-relative shedding (expected, since 2026-08-12): a not-yet-started window only admits backlog via an in-window `earliest_start` floor or a deadline at/after the window start — see §F | Give the task an `earliest_start` inside the target week, or a deadline at/after that week, to include it. A backlog task appearing in / being captured by a far-future week's plan without either is now expected to be impossible — if you see it, that's a regression |
 
 ## Plan 4 cutover — close the deployment gate
@@ -1263,8 +1428,57 @@ and/or domain wildcards:
 MEMBERSHIP_ALLOWLIST = "<ALLOWLIST>"   # e.g. "*@example.com,contractor@gmail.com"
 ```
 
-Anyone matching the allow-list, the `OPERATOR_EMAIL` seed admin, or an existing active
-`users` row may complete `/oauth/authorize`. Everyone else gets `access_denied`.
+With `MEMBERSHIP_ALLOWLIST` set, only an allow-list match or an `OPERATOR_EMAIL` identity
+may complete `/oauth/authorize`. The allow-list is authoritative: removing an entry locks
+that user out at their next sign-in, even though their `users` row stays active (the gate
+runs before the callback upserts the row). With an allow-list set, the gate also runs on
+every `refresh_token` grant: a delisted subject's refresh is refused with `400 invalid_grant`
+(`"not a member"`, log `oauth_refresh_refused`) and that refresh chain (the presented refresh
+and its paired access token) is revoked. Other access tokens already issued live out their
+TTL (1 hour, `ACCESS_TOKEN_TTL_SECONDS` in `worker/src/auth/oauth-provider.ts`); to cut
+access at once, offboard them (§4), which deletes their `oauth_tokens`. With no allow-list
+set, refresh is not membership-gated. Entries match the user's
+stable subject, which is their first-sign-in email, so a renamed user keeps matching their
+ORIGINAL address's entry. With no allow-list set (prod today), an existing active `users`
+row also admits. Everyone else sees a 403 "Invitation only" page
+(`worker/src/web/sign-in-refused-page.ts`) after the IdP consent, asking them to contact
+`INVITE_CONTACT` (the sentence is omitted when that var is unset; the page never names the
+operator). The client is not redirected to, so `bin/mint-token.py` waits out its
+`--callback-timeout` (default 300 s) and prints a hint naming the "Invitation only" page.
+When `UPSTREAM_REVOKE_ENABLED="true"` the just-granted upstream grant is revoked
+(best-effort, log prefix `auth_callback_revoke`); nothing is stored either way.
+`worker/test/auth/membership.test.ts`
+pins this against each env's real `wrangler.toml` values.
+
+**Delisted users get nothing done for them.** With an allow-list set, every background
+or public path that acts *for* a user checks membership first (`isActiveMember`,
+`worker/src/auth/membership.ts`). A subject that fails it is skipped, and the skip logs
+`delisted_skip {path}` with no PII:
+
+- `monday_resolve`: no resolve, no audit row.
+- `webhook_replan`: both providers, at the resolve coordinator, so a delisting inside the
+  debounce window is caught too.
+- `poll_sweep`: no nudges, deadline booking or escalation. The polls stay `open` and resume
+  on re-listing.
+- `booking_decline_sweep`: the rows stay stamped.
+- `subscription_renewal` and `ms_lifecycle_reensure`: the push channel lapses, and a
+  delisted user with no channel never gets one from the sweep's create pass. It
+  self-heals: after re-listing, the next daily renewal sees the kept `channel_id`
+  expired and re-subscribes, or creates the missing channel.
+- `booking_page`: `/book/{slug}`, its slots and claims are the opaque 404.
+- `poll_page`: the invitee page, grid and save, and the organiser's `/poll/:id/status?t=`
+  link, all read as a dead link.
+- `poll_guest_join`: the opaque 404 or expired form.
+- `calendar_feed`: `/cal/{token}/busy.ics` is a 404, with the token kept.
+- `accept_link`: the emailed plan-accept link reads as invalid (POST `401 invalid_token`)
+  before any commit or `last_seen` bump.
+- `confirm_action`: an agent-confirm link (§S) reads as invalid and nothing runs.
+
+These are not gated: the retention sweep and the deleted-account purge (they must still
+reach a delisted user), the D1 cleanup cron, `/admin/run-cron` (an explicit operator
+action), the bearer branch of `/poll/:id/status`, and `/cal-reveal`. With no allow-list
+set, nothing changes (prod parity: no active-row fallback). Delisting still keeps the
+data until offboard (§4).
 
 ### 2. Seed the admin user
 
@@ -1275,6 +1489,14 @@ as `role='admin'` automatically. To confirm:
 SELECT subject, role, is_active FROM users WHERE subject = '<OWNER>';
 -- expect: role='admin', is_active=1
 ```
+
+**Demoting an admin.** Remove the subject from `OPERATOR_EMAIL` (keep or add them in
+`MEMBERSHIP_ALLOWLIST` if they should stay a member) and redeploy, then
+`UPDATE users SET role='member' WHERE subject='<email>'` in D1. Every `/admin` route reads
+the live role (`requireAdminSubject`), so it takes effect on the subject's next request; a
+later `refresh_token` grant also drops `admin` from the reissued scopes (refresh re-narrows
+to the current role and can never widen). Do the redeploy first: an `OPERATOR_EMAIL`
+identity is re-seeded as admin on sign-in.
 
 (Read-only prod queries are pre-authorised; run via
 `op run --env-file=.env -- npx wrangler d1 execute scheduler --remote --command "<sql>"`.)
@@ -1291,14 +1513,97 @@ keeps existing tokens/ciphertexts valid. To rotate to distinct values, set Secre
 - `HMAC_KEY`      — keys capability tokens AND the OAuth login-nonce cookie. Rotating it
   breaks only in-flight accept links / login flows (short TTL).
 
+With neither a split key nor `TOKEN_HASH_PEPPER` set, the worker throws
+`crypto_key_missing: set <KEY> or TOKEN_HASH_PEPPER` (naming the variable, never a value)
+on first use rather than keying with an empty value, so a missing secret is a loud 500,
+not forgeable links.
+
 Downtime for a key rotation is acceptable (re-auth is the recovery). Push via the existing
 `bin/bootstrap-secrets.sh` pattern (`op run … -- npx wrangler secret put HASHING_KEY`).
 
 ### 4. Offboarding
 
 To remove a user (hard-delete current assets + stop their Google webhook, keep sent email
-history): `POST /admin/offboard` with `{ "subject": "<email>" }` as an admin (CF Access +
-`role='admin'`). It is idempotent and audited (`audit_log`, `source='admin'`).
+history), use the operator CLI:
+
+```bash
+read -rs OPTICAL_ADMIN_TOKEN && export OPTICAL_ADMIN_TOKEN   # paste; not echoed, not in history
+uv run bin/optical-admin.py offboard <email> --env <env> --yes
+unset OPTICAL_ADMIN_TOKEN
+```
+
+Never put the token on the command line (it lands in shell history). `op run` with an env
+file that maps `OPTICAL_ADMIN_TOKEN` works too.
+
+It wraps `POST /admin/offboard` with `{ "subject": "<email>" }`, which needs an
+admin-scoped bearer (`bin/mint-token.py`, `admin` scope) from a `role='admin'` subject.
+The CLI echoes the subject, env and host, and refuses before any HTTP without `--yes`.
+`--env` resolves through `bin/_env_hosts.py`, so it can only reach that env's host. The
+token comes only from `OPTICAL_ADMIN_TOKEN` in the environment (inject it from outside;
+it is never written to disk or printed). Offboard is idempotent and audited (`audit_log`,
+`source='admin'`). It deletes every owner-scoped row listed `delete` in
+`worker/src/lifecycle/owner-scoped-tables.ts`, including the subject's `oauth_tokens`
+(so their bearer and refresh tokens die at once) and their solver telemetry (the
+`solver_calls` rows keyed on `owner`). Known gap: R2 problem captures
+(`problems/<solver_calls.id>.json`, written only when `SOLVER_CAPTURE_PROBLEMS="true"`)
+are not swept and survive the offboard. The same `offboardUser` also runs from the
+retention sweep (actor `cron-sweep`) and from self-serve deletion (`DELETE /v1/account`,
+`source='api'`, actor = the subject); see "Account lifecycle".
+
+**Which subject.** Pass the subject exactly as `optical-admin.py list-users` shows it.
+Matching is case-insensitive (`COLLATE NOCASE` over `users.subject` and
+`identity_tokens.account_email`, input trimmed), and the response echoes the STORED subject
+that was offboarded. A renamed user's subject is their ORIGINAL (first-sign-in) address,
+not the one they sign in with now. An unknown subject is `404 {"error":"unknown_subject"}`
+with nothing deleted and no audit row; two stored subjects that differ only in case, with
+input matching neither exactly, is `409 {"error":"ambiguous_subject"}` (pass the exact
+stored form).
+
+**What offboard removes on the calendar.** Only upcoming work blocks placed by this
+deployment, or unstamped legacy ones (where the calendar is still reachable); blocks another
+deployment stamped are left alone, and an unstamped legacy block goes only when its task is a
+row of this deployment's D1 (§I, "Which deployment owns an event"). Past ones, and meetings booked or moved through Optical,
+stay. The deactivated `users` row keeps the email address, role and timestamps (created,
+last seen, retention warning, deactivated); `home_tz` and `done_color_id` are nulled.
+Offboard stamps `users.deactivated_at` (migration 0043). How long the row and the
+address in `audit_log` are kept is `DELETED_ACCOUNT_RETENTION_DAYS`; see "Account
+lifecycle", "Purge window".
+
+**Upstream grant revocation (`UPSTREAM_REVOKE_ENABLED`, default off).** With the flag
+exactly `"true"`, offboard also revokes the user's grant at the IdP. It runs after the
+channel stop and chunk sweep and before the D1 rows are deleted
+(`worker/src/auth/upstream-revoke.ts`, log prefix `offboard_revoke`):
+
+- **Google:** the stored refresh token is POSTed to `https://oauth2.googleapis.com/revoke`.
+  A 200, or a 400 `invalid_token` (already revoked), counts as success. Any other failure
+  logs `offboard_revoke_failed` (token redacted) and never blocks the deletion.
+- **Microsoft:** a documented no-op. Entra has no per-app revoke for a delegated grant:
+  Optical deletes its tokens, and the user removes the app themselves at
+  https://myapps.microsoft.com (work/school) or https://account.live.com/consent/Manage
+  (personal). With `MS_PROVIDER_ENABLED` off, a Microsoft subject logs
+  `offboard_revoke_skipped`.
+
+Turn it on only in a deployment with its own Google OAuth client. Google's revoke removes
+the whole user-to-client grant, so where several deployments share one client, a revoke in
+one (a smoke offboard, say) kills that Google account's credential in all of them. With the
+flag off, offboard only deletes the stored tokens, as before. The same helper revokes the
+just-granted grant when the membership gate refuses a sign-in (§1).
+
+The same CLI also has:
+
+```bash
+# Read-only listing (subject, role, is_active, last_seen, retention_warned_at,
+# deactivated_at, plus a computed overdue_unwarned) via
+# `wrangler d1 execute DB --remote`; no HTTP, no admin token. Inject
+# CLOUDFLARE_API_TOKEN from outside. R for overdue_unwarned comes from the env's
+# wrangler.toml block (--retention-days N overrides it). Falls back to the
+# pre-0043 and then the pre-0041 column set.
+uv run bin/optical-admin.py list-users --env <env>
+# POST /admin/run-cron?subject=<email>: runs the Monday resolve for ONE subject.
+read -rs OPTICAL_ADMIN_TOKEN && export OPTICAL_ADMIN_TOKEN   # paste; not echoed, not in history
+uv run bin/optical-admin.py run-cron monday-resolve --subject <email> --env <env>
+unset OPTICAL_ADMIN_TOKEN
+```
 
 ### 5. GO / NO-GO checklist (before authorising a 2nd user)
 
@@ -1311,6 +1616,154 @@ history): `POST /admin/offboard` with `{ "subject": "<email>" }` as an admin (CF
       `TOKEN_HASH_PEPPER` default consciously accepted.
 - [ ] `bin/switch-account.py` is gone (retired); operators use `/admin/offboard` + a fresh
       login per user instead of switching one shared account.
+
+## Account lifecycle: retention, deletion and system mail
+
+### Retention (`RETENTION_DAYS`)
+
+When `RETENTION_DAYS` (R) is a positive integer, the daily cleanup cron (`0 4 * * *`)
+warns, then offboards, active users whose `last_seen` is old
+(`worker/src/lifecycle/sweep-inactive.ts`; see "Warning before deletion" below). Unset,
+empty, `"0"`, negative or non-integer values make the sweep a strict no-op. A NULL
+`last_seen` is never swept. Activity that stamps `last_seen` (and clears any pending
+warning, `users.retention_warned_at`):
+
+- OAuth sign-in. This creates or reactivates the row.
+- Any request with a valid bearer whose subject has an **active** `users` row, at most once
+  per 20 h (`LAST_SEEN_BUMP_THROTTLE_MS`, throttled in the UPDATE's own WHERE so concurrent
+  requests are race-safe).
+- Submitting an emailed plan-accept form (the POST, whatever the commit outcome).
+
+Viewing the emailed confirm page (GET) does not count, because mail link scanners prefetch
+it. The activity bump never creates a row and never reactivates an offboarded user. A
+failed bump logs `last_seen_bump_failed` (with `via`: `bearer` or `accept_link`) and the
+request still succeeds.
+
+**Warning before deletion (migration 0041, `users.retention_warned_at`).** Each run has two
+phases over active users with a non-NULL `last_seen`:
+
+1. **Warn.** Once `last_seen` is older than `max(R − 14, 1)` days and `retention_warned_at`
+   is NULL, the sweep emails the user from the system sender (SMTP2GO, never the user's
+   mailbox): "your Optical data will be deleted on <D>; sign in or use it to keep it", where
+   D is the UTC date of the warning plus 14 days. A successful send stamps
+   `retention_warned_at`. A failed send stamps nothing, and the next day's run retries.
+   With `SYSTEM_MAIL_ENABLED` off, the sweep stamps without sending and logs
+   `retention_warning_unsent` (no address). With mail on but misconfigured
+   (`system_mail_misconfigured`), nothing is stamped, so no one is deleted until it is fixed.
+   So a recipient whose send keeps failing is retried daily and never auto-deleted.
+   The sweep logs `retention_unwarnable {count}` every run (warn level when the count is
+   above 0, info at 0, never an address): active users idle longer than R with
+   `retention_warned_at` NULL. `bin/optical-admin.py list-users --env <env>` marks those
+   rows `overdue_unwarned: true`; it reads R from the env's `wrangler.toml` block, and
+   `--retention-days N` overrides that. Look for `system_mail_failed` lines, then fix the
+   mail or offboard them manually. If activity lands while the
+   warning is being sent, the guarded stamp matches no row: the sweep logs
+   `retention_warning_raced` (no subject or address) and writes neither the stamp nor the
+   `retention_warned` audit row. The send happens before the stamp on purpose: claiming
+   first risks an unwarned deletion if the release write fails.
+2. **Delete.** The sweep offboards when `last_seen` is older than R days AND the warning's
+   UTC date is at least 14 days before today, so D is the day of deletion. A best-effort
+   "your data has been deleted" email follows. Just before each offboard the sweep re-checks
+   that user's row; if activity landed in between, it logs `retention_delete_raced` (warn, no
+   subject or address) and skips the user.
+
+Date arithmetic:
+
+- R > 14: warning at about R − 14 days idle, deletion at about R days idle (the first sweep
+  on D).
+- R ≤ 14: warning after 1 full idle day, deletion at about 15 days idle.
+- If R is raised after a warning, the deletion waits until `last_seen` is R days old. No new
+  warning is sent.
+
+Activity cancels the deletion: a sign-in, any authenticated `/v1` call, or an accept-link
+accept clears `retention_warned_at`. While a stamp is set, the bearer bump ignores its 20 h
+throttle. Audit actions: `retention_warned` and `sweep_offboard` (actor `cron-sweep`,
+`source='cron'`), on top of `offboardUser`'s own `offboard` row.
+
+**Deploy:** apply 0041 BEFORE deploying. `requireBearer` reads `retention_warned_at`, so on
+an unmigrated D1 every bearer call fails:
+`op run --env-file=../.env -- npx wrangler d1 migrations apply DB --env <env> --remote`.
+
+### Purge window (`DELETED_ACCOUNT_RETENTION_DAYS`, migration 0043)
+
+Every offboard (operator, self-delete, retention) stamps `users.deactivated_at`; a repeat
+offboard keeps the first stamp, and any reactivation (sign-in, `touchLastSeen`) clears it.
+When `DELETED_ACCOUNT_RETENTION_DAYS` (N) is a positive integer, the daily `0 4 * * *`
+sweep (`worker/src/lifecycle/purge-deleted.ts`, called from `sweepInactiveUsers` whatever
+`RETENTION_DAYS` is) deletes `users` rows that are still inactive and were deactivated more
+than N days ago. In the same D1 batch it replaces that subject in `audit_log.subject` and
+`audit_log.actor` with `deleted:` + HMAC-SHA256(hashing key, `audit-pseudonym:` + subject).
+The batch re-checks the delete and touches the audit rows only once the `users` row is gone,
+so a sign-in landing mid-purge is safe. The pseudonym is stable per subject (its rows still
+group together) and can't be reversed without the key. Audit rows are otherwise unchanged,
+and the purge itself is audited as `account_purged` under the pseudonym. Logs:
+`deleted_accounts_purged {count}`, `deleted_account_purge_raced`,
+`deleted_account_purge_failed`; with no hashing key nothing is purged
+(`deleted_account_purge_skipped`).
+
+- Unset, empty, `"0"`, negative or non-integer: keep the row and the audit address
+  indefinitely.
+- Rows deactivated before 0043 have no stamp. The first run with N set stamps them, so they
+  are purged N days after that run; a config change never mass-deletes.
+- Signing in again after a purge creates a fresh, empty row.
+- Both deletion mails and the `deleteAccount` description say what is kept and that the
+  deployment's N decides for how long.
+
+**Deploy:** apply 0043 BEFORE deploying. `touchLastSeen` clears `deactivated_at`, so on an
+unmigrated D1 every sign-in fails.
+
+### System mail (`SYSTEM_MAIL_ENABLED`)
+
+`SYSTEM_MAIL_ENABLED` (default `"false"`) gates Optical's first-party sender
+(`worker/src/mail/system-mailer.ts`): one SMTP2GO HTTP API call
+(`POST https://api.smtp2go.com/v3/email/send`) for mail Optical sends as itself. Its
+callers are the retention sweep (the warning and the deletion notice) and self-serve
+deletion (the confirmation); templates in `worker/src/mail/lifecycle-templates.ts`, plain
+text with no URLs. Product mail (replan emails, poll and
+booking notices) still goes from the user's own mailbox. It needs the var
+`SYSTEM_MAIL_FROM` and the secret `SYSTEM_MAIL_API_KEY`
+(`op run … -- npx wrangler secret put SYSTEM_MAIL_API_KEY --env <env>`).
+
+- Flag off (anything but exactly `"true"`): sends are silent no-ops, with no fetch and no log line.
+- Flag on but the key or sender missing or a `<set …>` placeholder: an error line
+  `system_mail_misconfigured {api_key, from}` (each `set` or `missing`), and the mail is skipped.
+- Send failure: `system_mail_failed {status}`, where `status` is the HTTP code, `network`,
+  `rejected` (SMTP2GO answered 200 but `data.succeeded < 1` or `data.failed > 0`, or the
+  body didn't parse) or `invalid_input` (CR/LF/control characters in the subject or recipient).
+
+Log lines never contain the key, body, subject or recipient. `send` never throws and
+returns `{ok}`, so a caller (a sweep, a deletion) proceeds on a failed send.
+
+### Self-serve deletion (`SELF_SERVE_DELETE_ENABLED`)
+
+`SELF_SERVE_DELETE_ENABLED` (default `"false"`) gates `DELETE /v1/account` (op
+`deleteAccount`, `worker/src/handlers/account.ts`). The body is strict
+`{ "confirm": "<the caller's email, as GET /v1/whoami returns it>" }`, matched
+case-insensitively and otherwise exactly (no trimming). Checks, in this order:
+
+- Flag not exactly `"true"`: `404 {"error":"not_found"}`, before auth and before the body is
+  read. This is deliberate and differs from the `403 feature_disabled` that polls and the
+  booking page return: a disabled deployment does not reveal that the route exists.
+- `401`/`403` from the owner gate (missing bearer, no subject).
+- `403 insufficient_scope` (`required: "scheduler:write"`) when the bearer lacks
+  `scheduler:write`.
+- `400 confirmation_mismatch` (or `validation_failed`) when `confirm` is not the caller's
+  email. Nothing is deleted.
+
+Only the bearer's own subject is ever deleted. It runs the full offboard (Plan 4 cutover
+§4: audit action `offboard`, `source='api'`, actor = the subject; upstream revoke when
+`UPSTREAM_REVOKE_ENABLED="true"`), so the caller's bearer and refresh tokens die and the
+next call is a 401. Like an operator offboard it keeps the deactivated `users` row (email
+address, role and timestamps; `home_tz` and `done_color_id` are nulled) and the
+`audit_log` rows, for as long as `DELETED_ACCOUNT_RETENTION_DAYS` says ("Purge window"
+above; "keep and disclose": a deployment's privacy policy must say so). An agent-confirm
+client (`AGENT_CONFIRM_CLIENT_IDS`, §S) deletes nothing on the call: after these checks it
+gets `202 awaiting_confirmation`, and the deletion runs only when the user confirms the
+emailed link. A best-effort
+confirmation email follows only when `SYSTEM_MAIL_ENABLED` is on. A concurrent double
+submit can send two emails and write two audit rows; offboard is idempotent, so neither
+call 5xxs.
+
 
 ## Multi-user smoke (scheduler-dev)
 
@@ -1592,7 +2045,11 @@ accept page and replan email translate them to end-user copy at render time
    ./bin/mint-token.py --url https://<subdomain>.<zone> --client-id smoke-cli
    ```
 2. The Google consent screen will now show the additional
-   "See free/busy information" permission. Accept it.
+   "See free/busy information" permission. Accept it, and leave every other
+   box ticked: the re-consent must grant every requested scope, because a
+   partial grant is refused at sign-in in every deployment ("Permissions
+   needed", see Diagnostics). The degrade-to-immovable above applies only to
+   stored grants that predate `calendar.freebusy`.
 3. The new refresh token (persisted in `identity_tokens`) includes the scope; on
    the next resolve, owned meetings that were previously immovable will become
    eligible for relocation.
@@ -1703,6 +2160,18 @@ from Google's scheduler, once the human confirms the move.
 
 - **`guestsCanModify` out of scope.** You cannot move a meeting you can edit
   but do not organise. The feature is organiser-only in v1.
+
+- **`source.kind:"meeting"` is server-owned.** Only the owned-meetings sync
+  writes it. `createTask` refuses it, and `updateTask` refuses setting it on
+  any task or changing a meeting row's source, both with `400 invalid_source`;
+  an unchanged echo of the stored source is accepted (GET-modify-PATCH keeps
+  working). As defence in depth, resolve freezes any meeting-kind row whose
+  event fails `isOwnedMovableMeeting` (`movable_verdict.reason:
+  "not_owned_movable"`) and logs `meeting_promotion_refused {task_id}`; query
+  the logs for that line to find forged or stale rows. Not covered: a client
+  can still write `movable_verdict` (each resolve re-stamps it, and only the
+  owner is affected), and a plan proposed before this check shipped that
+  contains a forged promotion can still be accepted.
 
 - **Attendee count not shown in email.** The replan diff email shows which
   meetings move (with `moved-to`/`moved-from` roles) but does not list the
@@ -2005,6 +2474,16 @@ owner's calendar. `GET /book/<slug>` serves the page, `GET
 path — feature off, unknown slug, disabled page — returns the same byte-
 identical 404, so the endpoint is not a slug oracle (`worker/src/booking/route.ts`).
 
+**Trailing slash.** A `GET`/`HEAD` for a public HTML page with one trailing
+slash answers `301` to the same path without it, query string kept verbatim
+(`?t=`/`?g=` capability tokens survive): `/book/<slug>/`, `/poll/<id>/`,
+`/poll/<id>/status/`, `/confirm/<id>/`, `/cal-reveal/<token>/` and the emailed
+`/v1/plans/<hash>/accept/`. Nothing else is lenient — JSON endpoints
+(`/book/<slug>/slots`, `/poll/<id>/grid`), the `.ics` feed, the rest of
+`/v1/*`, `/oauth/*`, `/auth/*`, `/admin/*`, webhooks and every non-GET method
+still match strictly, and an unknown path with a slash still 404s
+(`worker/src/public-page-slash.ts`).
+
 ### Two layouts, and one fetch per page
 
 The page draws one of two arrangements, chosen in JS from
@@ -2265,6 +2744,7 @@ passes `--env dev`. The script refuses to mint a second widget for a hostname
 that already has one — that would strand the deployed sitekey against a rotated
 secret and fail every claim closed — unless you pass `--force`.
 
+
 It needs `Turnstile Sites Read`+`Write` on `CLOUDFLARE_API_TOKEN`; without them
 the API answers `10000 Authentication error`. Those permissions are in
 `infra/create-api-token.sh`'s `WANTED` list — re-running that script updates the
@@ -2350,6 +2830,25 @@ else is left as-is (`worker/src/handlers/booking-page.ts`,
 | `bookable_over_movable_meetings` | See "What is offered as bookable" below. |
 | `location.modes` | Meeting types offered to the booker, in the order shown; array of `{kind, detail?}`. At least one, at most four (`ALL_KINDS.length`), no duplicate kinds. See "Location kinds and the offered set" below. |
 | `event_title` | Calendar event title; `{booker_name}` is replaced with the booker's name. |
+
+**Agent-confirm (O9.4).** For an OAuth client listed in `AGENT_CONFIRM_CLIENT_IDS` (§S), a
+`PUT` that would publish answers `202 awaiting_confirmation` and is applied only after the
+user confirms the emailed link. "Would publish" means turning the page on (`enabled`
+false→true), or changing `slug`, `event_title` or `location` while it stays on. Location
+is compared in canonical form, so re-sending identical values isn't gated. An edit that
+mixes gated and other fields defers as a whole. Disabling the page, or editing it while
+it's off, applies at once. The body is validated first, so 400s and `409 slug_taken` come
+back immediately. The confirm page shows, in order: a preview of the public page as a
+booker will see it after the change (the real `renderBookingPage` in preview mode, with
+sample times and no scripts, in a `sandbox=""` srcdoc iframe; no calendar is read; omitted
+while no slug is set), then the public URL, the event title as an example with the
+booker's name filled in ("Alex Example"), the location and the list of changes (other
+fields by plain-English label, from `BOOKING_PAGE_FIELD_LABELS`), then Confirm. The Done
+page links to the live page. Confirming re-checks that `BOOKING_PAGE_ENABLED` is still on, that the page's
+public state (enabled, slug, title, location) hasn't changed since the request, the
+cross-field rules against the live config, and that the slug is still free. Run
+`bin/booking-smoke.py` only against envs where the smoke client isn't gated: B1/D1 get a
+202 there and fail visibly with the body.
 
 ### Location kinds and the offered set
 
@@ -2532,6 +3031,26 @@ then a Google Calendar `createEvent` with the booker as the sole attendee
 booker's `location_kind` against the page's offered set (see "Location kinds
 and the offered set" above) — a Meet link for `meet`, otherwise text on the
 event's `location` field for `phone`/`in_person`/`custom`.
+
+Once the event exists, the **owner is emailed** a booking notice from and to
+their own mailbox (Gmail or Graph, the same `NotificationProvider.sendPollEmail`
+path as the poll organiser's "You booked" mail and the decline-cancel notices;
+`renderBookingOwnerNotifiedEmail`, `worker/src/booking/emails.ts`). Google's
+invitation goes to the booker only and never tells you about an event on your
+own calendar, so without this the owner heard nothing. Subject `New booking:
+<name>, <when>`; body: booker name and address, the start in the owner's
+effective tz (`getHomeTz`, fallback `SCHEDULER_TZ`) with the zone named, the
+duration, how it happens (video call — the join link is *on the event*, since
+neither provider's `createEvent` returns it; the phone number or place the
+booker gave; the owner's fixed `custom` text), and the booker's note, escaped
+and labelled as their own words, not checked by Optical. It is self-addressed,
+so `OUTBOUND_MAIL_DAILY_CAP` never counts or refuses it. Best-effort and off
+the response path (`waitUntil`): a provider-construction or send failure never
+fails the booking or changes the `201`. It is sent even when the confirm write
+then fails (the event exists either way), never when the calendar write fails.
+One log line per booking, booking id only: `booking_owner_notified {ok: true,
+bookingId}` (info) or `{ok: false, bookingId, error}` (error). A delisted
+owner's page is already a 404, so no notice is ever sent for one.
 
 - **The claim loses a race** (the D1 guard matches an existing row, so
   `claimSlot` returns null) → `409 slot_unavailable`, with a freshly recomputed
@@ -2807,6 +3326,16 @@ op run --env-file=../.env -- npx wrangler d1 migrations apply DB --env dev --rem
 op run --env-file=../.env -- npx wrangler deploy --env dev
 ```
 
+**Agent-confirm and the mail cap.** For an OAuth client listed in
+`AGENT_CONFIRM_CLIENT_IDS`, the poll ops that email or book wait for the user's emailed
+confirmation (§S "Poll ops"). Every poll email to an invitee is sent from the organiser's
+mailbox and counts against `OUTBOUND_MAIL_DAILY_CAP` (§S "Outbound mail cap"):
+`createMeetingPoll`, `nudgeMeetingPoll` and `updateMeetingPoll` answer
+`429 mail_cap_exceeded` before any write; the cron sweep, guest joins and the
+deadline-extended re-link skip capped invitees without rotating their links; cancellation
+always succeeds and logs the capped sends. `bin/poll-smoke.py` stops with a clear message
+when it gets a 202, so it can't run against a gated env.
+
 Migrations 0033 and 0034 (guest-join rate limiting; see "Guest joins" below)
 must land before deploy, same as any other migration — they auto-apply in
 sequence via `d1 migrations apply`. No new OAuth scope is required — meeting polls
@@ -3036,7 +3565,9 @@ or whose nudge cadence is due:
 ### `updateMeetingPoll` (`PATCH /v1/polls/{id}`)
 
 The organiser-facing edit endpoint: change the title, location, or deadline,
-add/remove invitees, or toggle the guest-join link. `extendDeadline` and
+add/remove invitees, or toggle the guest-join link. For an agent-confirm client
+(`AGENT_CONFIRM_CLIENT_IDS`, §S) any real change, title and location included,
+answers `202 awaiting_confirmation` and applies only once the user confirms. `extendDeadline` and
 `dropInvitee` used to live under `resolveMeetingPoll` — they moved here
 outright (see internal design notes), since they're edits to the
 poll, not booking-resolution actions; `resolveMeetingPoll` now only takes
@@ -4224,7 +4755,21 @@ MS_PROVIDER_ENABLED = "true"
 
 Default `"false"` in both envs until an Entra app registration exists and dev
 smoke has passed. When `"false"`, `/authorize` behaves exactly as before
-(straight to Google, no provider chooser).
+(straight to Google, no provider chooser), unless `PRIVACY_URL` is set.
+
+**Consent disclosure (`PRIVACY_URL`).** A non-blank `PRIVACY_URL` makes the
+chooser render even with one provider (`worker/src/web/provider-chooser-page.ts`).
+It then shows the offered provider buttons plus a disclosure: Optical reads and
+writes calendar events, reads free/busy and sends email as you; data reaches
+your AI client only when you ask; it is never used to train models; Google's
+Limited Use sentence verbatim ("Optical's use and transfer to any other app of
+information received from Google APIs will adhere to Google API Services User
+Data Policy, including the Limited Use requirements.", the policy name linked);
+"Privacy policy" / "Terms of service" links from `PRIVACY_URL` / `TERMS_URL`
+(absolute http(s) URLs only; anything else is dropped, not linked); and an
+escaped `DEPLOYMENT_LABEL` badge. Without `PRIVACY_URL` there is no disclosure
+or badge: a two-provider chooser is unchanged, and a Google-only deployment
+still 302s straight to Google.
 
 **This flag is a kill switch, not just a new-signup gate.** Provider
 resolution reads it on every request that needs a Microsoft token or Graph
@@ -4402,6 +4947,9 @@ lower-casing and before the membership gate:
   (`NULL` → a value) or across a provider switch (comparing subjects
   between two different IdPs is meaningless; that case already resets
   `calendar_sync`/`done_color_id` below).
+  With `REFUSE_PROVIDER_REBIND="true"` this is refused instead ("Account
+  already linked", §S "Provider rebind refusal"); the stored identity keeps
+  the account.
 
 **`OPERATOR_EMAIL` stays keyed on the resolved `subject`, not the token's
 current email** — it must therefore list the operator's *original*
@@ -4428,7 +4976,9 @@ and would otherwise wedge webhook-triggered replan forever). The next
 resolve re-seeds `done_color_id` for the new provider. `getAccessToken`'s
 refresh-token write is provider-guarded (`WHERE account_email=? AND
 provider=?`) so a refresh that was in flight on the old provider can't
-clobber the new provider's freshly-stored credential.
+clobber the new provider's freshly-stored credential. The same sign-in then
+creates a push channel on the new provider (§"Automatic channel renewal",
+"First channels"), so webhook replans resume without a manual re-subscribe.
 
 What a switch does **not** clean up, by design (v1): the old provider's
 push channel/subscription is **abandoned, not stopped** — Graph and Google
@@ -4440,6 +4990,9 @@ own lifetime. Chunk events already committed to the old calendar are
 stranded there; there is no switch-time ghost sweep in v1, so a user who
 switches provider needs to manually clean up any chunk events left on
 their old calendar.
+
+With `REFUSE_PROVIDER_REBIND="true"` the switch is refused instead ("Account
+already linked", §S "Provider rebind refusal"), and nothing is reset.
 
 ### Webhooks & subscriptions
 
@@ -4644,19 +5197,26 @@ their old calendar.
      Google side (WP0 of internal design notes). Flipping
      the flag on for an already-provisioned account requires re-consent —
      re-mint (`./bin/mint-token.py --provider microsoft …`) to pick it up.
+   Remove the default `User.Read`: identity comes from the id_token, never
+   Graph `/me`, so the worker doesn't request it.
    Grant admin consent only if testing under a managed tenant that requires
    it; the `common` multitenant + personal-account registration otherwise
    relies on per-user consent at sign-in.
-5. **Certificates & secrets** -> **New client secret**. Client secrets expire
+5. **Token configuration** -> **Add optional claim** -> token type **ID** ->
+   `email` and `xms_edov`. Without them the attested-email branch of the
+   identity rule never fires and every work account is keyed by UPN (deploy
+   gate item 2 below). The portal's "Entra ID only" warning on `xms_edov` is
+   expected: personal accounts fall through to the UPN branch.
+6. **Certificates & secrets** -> **New client secret**. Client secrets expire
    at most 24 months out — set a calendar reminder well before expiry (the
    secret cannot be recovered after creation, only rotated: create a new one,
    push it via `op run -- npx wrangler secret put MICROSOFT_OAUTH_CLIENT_SECRET
    --env <env>`, then delete the old one from the Entra app once the new
    secret is confirmed live).
-6. Copy the **Application (client) ID** into `MICROSOFT_OAUTH_CLIENT_ID` under
+7. Copy the **Application (client) ID** into `MICROSOFT_OAUTH_CLIENT_ID` under
    the target env's vars in `worker/wrangler.toml` (replacing the
    `<set after Entra app registration>` placeholder), then deploy.
-7. **Unverified-publisher warning:** until the app goes through Microsoft's
+8. **Unverified-publisher warning:** until the app goes through Microsoft's
    publisher verification, personal/consumer accounts and accounts in "strict"
    managed tenants see an "unverified publisher" interstitial during consent.
    This is expected in v1; publisher verification is deferred.
@@ -4702,7 +5262,7 @@ exercised end to end.
   `categories` list (the provider's `undoneColorId` is `""`),
   which also clears any categories the user added to that chunk event by
   hand — acceptable because chunk events are scheduler-owned.
-- **Unverified-publisher consent warning.** See Entra registration step 7
+- **Unverified-publisher consent warning.** See Entra registration step 8
   above — cosmetic but can alarm first-time signers-in; publisher
   verification is deferred, not planned for v1.
 - **`guestsCanModify` out of scope**, same as the existing Google limitation:
@@ -4731,6 +5291,43 @@ exercised end to end.
   depends on the 4200-minute subscription lifetime and the daily 04:00 cron
   both continuing to hold; there's no `rotated_at` column to verify it
   actually fired (follow-up).
+- **A 202 from `sendMail` is not delivery.** Graph accepts the send and saves
+  it to Sent Items, but a personal (outlook.com) mailbox can still drop it
+  later in its own outbound path, with no bounce and nothing in Optical's
+  logs. Seen live on 2026-10-21: both invites of a new poll vanished
+  (Sent Items had them; the receiving Google and Cloudflare MX logs never
+  did) while the same account's self-addressed plan/confirm mail and a
+  hand-sent test to the same recipient arrived; a manual nudge the next day
+  delivered both. Most likely a throttle on a burst of sends (five in about
+  three minutes) from a newly consented app. Remedy for a user: the poll's
+  manual nudge.
+- **Personal accounts signed in with a non-Microsoft address lose meeting
+  RSVPs.** Such an account (sign-in `you@gmail.com` or `you@own-domain`) has a
+  hidden mailbox `outlook_…@outlook.com` that accepts no external mail.
+  Exchange makes that hidden address the **organiser** of every event Graph
+  creates, so an outside attendee's accept/decline (an iMIP reply to the
+  organiser) bounces with "Address not found" (seen live 2026-10-22, a
+  declined poll booking). The organiser's copy never learns the response:
+  poll meetings show no RSVPs, booking-page decline auto-cancel never fires,
+  and owned-meeting masks never see an attendee as accepted. Graph can't set
+  the organiser address, so the only fix is on the account: make a real
+  Outlook address (`@outlook.*`/`@hotmail.*`) the primary alias
+  (account.microsoft.com → Your info → Manage how you sign in). Verified
+  live 2026-10-22: after the switch, new invites carry the Outlook alias as
+  organiser and declines reach the Outlook inbox. (The page may report
+  "unable to make … your primary alias" even when the change went through;
+  Microsoft's SMS confirmation is the reliable signal.) The id_token's
+  `preferred_username` follows the new primary alias, so allow-list it
+  first. The account itself carries over on its provider subject, but keeps
+  its original email as its key: `resolveSubject` logs
+  `identity_email_drift` and never renames, so Optical's mail to the user
+  still goes to the old address. Work accounts and native
+  Outlook accounts are unaffected. Mail from such an account also goes out
+  "on behalf of" the sign-in address (`From` = sign-in address, `Sender` =
+  the hidden mailbox), so DMARC fails alignment at every receiver and that
+  domain's own policy decides junk vs delivery (`p=none` delivered).
+  Forwarding through Cloudflare Email Routing re-signs the mail, so the final
+  inbox shows `dmarc=pass` and hides this.
 
 ### Extended-properties spike — validate before building on it
 
@@ -4768,6 +5365,21 @@ same `graphPropId`/mapping boundary so no other code needs to change.
   `$expand=singleValueExtendedProperties(...)`. Fixed: the initial delta
   request now sends `$expand=singleValueExtendedProperties($filter=...)` for
   both `scheduler_chunk_id` and `optical_meeting_task_id`.
+
+Every Graph read now also expands `optical_deployment`, the deployment stamp (§I,
+"Which deployment owns an event"); without it every foreign chunk would read as legacy.
+
+**Every private property Optical writes must be in that `$expand` list**
+(`expandOpticalProperties`): Graph returns only the named properties a read asks
+for. Until 2026-10-16 the list missed `optical_poll_id` and `optical_booking`, so on
+Outlook a poll-booked meeting was imported as an owned movable meeting (and could be
+relocated on accept), and booking-page decline auto-cancel never recognised its own
+booking events. Both are expanded now; `worker/test/providers/microsoft-expand-properties.test.ts`
+pins the full list, and `bin/_smoke_lib.py` `_GRAPH_PRIVATE_PROPS` mirrors it. A new
+private key needs adding in both places. A stored Graph delta link keeps the
+`$expand` it was opened with, so a Microsoft subject whose delta link was stored
+before a list change keeps the old `$expand` until its next full sync. Re-minting or
+resetting the Microsoft smoke accounts clears it.
 
 Both fixes are unit-tested (`worker/test/v1-calendar-access-token.test.ts`,
 `worker/test/providers/microsoft-calendar-provider.test.ts`), but neither has
@@ -5708,3 +6320,333 @@ any stray values (`UPDATE users SET home_tz = NULL …`) first, or accept that.
 - The window stamp is a whole-body task update. A task PATCH or webhook
   manual move that reads the row before the tz-change batch and writes after
   it drops the stamp, and those windows then follow the new zone.
+
+
+## S. Agentic safety and account hardening
+
+Five vars, all off or at their safe default unless a deployment sets them
+(`worker/src/env.ts`):
+
+| Var | Unset means | Effect |
+|---|---|---|
+| `AGENT_CONFIRM_CLIENT_IDS` | no client gated | Comma-separated OAuth client ids, or `"*"` for every OAuth client, whose consequential ops wait for the user's emailed confirmation ("Agent-confirm") |
+| `OUTBOUND_MAIL_DAILY_CAP` | 50 | Third-party recipients per subject per UTC day from the user's own mailbox ("Outbound mail cap") |
+| `REFUSE_PROVIDER_REBIND` | off | Exactly `"true"`: an account bound to one IdP identity is never handed to another ("Provider rebind refusal") |
+| `REQUIRE_EXACT_PROVIDER_SCOPES` | require | Require exact provider scopes. Only exactly `"false"` relaxes it ("Scope check valve") |
+| `DELETED_ACCOUNT_RETENTION_DAYS` | keep indefinitely | Positive integer N: purge the deactivated `users` row and pseudonymise its `audit_log` address N days after offboard ("Account lifecycle", "Purge window") |
+
+The membership allow-list now also stops background and public activity for a delisted
+user (Plan 4 cutover §1, "Delisted users get nothing done for them").
+
+### Deploy order: migrations 0042 to 0045
+
+Apply all four BEFORE deploying the code that uses them:
+
+- **0042** `pending_actions` (agent-confirm).
+- **0043** `users.deactivated_at` (purge window). Load-bearing: `touchLastSeen` writes the
+  column, so on an unmigrated D1 **every sign-in fails**.
+- **0044** `outbound_mail_counts` (mail cap).
+- **0045** `pending_actions.mail_channel` (decision K: the system-mailer fallback limit).
+  Without it, a gated deferral whose own-mailbox send fails errors (500) at the fallback
+  instead of sending through SMTP2GO.
+
+0042 and 0045 also back `replanNow` (decision L dedupe) for every client in **every** env,
+trial or not: on an unmigrated D1, any `replanNow` that sends mail returns 500.
+
+```bash
+op run --env-file=../.env -- npx wrangler d1 migrations apply DB --env <env> --remote
+op run --env-file=../.env -- npx wrangler deploy --env <env>
+```
+
+`bin/deploy.sh` applies migrations before deploying, so prod is safe by construction.
+multiuser-smoke M7 seeds a `pending_actions` row and asserts offboard purges it, so it
+needs 0042.
+
+### Agent-confirm (`AGENT_CONFIRM_CLIENT_IDS`, migration 0042)
+
+For an OAuth client the var lists, the gated ops below answer
+`202 {"status":"awaiting_confirmation", action_id, expires_at, message}` instead of
+acting. Capability links, public pages and crons carry no OAuth client, so even `"*"` never
+gates them. Ungated clients get exactly the responses they always did.
+
+1. **Deferral** (`worker/src/confirm/defer.ts`). The op's payload and a summary are
+   validated and stored in `pending_actions` (owner-scoped, 24 h). The user is emailed from
+   their own mailbox, or by system mail (SMTP2GO) if that fails, with the op's label and a
+   single-use link to `GET /confirm/{id}?t=…` (capability purpose `confirm-action`). If
+   neither sends, the op answers `503 confirmation_unavailable` and stores nothing.
+   Flooding limits (decision K), all per owner and atomic in one D1 statement:
+   - **Dedupe.** The same op with the same payload (canonical JSON) while an earlier one is
+     still live (unconsumed, unexpired) returns that action's 202 again, with no new row
+     and no second email. For `commit`/acceptPlan the key is the `plan_hash`, across both
+     ops. A consumed or expired action no longer dedupes.
+   - **`replanNow` (decision L).** Its accept email uses the same `plan_hash` marker,
+     for every client (gated or not): a repeat call that lands on the same plan sends no
+     second email (`email_skipped:"duplicate"`), and the email counts toward the live cap
+     (`"too_many_pending_actions"`) and the fallback limit (`"undeliverable"`). The plan
+     is still produced and stored, and the response is still 200. Its marker also
+     dedupes a later gated `commit` of that plan, and vice versa. Webhook and Monday-cron
+     replans don't use markers: they mail on every real calendar change.
+   - **Live cap.** At most 20 live pending actions, plan-commit emails included. Past
+     that, a new one is `429 too_many_pending_actions` (a duplicate still gets its 202).
+     A plan-commit marker frees its slot once its plan is accepted (committed), expired
+     or superseded (its pending row gone): each deferral first marks such markers consumed.
+     Otherwise it lives until its link expires (up to 72 h).
+   - **System-mailer fallback.** At most 3 confirmation emails per rolling 24 h go
+     through SMTP2GO (`pending_actions.mail_channel='system'`, migration 0045; consumed
+     rows count, undelivered ones don't). Past that the op answers 503 and stores
+     nothing. SMTP2GO is shared with every user's retention and deletion mail, so one
+     looping agent can't drain it; a user whose own mailbox send keeps failing has a
+     broken grant and should re-sign in. Mail from the user's own mailbox to themselves
+     stays exempt from the O9.8 cap; the live cap bounds it instead.
+2. **Review.** The GET page shows the details (recipients, exact email text, slot, public
+   URL, as the op defines; an op may lead with an inert preview, see `updateBookingPage`)
+   and a Confirm button. The expiry is shown in the owner's effective timezone
+   (`users.home_tz`, else `SCHEDULER_TZ`), with the zone named. It is safe to prefetch.
+   Both `/confirm` routes sit outside the spec and send `no-store`, `X-Frame-Options: DENY`,
+   `noindex`, `no-referrer` and a CSP (`default-src 'none'`; a preview's srcdoc iframe
+   inherits it, so it runs no script). Long text wraps (`overflow-wrap:anywhere`).
+3. **Confirm.** The owner must still have an active account (`users.is_active = 1`):
+   a deactivated or deleted account's link reads as invalid, so a deferral that raced a
+   self-delete can't recreate rows. The browser POST consumes the row once with a CAS that also blanks its
+   payload and summary, re-checks state, and replays the op. The row stays consumed
+   whatever the outcome; a failed or stale replay is not retried, so ask the agent again.
+   A replay's links (a poll's status page and guest link, a live booking page) come back
+   as structured `links` and render as buttons, the guest link also in a read-only field
+   to copy; only `http(s)` URLs are linked, and a replay message never embeds a URL.
+
+Refused, so an agent can't click for the user:
+
+- A confirm POST carrying `Authorization`, or whose `Sec-Fetch-Site` is present and not
+  `same-origin`: 403. (Origin isn't used: with `no-referrer` a genuine form POST sends
+  `Origin: null`.)
+- An acceptPlan capability POST with `Authorization`: `403 authorization_not_allowed`; with
+  a foreign `Sec-Fetch-Site`: `403 cross_site_not_allowed`.
+- A delisted owner (allow-list set, subject not on it): the confirm link and the accept
+  link read as invalid and nothing runs (`delisted_skip`, paths `confirm_action` /
+  `accept_link`).
+- A confirm-action token presented to acceptPlan, the poll grid or the poll status page.
+
+Expired rows lose their payload and summary when a link reaches them or at the next
+deferral (by anyone), and are deleted 7 days after expiry. Offboard deletes
+`pending_actions`, so an old link can't act on a re-created account.
+
+Logs, carrying the op and action id only: `confirm_action_deferred`,
+`confirm_action_replayed`, `confirm_action_replay_failed`, `confirm_action_undeliverable`,
+`confirm_action_unknown_op`, `confirm_action_bad_payload`, `confirm_action_bad_summary`,
+`confirm_mail_provider_failed`, `confirm_action_deduped`, `confirm_action_capped`,
+`confirm_system_fallback_capped`.
+
+**Gated ops:**
+
+- **`commit` and the bearer branch of `acceptPlan` (O9.2).** These never commit for a gated
+  client. Their only `pending_actions` row is a `plan.commit-mail` marker for the dedupe,
+  live cap and fallback limit above; it is never replayed through `/confirm`. After the usual checks (404, 410, the idempotent
+  200, acceptPlan's `409 plan_superseded`, a plan from a stale timezone), the user is
+  emailed that plan's own accept email, subject "Scheduler: your assistant asked to apply a
+  plan (…)", with a fresh accept link. The op answers 202, whose `action_id` is the
+  `plan_hash`. Only the user's Accept on that page (the capability branch, with its CAS,
+  supersede, timezone, `Authorization`, `Sec-Fetch-Site` and delisted guards) commits. A
+  gated `/v1/resolve` stores the review snapshot; a plan with no reviewable changes (an
+  empty diff, or resolved by an ungated client so no snapshot) is
+  `409 plan_not_reviewable`. If no mail can be sent: 503. Logs: `plan_commit_deferred`, `plan_mail_deduped` (also `replanNow`),
+  `confirm_mail_provider_failed` and `confirm_action_undeliverable` (with `op`
+  `commit`/`acceptPlan`), `resolve_review_snapshot_failed`.
+- **Poll ops (O9.3).** `createMeetingPoll` always; `nudgeMeetingPoll` when at least one
+  invitee hasn't responded; `cancelMeetingPoll` while the poll is `open` or
+  `needs_attention`; `resolveMeetingPoll` (`book` and `bookBest`) after its status and slot
+  checks; `updateMeetingPoll` when it adds or restores an invitee, drops one, changes the
+  deadline, toggles the guest link, or changes the title or location (decision J: both
+  reach every invitee's page, later poll mail and the booked invite). The whole body is
+  then deferred. Only an edit whose every field is a no-op (the current title or location
+  re-sent, the guest link already in that state, an already-dropped removal, an empty
+  `addInvitees`) runs at once.
+  Confirming re-runs every check, including `MEETING_POLL_ENABLED` and the mail cap, and
+  refuses when: the poll was booked or cancelled meanwhile; its title, location or deadline
+  changed since the request (`content_changed`); anyone it would email wasn't shown on the
+  confirm page (`recipients_changed`; cancel exempt); or, for an edit that can book, the
+  calendar invite would reach someone not shown. The confirm result page links the status
+  page ("Open your poll status page") and the guest link ("Guest link to share", copyable).
+- **`updateBookingPage` (O9.4).** Publishing edits; see §K "Configuring a page".
+- **`deleteAccount` (decision B).** After the flag, auth, scope, body and confirm-field
+  checks, the call defers (summary: the account email). The confirm page reads
+  "Permanently delete the Optical account <email>" and says it can't be undone. Confirming
+  re-checks `SELF_SERVE_DELETE_ENABLED` and that the account is still active (else "This
+  wasn't done"), then runs the offboard and sends the deletion mail.
+
+**codemode-mcp vendored-spec drift.** Re-vendor codemode-mcp's `spec.json` after these
+land, and teach its surface/docs that `202 awaiting_confirmation` means "not done, tell
+the user to check their email":
+
+- `commit` gains 202, `409 plan_not_reviewable` and 503.
+- `acceptPlan` gains 202, 503 and the two 403s, and its 409 also covers
+  `plan_not_reviewable`.
+- The poll ops, `updateBookingPage` and `deleteAccount` gain 202 and 503.
+- The render-snapshot `trigger` gains `"api"`; `replanNow`'s response is a typed object.
+- The poll create, nudge and update ops gain `429 mail_cap_exceeded`.
+- `replanNow`'s response gains optional `email_skipped` (`"duplicate"`,
+  `"too_many_pending_actions"`, `"undeliverable"`; decision L). Teach the surface that
+  `"duplicate"` means "nothing new was sent; check the earlier email for this plan".
+
+### Untrusted fields and snapshot redaction (O9.6)
+
+Response fields that can carry third-party text are tagged `x-optical-untrusted: true` in
+`schema/openapi.json` (helper `worker/src/schema/untrusted.ts`; meaning in the spec's
+`info.description`): booker name, email, note and location detail; poll invitee names and
+emails, and `nudgeMeetingPoll`'s `nudged`; task titles and locations; dropped titles and
+resolve warnings; render-snapshot titles, `trigger.inviteTitle` and warnings. Gateways
+should fence them as data (codemode-mcp C9.1, not yet shipped).
+
+`getLatestProposedPlan.render_snapshot` and `replanNow.model` replace the titles of
+calendar events the user doesn't organise (and a foreign webhook trigger's
+`inviteTitle`) with "Busy". Provenance is recorded at build time
+(`ExternalEvent.organizedBySelf`, `TimelineEntry.origin`,
+`trigger.inviteOrganizedBySelf`) and a missing value fails closed. The stored snapshot,
+the user's email and the accept page keep the real titles. Snapshots persisted before
+this change show every non-task, non-own title as "Busy" until they expire (72 h). Events
+the user organises but others can retitle (booking events named `{booker_name}`,
+`guestsCanModify`) keep their titles, marked untrusted rather than redacted.
+`bin/regression-smoke.py`'s webhook leg asserts the redaction shape.
+
+### Outbound mail cap (`OUTBOUND_MAIL_DAILY_CAP`, migration 0044)
+
+Every production notification provider (Gmail / Graph, built in
+`worker/src/index-providers.ts`) is wrapped by `withOutboundMailCap`
+(`worker/src/mail/outbound-cap.ts`). The unit is third-party recipients per subject per UTC
+day. Mail to the user's own address (replan emails, organiser notices, confirm emails) is
+never counted.
+
+- Unset or unparseable: 50. `"0"`: no third-party mail from user mailboxes at all (a kill
+  switch, not "unlimited"). Negative values clamp to 0. Express "unlimited" as a large
+  number.
+- The slot is reserved atomically before the send and never refunded, so the cap can't be
+  overshot. Each reservation prunes the subject's older days. `outbound_mail_counts` is
+  owner-scoped; offboard deletes it.
+- `createMeetingPoll`, `nudgeMeetingPoll` and `updateMeetingPoll` check the budget before
+  any write and answer `429 mail_cap_exceeded`. A nudge racing a concurrent request can
+  stop part-way.
+- Every poll-link rotation reserves its budget first, all or nothing. A capped invitee
+  keeps their old, working link: the cron nudge leaves the poll unstamped, the
+  deadline-extended loop skips them, and a guest join doesn't create a link-less guest.
+- Cancellation, booking notices and the booking-decline sweep send what they can and log
+  the rest; a capped booker email in the decline sweep still lets the owner's heads-up go.
+- Over the cap: `outbound_mail_capped {count, cap}`.
+- Not capped: calendar-invite mail the provider sends (`sendUpdates`), and system mail
+  (SMTP2GO).
+
+Known gap: a guest-link holder rotating IPs can spend the organiser's daily budget through
+guest joins, after which the organiser's own create and nudge get 429 until 00:00 UTC (no
+link is killed).
+
+### Provider rebind refusal (`REFUSE_PROVIDER_REBIND`)
+
+With the var exactly `"true"`, `storeIdentityTokens` throws `ProviderRebindRefusedError`
+before any write when the email's account has a stored `provider_subject` and the sign-in
+carries a different subject, or comes from the other provider. A guarded
+`ON CONFLICT … DO UPDATE … WHERE` serialises two racing first binds. The callback order
+is: scope check, identity, membership, rebind check, store. So a non-member sees
+"Invitation only" and learns nothing about whether an account exists.
+
+On refusal the callback logs `auth_callback_rebind_refused {provider, mismatch}`, revokes
+the fresh grant best-effort (`revokeUpstreamGrant`, `reason:"account_bound"`; it belongs to
+the other upstream account, so the stored grant survives) and returns a 403 "Account
+already linked" page. The page tells the person to use the account they signed in with
+first, or to ask `INVITE_CONTACT`, and never names the provider. Nothing is written; sync
+state and done colour are untouched. The only release is an operator offboard, after which
+the next sign-in creates a new, empty account.
+
+- Rows from before migration 0037 (NULL `provider_subject`) still bind on their next
+  sign-in, even across providers.
+- With the var off, nothing changes: the provider switch and same-provider rebind in §O
+  still apply.
+- Unconditional, flag or not: the "existing grant" revoke skip now requires the stored
+  `provider_subject` to match (or be NULL), so a partial grant from a different account at
+  the same IdP is revoked rather than skipped.
+
+### Scope check valve (`REQUIRE_EXACT_PROVIDER_SCOPES`)
+
+The partial-consent check (`worker/src/auth/scope-check.ts`) runs in every env. If a real
+consent that ticked every box is still refused, the IdP's echo differs from what the check
+expects.
+
+1. Set `DEBUG_LOG="true"` in that env and retry. The callback logs
+   `dbg_auth_callback_granted_scopes {provider, scope}` with the raw scope string the IdP
+   returned. It never logs tokens or emails.
+2. To unblock sign-in until the fix ships, set `REQUIRE_EXACT_PROVIDER_SCOPES="false"` and
+   redeploy. Partial grants are then stored. Each one logs
+   `auth_callback_scopes_relaxed {provider, missing}`, and nothing is revoked. Calls that
+   need a missing scope then fail at the provider.
+3. Remove the override once fixed.
+
+**Before deploying the scope check to prod, verify it on dev and on the Microsoft env.**
+Apply migrations and deploy both, then run `bin/mint-token.py` once per provider (Google
+on dev, `--provider microsoft` on the Microsoft env). Both must mint a token and neither
+may show "Permissions needed". Only then deploy prod.
+
+### Single-use refresh rotation (`oauth_refresh_refused`)
+
+A `refresh_token` grant on `POST /oauth/token` rotates the pair: the presented refresh
+token and its paired access token are revoked and a new pair is issued. Rotation is
+single-use. After the checks (unknown, revoked, client, expiry, membership, role
+re-narrowing), one conditional write is the serialization point:
+
+```sql
+UPDATE oauth_tokens SET revoked_at = ? WHERE hashed_token = ? AND revoked_at IS NULL
+```
+
+Only the request that changes that row mints a new pair. When a client sends the same
+refresh token several times at once, exactly one request gets `200`. Every other one gets
+`400 {"error":"invalid_grant","error_description":"revoked"}`, the same body a sequential
+reuse gets, and writes nothing. The authorization-code grant already uses the same idiom
+on `oauth_codes.used_at`. Before this conditional write was added, every request that read
+the row before the first rotation landed minted its own 90-day chain, so a 13-wide burst
+could leave several live chains, most of them orphaned.
+
+Every `400` of the refresh grant logs one line, `oauth_refresh_refused {reason, client_id}`:
+
+| `reason` | When | Response body |
+|---|---|---|
+| `missing_params` | No `refresh_token` or no `client_id` in the form | `{"error":"invalid_request"}` |
+| `unknown_token` | No `oauth_tokens` row for the presented token | `{"error":"invalid_grant"}` |
+| `not_refresh_token` | An access token was presented | `{"error":"invalid_grant","error_description":"not a refresh token"}` |
+| `revoked` | The token was already rotated or revoked | `{"error":"invalid_grant","error_description":"revoked"}` |
+| `client_mismatch` | The token belongs to a different client | `{"error":"invalid_grant"}` |
+| `expired` | Past the 90-day refresh TTL | `{"error":"invalid_grant","error_description":"expired"}` |
+| `not_member` | Allow-list set and the subject is delisted; the presented chain is revoked (Plan 4 cutover §1) | `{"error":"invalid_grant","error_description":"not a member"}` |
+| `lost_race` | The token was rotated or revoked between this request's read and its rotation (a concurrent refresh, `/oauth/revoke`, `not_member` refusal or account delete) | `{"error":"invalid_grant","error_description":"revoked"}` |
+
+The payload is exactly `{reason, client_id}`. It never carries the token, its hash, the
+subject or an email. `client_id` is the value the caller **presented** (for
+`client_mismatch`, not the token's owner), truncated to 64 characters, and the empty string
+when absent. It isn't validated on `missing_params` or `unknown_token`, but a public client
+id is not a secret, and it is what tells a client's own burst apart from a stranger
+probing. A non-form request and the authorization-code grant's `400`s are not refresh
+refusals and are not logged.
+
+A burst of `lost_race` lines with one `client_id` is a client that refreshes without
+single-flight: several in-flight requests each noticed the access token was stale. Fix the
+client, then re-mint its tokens (Diagnostics).
+
+Two things are deliberately absent:
+
+- **No reuse grace window.** Accepting a just-rotated token for a few seconds would reopen
+  this race (each presenter in the window forks a chain) and is a theft window. Handing a
+  late presenter the same new pair is impossible: `oauth_tokens` stores only hashes.
+- **No family revocation on reuse.** OAuth 2.1 reuse detection would treat a client's
+  legitimate burst as theft and revoke the winner's fresh chain too, logging the user out
+  over a client bug. It would also need a migration (`oauth_tokens` has no family id;
+  `refresh_of` points only at the paired access token).
+
+The winner revokes the paired access token in the same D1 batch (one transaction) as the
+new pair's inserts. If issuance fails after the conditional write has won, the presented
+refresh is spent and nothing was issued, but the old access token stays live until its
+1-hour TTL; the client must re-mint. The old unconditional rotation spent the refresh the
+same way.
+
+**Deploy-order gate.** Before deploying this to any env, confirm the codemode-mcp
+single-flight refresh fix is live on every codemode-mcp deployment that talks to that
+env. Before this change, a connector that bursts refreshes kept working because several
+of its parallel requests won. With it, exactly one wins and the rest get
+`invalid_grant`; a connector that keeps the old token, or treats any `invalid_grant` as a
+dead grant, ends up without a working refresh token and stops working until it is
+re-authorised. Merging is not gated; `wrangler deploy` is.
+The `bin/` harnesses refresh sequentially on one client and are unaffected.

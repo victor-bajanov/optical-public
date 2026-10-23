@@ -112,6 +112,28 @@ describe("OpenAPI spec descriptions", () => {
     }
   });
 
+  it("documents source.kind 'meeting' as server-owned on the task ops (O9.5)", () => {
+    // A client-written meeting source made arbitrary events movable. The
+    // contract an MCP agent reads must say the kind is server-owned and name
+    // the 400 it now gets, and the response enum must admit the 'meeting' rows
+    // GET/LIST/PATCH really return.
+    const ops: Record<string, any> = {};
+    for (const methods of Object.values<any>(doc.paths)) {
+      for (const op of Object.values<any>(methods)) if (op?.operationId) ops[op.operationId] = op;
+    }
+    for (const id of ["createTask", "updateTask"]) {
+      const kind = ops[id].requestBody.content["application/json"].schema.properties.source.properties.kind;
+      expect(kind.enum, id).toContain("meeting");
+      expect(kind.description, id).toMatch(/server-owned/);
+      expect(kind.description, id).toMatch(/invalid_source/);
+      expect(ops[id].responses["400"].description, id).toMatch(/invalid_source/);
+    }
+    for (const id of ["createTask", "getTask", "updateTask"]) {
+      const resp = Object.values<any>(ops[id].responses).find((r) => r?.content?.["application/json"]?.schema?.properties?.source);
+      expect(resp.content["application/json"].schema.properties.source.properties.kind.enum, id).toContain("meeting");
+    }
+  });
+
   it("has no drift between the live routes and the PUBLISHED schema/openapi.json", () => {
     // Every other test here builds the document in memory from the live Zod
     // routes, so all of them pass against a stale published file. But

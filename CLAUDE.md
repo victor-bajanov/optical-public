@@ -38,6 +38,10 @@ under `[env.dev]`, so `wrangler d1 migrations apply scheduler-dev` fails with
 "Couldn't find a D1 DB". `wrangler d1 migrations apply DB --env dev` resolves the
 dev binding correctly.
 
+Always apply migrations BEFORE the deploy, in every env. Migration **0041**
+(`users.retention_warned_at`) is load-bearing: `requireBearer` reads the
+column, so deploying ahead of it fails every bearer call.
+
 Dev is fully isolated from prod: own D1 (`scheduler-dev`), KV, Durable Objects,
 and the `scheduler-dev.example.com` custom domain.
 
@@ -63,8 +67,10 @@ signed-in user organises are imported as `tasks` rows (`context:"meeting"`,
 `source.kind:"meeting"`) and may be relocated to slots where every *accepted*
 attendee is free. Tunables: `MEETING_MIN_NOTICE_MINUTES` (default 1440),
 `MEETING_CHURN_MULTIPLIER_CAP` (default 20). Requires the
-`calendar.freebusy` OAuth scope — existing accounts must re-consent; until then
-meetings degrade to immovable (today's behaviour). Moves notify attendees
+`calendar.freebusy` OAuth scope — existing accounts must re-consent, and the
+re-consent must grant every requested scope (a partial grant is refused at
+sign-in in every deployment; runbook Diagnostics, "Permissions needed"). Stored grants that predate
+`calendar.freebusy` degrade meetings to immovable (today's behaviour). Moves notify attendees
 (`sendUpdates=all`) only after the user accepts the proposed plan.
 
 **Enabling in dev:**
@@ -126,7 +132,10 @@ degrades on this specific error (calendar-side cleanup skipped, D1 removal
 still completes); any other provider-construction error is rethrown and
 aborts the offboard before any row is deleted. `/oauth/authorize`'s
 provider chooser offers Microsoft only when the flag is "true" **and**
-`MICROSOFT_OAUTH_CLIENT_ID` is a real (non-placeholder) value.
+`MICROSOFT_OAUTH_CLIENT_ID` is a real (non-placeholder) value. With
+`PRIVACY_URL` set, the chooser renders even when Microsoft is off, carrying
+the consent disclosure (Limited Use sentence, privacy/terms links); see
+runbook §O "Consent disclosure".
 
 Identity is derived from the id_token's verified claims (`email` only when
 Entra-attested via `xms_edov`, else the UPN), never Graph `/me.mail` — see
@@ -135,7 +144,9 @@ cleared before this reaches an env with existing Microsoft users. Signing
 in with the other provider under the same email resets that subject's
 calendar sync state and done marker (provider switch is now safe, not
 destructive-but-silent) — see runbook §O for what a switch does and does
-not clean up.
+not clean up. With `REFUSE_PROVIDER_REBIND="true"` the switch (and a
+same-provider rebind) is refused instead with an "Account already linked"
+page; see runbook §S.
 
 A user's internal identity is anchored on the provider's immutable subject
 (Microsoft `tid:oid`, Google userinfo `id` — migration 0037), not the
@@ -241,6 +252,15 @@ far they may press the strip's "Later →" cell. Pages past the reach are
 against the page holding the requested start only (`pageForStart`), so a
 far-out booking costs one read, not a year of calendar. See runbook §M
 "Paging"; smoke step B10 in `bin/booking-smoke.py`.
+
+## Booking-page owner notice
+
+Rides `BOOKING_PAGE_ENABLED` — no flag, no migration. After a claim's
+calendar event is created, the owner gets a best-effort "New booking" email
+from and to their own mailbox (booker, time in the owner's tz, duration, how,
+and the booker's note labelled as untrusted); self-addressed, so the outbound
+cap never counts it. Log line `booking_owner_notified {ok,bookingId}`. See
+runbook §K "What happens on a booking".
 
 ## Booking-page decline auto-cancel
 
@@ -395,4 +415,130 @@ Workers settings API and asserts that phase — container/shadow/fallback/
 worker; `--phase <p>` pins one; `--phase fanout` is explicit-only, dev-only,
 and expects `SOLVER_ENGINE_FANOUT="true"` +
 `SOLVER_ENGINE_FANOUT_MIN_CHUNKS="1"` deployed plus a crowded week).
+
+## Membership and account lifecycle
+
+A non-empty `MEMBERSHIP_ALLOWLIST` is authoritative: an existing active user
+not on it (and not in `OPERATOR_EMAIL`) is refused at sign-in. The
+existing-user branch applies only when no allow-list is configured.
+`worker/test/auth/membership.test.ts` pins this against each env's real toml
+values. A refused sign-in gets a 403 "Invitation only" page (asks the person
+to contact `INVITE_CONTACT`; no redirect to the client), and with an
+allow-list set a delisted subject's `refresh_token` grant is refused
+(`400 invalid_grant`, chain revoked). Offboard (`bin/optical-admin.py
+offboard`) and the `RETENTION_DAYS` sweep are in runbook "Plan 4 cutover" §4
+and "Account lifecycle".
+
+**Refresh rotation.** A `refresh_token` grant is single-use under a CAS
+(`revoked_at IS NULL`): of a concurrent burst presenting one token, exactly
+one mints a new pair and the rest get `400 invalid_grant` `"revoked"`. Every
+refused refresh logs `oauth_refresh_refused {reason, client_id}`. Don't
+deploy it to an env until the codemode-mcp single-flight refresh fix is live
+on every codemode-mcp deployment that talks to that env (runbook §S,
+"Single-use refresh rotation").
+
+**Upstream revoke.** `UPSTREAM_REVOKE_ENABLED` (default "false") makes
+offboard and a refused sign-in revoke the user's grant at the IdP (Google
+revoke endpoint; Microsoft is a no-op). Set it only where the deployment has
+its own Google OAuth client: Google's revoke removes the whole user-to-client
+grant, so deployments sharing a client would revoke each other's users.
+Runbook "Plan 4 cutover" §4.
+
+**Retention warning.** The `RETENTION_DAYS` (R) sweep emails a warning at
+`max(R−14, 1)` days idle and deletes only once the warning is ≥ 14 UTC days
+old; any activity clears it. Migration **0041**
+(`users.retention_warned_at`) must be applied BEFORE deploying:
+`requireBearer` reads the column, so an unmigrated D1 fails every bearer
+call. Runbook "Account lifecycle".
+
+**Self-serve deletion.** `SELF_SERVE_DELETE_ENABLED` (default "false") gates
+`DELETE /v1/account` (`deleteAccount`, body `{confirm:<own email>}`, needs
+`scheduler:write`). Flag off is a 404 that deliberately runs before auth, so
+a disabled deployment doesn't reveal the route (polls and the booking page
+use 403 `feature_disabled` instead). It runs the full offboard on the
+caller's own subject only; the deactivated `users` row (email, role,
+timestamps) and `audit_log` are kept and disclosed, for as long as
+`DELETED_ACCOUNT_RETENTION_DAYS` says. Runbook "Account lifecycle".
+
+**System mail.** `SYSTEM_MAIL_ENABLED` (default "false") gates Optical's
+first-party sender (`worker/src/mail/system-mailer.ts`, SMTP2GO HTTP API),
+separate from product mail sent from the user's own mailbox. Needs var
+`SYSTEM_MAIL_FROM` and secret `SYSTEM_MAIL_API_KEY`. Off is a silent no-op;
+`send` never throws. Log lines and failure statuses: runbook "Account
+lifecycle", "System mail".
+
+**Purge window.** `DELETED_ACCOUNT_RETENTION_DAYS` (unset/"0" = keep
+indefinitely) is N days after an offboard before the daily sweep deletes the
+deactivated `users` row and replaces the subject in `audit_log.subject` and
+`.actor` with a keyed `deleted:<hmac>` pseudonym. Prod and dev set "0".
+Offboard stamps `users.deactivated_at` (migration **0043**); pre-0043 rows are
+stamped on the first run, never mass-deleted. The sweep also logs
+`retention_unwarnable {count}` for users it can't warn (never auto-deleted),
+and `optical-admin list-users` flags them `overdue_unwarned`. Runbook
+"Account lifecycle", "Purge window".
+
+**Agentic safety (runbook §S).** Apply migrations **0042–0045**
+BEFORE deploying: without 0043 every sign-in fails (`touchLastSeen` writes
+`users.deactivated_at`); without 0045 (`pending_actions.mail_channel`) a
+gated op whose own-mailbox confirm send fails 500s at the system-mail
+fallback. 0042 and 0045 also back `replanNow` for every client in every env:
+on an unmigrated D1 any `replanNow` that sends mail returns 500.
+- *Agent-confirm.* `AGENT_CONFIRM_CLIENT_IDS` (unset = nobody gated; "*" =
+  every OAuth client) lists the clients whose consequential ops answer
+  `202 awaiting_confirmation` and run only after the user confirms an
+  emailed single-use link (`/confirm/{id}`, outside the spec; the POST
+  refuses `Authorization` and a foreign `Sec-Fetch-Site`). Gated: `commit`
+  and acceptPlan's bearer branch (they email the plan's own accept link),
+  the poll ops that email or book, poll title/location edits on an open or
+  escalated poll (decision J), booking-page publishing and `deleteAccount`.
+  An identical request while one waits returns the same 202 with no new
+  email. At most 20 live pending actions per user
+  (`429 too_many_pending_actions`), and at most 3 confirmations per user per
+  rolling 24 h sent by the system-mail (SMTP2GO) fallback when the user's own
+  mailbox send fails (0045; past that, 503). `replanNow` (every client)
+  sends each plan's accept email at most once while its link is live and
+  counts toward the same limits; when it skips the email it still answers
+  200, with `email_sent: false` and `email_skipped`. Replays re-check state.
+  Re-vendor codemode-mcp after any change to this surface.
+- *Outbound mail cap.* `OUTBOUND_MAIL_DAILY_CAP` (default 50; "0" = no
+  third-party mail (a kill switch, not unlimited)) caps third-party
+  recipients per subject per UTC day from the user's own mailbox (migration
+  0044). Poll create/nudge/update answer
+  `429 mail_cap_exceeded` before any write; mail to the user, calendar
+  invites and system mail aren't counted.
+- *Untrusted fields.* Response fields carrying third-party text are tagged
+  `x-optical-untrusted: true` in the spec, and render snapshots returned over
+  the API show others' event titles as "Busy".
+- *Delisted users.* With `MEMBERSHIP_ALLOWLIST` set, every cron, webhook
+  replan and public page (booking, poll, feed, accept and confirm links)
+  does nothing for a subject not on it (`delisted_skip {path}`); retention
+  and the purge still run.
+- *Provider rebind refusal.* `REFUSE_PROVIDER_REBIND` (default off; exactly
+  "true" enables) refuses a sign-in whose email belongs to an account bound
+  to a different provider subject or provider; release is an offboard.
+- *Scope valve.* `REQUIRE_EXACT_PROVIDER_SCOPES` (default: require exact
+  provider scopes; only "false" relaxes it) lets a partial grant through
+  instead of refusing it. With `DEBUG_LOG="true"` the callback logs the raw
+  granted scope string (`dbg_auth_callback_granted_scopes`). Verify the scope
+  check by minting on dev and the Microsoft env before deploying prod.
+
+## Calendar event ownership across deployments
+
+**No flag.** Every event a deployment creates (chunks, bookings, poll
+bookings) carries the private extended property `optical_deployment` = the
+origin of its `OAUTH_ISSUER` (`worker/src/providers/deployment-scope.ts`; no
+new var). Both providers strip `scheduler_chunk_id` and `optical_booking` off
+an event another deployment stamped, on every read, so commit, the stray
+scan, done-by-colour, recolour and the offboard sweep never touch it and it
+reads as ordinary busy time. `optical_poll_id` is not stripped (it keeps a
+poll meeting out of every deployment's owned-meeting import). An unstamped
+legacy chunk is the reader's own only when its task is a tasks row of this
+D1; otherwise resolve treats it as external busy time and commit and the
+offboard sweep never delete it (`worker/src/planning/scheduler-chunks.ts`).
+Commit stamps a legacy chunk of its own plan when it next reconciles it. The
+`OAUTH_ISSUER` origin is therefore a durable identity: changing it orphans
+every stamped event. One calendar should still never be
+connected to two deployments: they'd replan on each other's changes. See
+runbook §I, "Which deployment owns an event".
+
 

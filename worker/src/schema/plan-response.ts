@@ -1,6 +1,7 @@
 // worker/src/schema/plan-response.ts
 import { z } from "zod";
 import { D } from "./descriptions";
+import { untrusted } from "./untrusted";
 
 const ScheduleEntry = z.object({
   task_id: z.string().uuid().describe(D.response.schedule.task_id),
@@ -12,7 +13,7 @@ const ScheduleEntry = z.object({
 
 const DroppedEntry = z.object({
   task_id: z.string().uuid().describe(D.response.dropped.task_id),
-  title: z.string().describe(D.response.dropped.title),
+  title: untrusted(z.string().describe(D.response.dropped.title)),
   drop_cost: z.number().describe(D.response.dropped.drop_cost),
   reason: z.string().describe(D.response.dropped.reason),
   contributing_constraints: z.array(z.string()).describe(D.response.dropped.contributing_constraints),

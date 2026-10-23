@@ -2,13 +2,15 @@ import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { __setIdentityProviderForTests } from "../src/auth/identity-provider";
 import type { IdentityProvider } from "../src/auth/identity-provider";
+import { FULL_UPSTREAM_GRANT } from "./fixtures/upstream-grant";
 
 function mock(email: string): IdentityProvider {
   return {
     scopes: ["s"],
     authorizeUrl: ({ state }) => `https://idp.test/auth?state=${state}`,
-    exchangeCode: async () => ({ accessToken: "a", refreshToken: "r", expiresIn: 3600, scope: "s" }),
+    exchangeCode: async () => ({ accessToken: "a", refreshToken: "r", expiresIn: 3600, scope: FULL_UPSTREAM_GRANT }),
     fetchIdentity: async () => ({ email, providerSubject: `sub-${email}` }),
+    revokeGrant: async () => {},
     refreshAccessToken: async () => ({ accessToken: "a", expiresIn: 3600 }),
   };
 }

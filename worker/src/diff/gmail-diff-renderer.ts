@@ -8,23 +8,29 @@ function subjectFor(model: ReplanEmailModel, planHash: string): string {
   if (typeof model.trigger === "object" && model.trigger.kind === "webhook") {
     return `Scheduler: replan for invite "${model.trigger.inviteTitle}" (${shortHash(planHash)})`;
   }
+  if (model.trigger === "api") return `Scheduler: your assistant asked to apply a plan (${shortHash(planHash)})`;
   return model.isEmpty
     ? `Scheduler: weekly plan unchanged (${shortHash(planHash)})`
     : `Scheduler: weekly replan ready (${shortHash(planHash)})`;
 }
+
+// O9.2: a plan an agent-confirm client asked to commit. Static copy only.
+const AGENT_INTRO = "Your assistant asked Optical to apply this plan to your calendar. Nothing changes until you accept it.";
 
 const ctaButton = (url: string) =>
   `<div style="margin-top:18px"><a href="${esc(url)}" style="display:inline-block;background:#1a73e8;color:#fff;text-decoration:none;font-size:14px;font-weight:600;padding:11px 24px;border-radius:6px">Accept this plan</a></div>`;
 
 export class GmailDiffRenderer implements DiffEmailRenderer {
   render(model: ReplanEmailModel, opts: RenderOpts): RenderedEmail {
-    const body = renderDiffCalendarHtml(model);
+    const intro = model.trigger === "api";
+    const body = (intro ? `<p style="font-size:14px;color:#202124;margin:0 0 12px">${esc(AGENT_INTRO)}</p>` : "") +
+      renderDiffCalendarHtml(model);
     const html =
       `<!doctype html><html><body style="margin:0;padding:24px;background:#f6f8fc">` +
       `<div style="max-width:600px;margin:0 auto;background:#fff;border-radius:8px;padding:24px">` +
       body + ctaButton(opts.acceptUrl) +
       `</div></body></html>`;
-    const plaintext = `${renderDiffPlaintext(model)}\nAccept this plan: ${opts.acceptUrl}`;
+    const plaintext = `${intro ? `${AGENT_INTRO}\n\n` : ""}${renderDiffPlaintext(model)}\nAccept this plan: ${opts.acceptUrl}`;
     return { subject: subjectFor(model, opts.planHash), plaintext, html };
   }
 }

@@ -369,6 +369,25 @@ def bookings_feature_disabled_message() -> str:
     )
 
 
+def awaiting_agent_confirmation(status: int, body: dict) -> bool:
+    """True iff a poll op answered O9.3's 202 awaiting_confirmation: this
+    deployment lists the smoke's OAuth client in AGENT_CONFIRM_CLIENT_IDS
+    (trial sets "*"), so every create/nudge/cancel/resolve/emailing edit is
+    deferred until a human clicks an emailed link — the smoke can't drive
+    that, and it must not read as a poll regression."""
+    return status == 202 and isinstance(body, dict) and body.get("status") == "awaiting_confirmation"
+
+
+def agent_confirm_gated_message() -> str:
+    """The FAIL text for the awaiting_agent_confirmation case."""
+    return (
+        "createMeetingPoll answered 202 awaiting_confirmation: this deployment's "
+        "AGENT_CONFIRM_CLIENT_IDS gates the smoke client (trial sets \"*\"), so poll ops "
+        "wait for an emailed human confirmation — run poll-smoke against dev, where it is "
+        "unset; this is a harness/environment mismatch, not a poll failure"
+    )
+
+
 def nudge_is_permitted(status: str) -> bool:
     """Post-wave contract (decision D4 / M5): manual nudge is valid on an OPEN
     poll only — a needs_attention poll is closed to invitees, so nudging it
@@ -1438,6 +1457,10 @@ def run_happy_path(env: PollSmokeEnv, sched: SchedulerClient, cal: CalendarLike,
         if status == 403 and body.get("error") == "feature_disabled":
             state.soft_note("P1", "MEETING_POLL_ENABLED is not on for this deployment — SKIPPING the whole run")
             raise SystemExit(2)
+        if awaiting_agent_confirmation(status, body):
+            # Stop before the other modes each fail the same way; the stored
+            # pending action expires unconfirmed in 24 h and sends nothing.
+            raise SystemExit(f"P1 FAIL — {agent_confirm_gated_message()}")
         state.fail("P1", f"create poll: {status} {body!r}")
         return
     poll_id = body["id"]

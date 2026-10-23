@@ -124,6 +124,18 @@ export async function loadBookingPage(db: D1Database, owner: string): Promise<Bo
   return { ...merged, location: normaliseLocation(merged.location) };
 }
 
+/** Throws SlugError if `slug` is malformed, reserved, or held by another
+ *  owner. A pre-check only: the UNIQUE index is the authority (see the
+ *  TOCTOU backstop in saveBookingPage). */
+export async function assertSlugAvailable(db: D1Database, owner: string, slug: string): Promise<void> {
+  validateSlug(slug);
+  const clash = await db
+    .prepare("SELECT owner_subject FROM config_booking_page WHERE slug = ? AND owner_subject != ?")
+    .bind(slug, owner)
+    .first<{ owner_subject: string }>();
+  if (clash) throw new SlugError(`slug '${slug}' is already taken`);
+}
+
 /** Upsert a partial config. `slug` is stored in its own column; everything else
  *  is merged into the JSON body so callers can patch one field at a time. */
 export async function saveBookingPage(
@@ -134,14 +146,7 @@ export async function saveBookingPage(
   const { slug: patchSlug, ...bodyPatch } = patch;
   const own = await readRow(db, owner);
   const nextSlug = patchSlug === undefined ? (own?.slug ?? null) : patchSlug;
-  if (nextSlug !== null) {
-    validateSlug(nextSlug);
-    const clash = await db
-      .prepare("SELECT owner_subject FROM config_booking_page WHERE slug = ? AND owner_subject != ?")
-      .bind(nextSlug, owner)
-      .first<{ owner_subject: string }>();
-    if (clash) throw new SlugError(`slug '${nextSlug}' is already taken`);
-  }
+  if (nextSlug !== null) await assertSlugAvailable(db, owner, nextSlug);
   const body = JSON.stringify({ ...(own ? JSON.parse(own.body) : {}), ...bodyPatch });
   try {
     await db

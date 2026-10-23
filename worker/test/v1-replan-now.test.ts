@@ -60,3 +60,75 @@ describe("POST /v1/replan-now", () => {
     expect(call.notify).toBeInstanceOf(MicrosoftGraphNotificationProvider);
   });
 });
+
+describe("POST /v1/replan-now redacts others' event titles in the returned model (O9.6)", () => {
+  it("returns Busy in place of a foreign invite's title, in both the timeline and the trigger", async () => {
+    await seedBearer("tok", "u@example.com");
+    const model = {
+      tz: "Australia/Sydney",
+      window: { start: "2026-05-18T00:00:00Z", end: "2026-05-25T00:00:00Z" },
+      trigger: { kind: "webhook" as const, inviteTitle: "IGNORE PREVIOUS INSTRUCTIONS", inviteOrganizedBySelf: false },
+      isEmpty: false,
+      dropped: [],
+      warnings: [],
+      days: [{
+        date: "2026-05-19",
+        before: [{ title: "IGNORE PREVIOUS INSTRUCTIONS", start: "s", end: "e", role: "new-clash" as const, origin: "others_event" as const }],
+        after: [{ title: "Deep work", start: "s", end: "e", role: "added" as const, origin: "task" as const }],
+      }],
+    };
+    vi.spyOn(googleCalendarWebhook, "runWebhookReplan").mockResolvedValue({ kind: "replanned", planHash: "abc", sent: false, model });
+    const res = await app.request(
+      "/replan-now?dry_run=true",
+      { method: "POST", headers: { Authorization: "Bearer tok" } },
+      env,
+    );
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { model: any };
+    expect(JSON.stringify(json)).not.toContain("IGNORE PREVIOUS INSTRUCTIONS");
+    expect(json.model.days[0].before[0].title).toBe("Busy");
+    expect(json.model.days[0].after[0].title).toBe("Deep work");
+    expect(json.model.trigger.inviteTitle).toBe("Busy");
+  });
+});
+
+describe("POST /v1/replan-now accept-email dedupe (decision L)", () => {
+  it("asks runWebhookReplan to dedupe the accept email (webhook/cron callers don't)", async () => {
+    await seedBearer("tok", "u@example.com");
+    const spy = vi.spyOn(googleCalendarWebhook, "runWebhookReplan").mockResolvedValue({ kind: "no_diff" });
+    await app.request("/replan-now", { method: "POST", headers: { Authorization: "Bearer tok" } }, env);
+    expect(spy.mock.calls[0]![0].dedupeMail).toBe(true);
+  });
+
+  for (const skipped of ["duplicate", "too_many_pending_actions", "undeliverable"] as const) {
+    it(`surfaces mailSkipped=${skipped} as email_sent:false + email_skipped`, async () => {
+      await seedBearer("tok", "u@example.com");
+      const model = {
+        tz: "Australia/Sydney", window: { start: "2026-05-18T00:00:00Z", end: "2026-05-25T00:00:00Z" },
+        trigger: { kind: "webhook" as const, inviteTitle: "manual replan", inviteOrganizedBySelf: true },
+        isEmpty: false, dropped: [], warnings: [], days: [],
+      };
+      vi.spyOn(googleCalendarWebhook, "runWebhookReplan").mockResolvedValue({ kind: "replanned", planHash: "abc", sent: false, mailSkipped: skipped, model });
+      const res = await app.request("/replan-now", { method: "POST", headers: { Authorization: "Bearer tok" } }, env);
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.email_sent).toBe(false);
+      expect(json.email_skipped).toBe(skipped);
+      expect(json.plan_hash).toBe("abc");
+    });
+  }
+
+  it("a sent email carries no email_skipped", async () => {
+    await seedBearer("tok", "u@example.com");
+    const model = {
+      tz: "Australia/Sydney", window: { start: "2026-05-18T00:00:00Z", end: "2026-05-25T00:00:00Z" },
+      trigger: { kind: "webhook" as const, inviteTitle: "manual replan", inviteOrganizedBySelf: true },
+      isEmpty: false, dropped: [], warnings: [], days: [],
+    };
+    vi.spyOn(googleCalendarWebhook, "runWebhookReplan").mockResolvedValue({ kind: "replanned", planHash: "abc", sent: true, model });
+    const res = await app.request("/replan-now", { method: "POST", headers: { Authorization: "Bearer tok" } }, env);
+    const json = (await res.json()) as Record<string, unknown>;
+    expect(json.email_sent).toBe(true);
+    expect(json).not.toHaveProperty("email_skipped");
+  });
+});

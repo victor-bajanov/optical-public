@@ -3,7 +3,7 @@ import { env } from "cloudflare:test";
 import { runResolve } from "../../src/planning/resolve-internal";
 import { MockCalendarProvider } from "../../src/providers/mock-calendar-provider";
 import { recordChunkCompletionStmt, deleteTaskCompletionsStmt, loadCompletedChunkIdsByTask } from "../../src/db/chunk-completions";
-import { SCHEDULER_CHUNK_ID_KEY } from "../../src/providers/types";
+import { OPTICAL_DEPLOYMENT_KEY, SCHEDULER_CHUNK_ID_KEY } from "../../src/providers/types";
 
 const OWNER = "user@example.com";
 const WIN_START = "2026-06-15T00:00:00Z";
@@ -138,6 +138,32 @@ describe("per-chunk done-scan", () => {
       .bind("t2", OWNER)
       .first<{ status: string }>();
     expect(row?.status).toBe("done");
+  });
+
+  it("ignores a done-painted chunk stamped by another Optical deployment on the same calendar", async () => {
+    await seedTask("t2", {
+      title: "Atomic",
+      context: "deep",
+      priority: 60,
+      duration_minutes: 30,
+      earliest_start: WIN_START,
+    });
+    const foreign = schedulerEvent("t2#0", "2026-06-16T09:00:00.000Z", "2026-06-16T09:30:00.000Z", DONE);
+    foreign.extendedProperties.private[OPTICAL_DEPLOYMENT_KEY] = "https://optical-b.example.com";
+    const cal = new MockCalendarProvider({ deploymentId: "https://optical-a.example.com", events: [foreign] });
+    await runResolve({
+      env: { ...env, SOLVER: makeSolver() },
+      calendar: cal,
+      windowStart: WIN_START,
+      windowEnd: WIN_END,
+      accountEmail: OWNER,
+      trigger: "api",
+    });
+    const row = await env.DB.prepare("SELECT status FROM tasks WHERE id = ? AND owner_subject = ?")
+      .bind("t2", OWNER)
+      .first<{ status: string }>();
+    expect(row?.status).toBe("pending");
+    expect((await loadCompletedChunkIdsByTask(env.DB, OWNER, ["t2"])).get("t2")).toBeUndefined();
   });
 
   it("flips a multi-chunk task to done only when EVERY chunk is done-colored", async () => {

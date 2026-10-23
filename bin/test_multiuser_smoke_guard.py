@@ -388,5 +388,32 @@ def test_preflight_turns_a_refresh_rejection_into_a_clean_exit_naming_the_label(
     assert "mu-smoke-login.py B --provider microsoft" in msg
 
 
+# O9.1: offboard must also purge pending_actions (migration 0042), the
+# agent-confirm deferrals; M7 seeds one for B and asserts it's gone.
+class _RecordingD1:
+    def __init__(self):
+        self.executed: list[str] = []
+
+    def execute(self, sql: str):
+        self.executed.append(sql)
+
+
+def test_m7_purge_tables_include_pending_actions():
+    assert "pending_actions" in mu.M7_PURGED_TABLES
+    assert "pending_actions" in mu.M7_SEEDED_TABLES
+    # Everything M7 seeds it must also assert purged.
+    assert set(mu.M7_SEEDED_TABLES) <= set(mu.M7_PURGED_TABLES)
+
+
+def test_seed_pending_action_inserts_an_unexpired_row_owned_by_the_subject():
+    d1 = _RecordingD1()
+    mu._seed_pending_action(d1, "b@x.example")
+    assert len(d1.executed) == 1
+    sql = d1.executed[0]
+    assert sql.startswith("INSERT INTO pending_actions")
+    assert "'b@x.example'" in sql
+    assert "'2099-" in sql   # never expired, so only offboard can remove it
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

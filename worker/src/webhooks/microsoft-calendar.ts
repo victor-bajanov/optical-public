@@ -6,6 +6,7 @@ import { getCalendarSyncByChannelId } from "../db/calendar-sync";
 import { defaultCalendarProvider } from "../index-providers";
 import { ensureSubscription } from "./subscription-manager";
 import { webhookCallbackUrl } from "./callback-url";
+import { isActiveMember } from "../auth/membership";
 
 interface GraphNotification {
   subscriptionId?: string;
@@ -117,6 +118,11 @@ export function mountMicrosoftCalendarWebhookRoute(
         }
         for (const owner of lifecycleOwners) {
           try {
+            // Card C: a re-ensure is a Graph call with the owner's grant; a
+            // delisted owner's subscription is left to lapse, as the daily
+            // renewal does (a change notification above still reaches the
+            // coordinator, whose runner skips the replan itself).
+            if (!(await isActiveMember(c.env, owner, "ms_lifecycle_reensure"))) continue;
             const calendar = c.var.calendarProvider ?? (await defaultCalendarProvider(c.env, owner));
             await ensureSubscription({
               db: c.env.DB,

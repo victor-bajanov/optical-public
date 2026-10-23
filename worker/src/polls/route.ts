@@ -2,6 +2,7 @@ import type { Hono } from "hono";
 import type { Env } from "../env";
 import type { AppVariables } from "../index-providers";
 import { defaultCalendarProvider, defaultNotificationProvider } from "../index-providers";
+import { OutboundMailCapExceeded, reserveOutboundMail } from "../mail/outbound-cap";
 import type { CalendarProvider } from "../providers/calendar-provider";
 import type { NotificationProvider } from "../providers/notification-provider";
 import { verifyCapabilityWithEnv, signCapabilityWithEnv } from "../auth/capability";
@@ -66,6 +67,7 @@ import {
   type AggregateRow,
   type CandidateRow,
 } from "../web/poll-status-page";
+import { isActiveMember } from "../auth/membership";
 
 /** Fallback hours when neither the poll's owner nor the instance has a
  *  config_business_hours row — mirrors booking/availability.ts's own
@@ -189,6 +191,9 @@ async function resolveInvitee(
   if (!invitee || invitee.dropped || invitee.id !== claims.inviteeId) return null;
   const poll = await getPoll(db, pollId);
   if (!poll || poll.subject !== claims.subject) return null;
+  // Card C: a delisted organiser's poll reads as a dead link (no calendar
+  // read, no save, no auto-book, no mail from their mailbox).
+  if (!(await isActiveMember(env, poll.subject, "poll_page"))) return null;
   return { poll, invitee };
 }
 
@@ -215,7 +220,11 @@ async function resolveStatusToken(
   if (!token) return null;
   const claims = await verifyCapabilityWithEnv(token, env);
   if (!claims || claims.purpose !== "poll-status" || claims.pollId !== pollId) return null;
-  return getPollForSubject(db, claims.subject, pollId);
+  const poll = await getPollForSubject(db, claims.subject, pollId);
+  // Card C: each status-link view reads the organiser's calendar to rank
+  // candidates, so a delisted organiser's link is the same 404 as no poll.
+  if (!poll || !(await isActiveMember(env, poll.subject, "poll_page"))) return null;
+  return poll;
 }
 
 /** Assembles the {tz, hours, busy} triple `grid.ts`'s `candidateStarts` needs,
@@ -493,7 +502,7 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
     const guestToken = c.req.query("g") ?? "";
     if (guestToken) {
       const poll = await getPoll(c.env.DB, pollId);
-      if (poll?.guestTokenHash) {
+      if (poll?.guestTokenHash && (await isActiveMember(c.env, poll.subject, "poll_guest_join"))) {
         const hash = await hashToken(guestToken, hashingKey(c.env));
         if (hash === poll.guestTokenHash) {
           return new Response(
@@ -756,6 +765,9 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
     const pollId = c.req.param("id");
     const poll = await getPoll(c.env.DB, pollId);
     if (!poll || !poll.guestTokenHash) return notFoundResponse();
+    // Card C: a join mails from the organiser's mailbox, so a delisted
+    // organiser's guest link is the same opaque 404, before any work.
+    if (!(await isActiveMember(c.env, poll.subject, "poll_guest_join"))) return notFoundResponse();
 
     const declaredLength = Number(c.req.header("content-length"));
     if (declaredLength > MAX_JOIN_BODY_BYTES) return json({ error: "invalid_body" }, 400);
@@ -852,6 +864,16 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
 
     const notification = c.get("notificationProvider") ?? await defaultNotificationProvider(c.env, poll.subject);
 
+    async function reserveOrSkip(toEmail: string): Promise<boolean> {
+      try {
+        await reserveOutboundMail(c.env, poll!.subject, notification, [toEmail]);
+        return true;
+      } catch (err) {
+        if (err instanceof OutboundMailCapExceeded) return false;
+        throw err;
+      }
+    }
+
     // Mints a fresh capability token for `inviteeId` and emails it as that
     // invitee's personal link. Used on BOTH the new-guest path and the
     // already-invited path below — one code path mints and sends every
@@ -862,7 +884,11 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
     // organiser-authenticated create/nudge paths in handlers/polls.ts, a
     // transient email-provider hiccup here must not turn into a 500 for an
     // unauthenticated caller.
-    async function mintAndEmailLink(inviteeId: string, toEmail: string): Promise<void> {
+    async function mintAndEmailLink(inviteeId: string, toEmail: string, reserved = false): Promise<void> {
+      // O9.8: reserve the organiser's mail budget BEFORE rotating the token,
+      // so a capped send never kills the invitee's existing link (a guest-
+      // link holder re-joining as a known invitee at the cap changes nothing).
+      if (!reserved && !(await reserveOrSkip(toEmail))) return;
       const ttlSeconds = Math.max(60, Math.floor((Date.parse(poll!.deadlineUtc) + 7 * 86_400_000 - nowMs) / 1000));
       const capToken = await signCapabilityWithEnv(
         { purpose: "poll-response", pollId, inviteeId, subject: poll!.subject, ttlSeconds },
@@ -937,6 +963,9 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
     // The capability token's claims embed `inviteeId` (plan-fixed shape),
     // which db/polls.ts's `newInviteeId` lets a caller mint BEFORE the row
     // exists specifically so it can be bound into the token first.
+    // O9.8: no budget → no link-less guest row; same identical response.
+    if (!(await reserveOrSkip(trimmedEmail))) return succeed();
+
     const inviteeId = newInviteeId();
     const placeholderTokenHash = await hashToken(`${inviteeId}:pending`, hashingKey(c.env));
     try {
@@ -966,7 +995,7 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
       }
       throw err;
     }
-    await mintAndEmailLink(inviteeId, trimmedEmail);
+    await mintAndEmailLink(inviteeId, trimmedEmail, true);
     return succeed();
   });
 

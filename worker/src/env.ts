@@ -21,6 +21,11 @@ export interface Env {
   // Vars
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_POLICY_AUD: string;
+  /** Public origin of this deployment (OAuth issuer, links in mail). Its
+   *  origin is ALSO the durable owner identity stamped on every calendar event
+   *  Optical creates (optical_deployment, providers/deployment-scope.ts):
+   *  changing it makes this deployment's own chunks and bookings read as
+   *  another deployment's. Runbook §I, "Changing OAUTH_ISSUER". */
   OAUTH_ISSUER: string;
   GOOGLE_OAUTH_REDIRECT_URI: string;
   SCHEDULER_TZ: string;
@@ -98,10 +103,12 @@ export interface Env {
   // value) → tentative events do NOT block. Stringly-typed Worker var; read in
   // runResolve and passed as a boolean into buildSolverProblem.
   TENTATIVE_IS_BUSY?: string;
-  // Plan 6 brief C: inactive-user retention window in days. When this parses to a
-  // POSITIVE integer, the daily cleanup cron offboards active users whose
-  // last_seen is older than now - RETENTION_DAYS. Unset / empty / "0" / negative /
-  // non-numeric → strict NO-OP (the sweep never runs). Stringly-typed Worker var.
+  // Plan 6 brief C + hosted-trial O10b: inactive-user retention window R in
+  // days. When this parses to a POSITIVE integer, the daily cleanup cron warns
+  // active users idle max(R-14, 1) days (stamping users.retention_warned_at),
+  // then offboards those idle R days whose warning is at least 14 UTC days old
+  // (see sweep-inactive.ts). Unset / empty / "0" / negative / non-numeric →
+  // strict NO-OP (the sweep never runs). Stringly-typed Worker var.
   RETENTION_DAYS?: string;
   // Task done-marking: Google Calendar colorId applied to events for tasks that
   // have been marked done. MUST differ from the scheduler create color "5".
@@ -178,9 +185,60 @@ export interface Env {
   // other way to know which deployment it is). Missing ⇒ "unknown" — a
   // mislabelled capture beats a lost one.
   DEPLOY_ENV?: string;
+  // Hosted trial: public privacy-policy URL. When set, the /authorize chooser
+  // always renders (even with one provider) with a disclosure linking it.
+  // Trial-only; unset elsewhere.
+  PRIVACY_URL?: string;
+  // Hosted trial: public terms URL, linked beside PRIVACY_URL. Trial-only.
+  TERMS_URL?: string;
+  // Hosted trial: human-readable deployment name for user-facing pages (e.g.
+  // the not-invited page). Not DEPLOY_ENV, which is a machine label.
+  DEPLOYMENT_LABEL?: string;
+  // Hosted trial: free text telling a non-member whom to ask for an invite,
+  // shown on the not-invited page. Keeps operator names out of shipped code.
+  INVITE_CONTACT?: string;
+  // Hosted trial: when exactly "true", enables self-serve account deletion
+  // (DELETE /v1/account). Default OFF. Stringly-typed.
+  SELF_SERVE_DELETE_ENABLED?: string;
+  // Hosted trial: when exactly "true", operator mail (deletion confirmations,
+  // retention warnings) is sent via the system mail API (SMTP2GO). Default
+  // OFF: sends are silent no-ops (no fetch, no log line). Needs SYSTEM_MAIL_FROM and
+  // SYSTEM_MAIL_API_KEY. Stringly-typed.
+  SYSTEM_MAIL_ENABLED?: string;
+  // Hosted trial: sender address for system mail (see SYSTEM_MAIL_ENABLED).
+  SYSTEM_MAIL_FROM?: string;
+  // Hosted trial: when exactly "true", offboard (and the OAuth callback's
+  // refusal paths) revoke the user's grant at the IdP (Google's revoke
+  // endpoint; Microsoft is a no-op). Default OFF, and it must stay off in
+  // every env that shares its Google OAuth client with another (prod and dev
+  // do): Google's revoke removes the whole user<->client grant, so a revoke in
+  // any one env (e.g. a dev smoke offboard) would kill that Google account's
+  // credential in all of them. The trial env has its own Google project (plan
+  // D2), so the grant it revokes is its own. Stringly-typed.
+  UPSTREAM_REVOKE_ENABLED?: string;
+  // Agent-confirm gate: comma-separated OAuth client ids whose consequential
+  // actions return 202 awaiting_confirmation and run only once the user
+  // confirms by email; "*" = every client. Unset = no client gated.
+  AGENT_CONFIRM_CLIENT_IDS?: string;
+  // Per-subject outbound mail cap per UTC day (429 past it). Unset = code
+  // default 50. Stringly-typed.
+  OUTBOUND_MAIL_DAILY_CAP?: string;
+  // When exactly "true", a different provider subject signing in with an
+  // existing account's email is refused instead of rebinding. Default OFF.
+  REFUSE_PROVIDER_REBIND?: string;
+  // Require exact provider scopes: a sign-in missing product scopes is
+  // refused. Default "true" (absent = true); only exactly "false" lets it
+  // through.
+  REQUIRE_EXACT_PROVIDER_SCOPES?: string;
+  // Days after offboard before the deactivated users row is deleted and the
+  // audit_log subject pseudonymised. "0" (or unset) = keep indefinitely.
+  DELETED_ACCOUNT_RETENTION_DAYS?: string;
 
   // Secrets
   GOOGLE_OAUTH_CLIENT_ID: string;
   GOOGLE_OAUTH_CLIENT_SECRET: string;
   TOKEN_HASH_PEPPER: string;
+  // Hosted trial: system mail API key (a Worker secret, never a var). Only
+  // read when SYSTEM_MAIL_ENABLED is "true".
+  SYSTEM_MAIL_API_KEY?: string;
 }

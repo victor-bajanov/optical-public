@@ -79,6 +79,10 @@ bucket_name = "optical-solver-capture"
 [vars]
 ACCESS_TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
 ACCESS_POLICY_AUD = "REPLACE_WITH_YOUR_ACCESS_AUD"
+# OAUTH_ISSUER's origin is also this deployment's calendar-event identity: every
+# event Optical creates is stamped optical_deployment=<origin>, and a stamp that
+# doesn't match reads as another deployment's. Changing the origin orphans every
+# stamped chunk and booking; see runbook §I "Changing OAUTH_ISSUER".
 OAUTH_ISSUER = "https://scheduler.example.com"
 GOOGLE_OAUTH_REDIRECT_URI = "https://scheduler.example.com/auth/callback"
 GOOGLE_OAUTH_CLIENT_ID = "REPLACE_WITH_YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
@@ -103,6 +107,9 @@ TENTATIVE_IS_BUSY = "false"
 # Inactive-user retention (Plan 6). Empty = OFF (never sweep). Set to a positive
 # integer number of days to enable the daily offboard of users idle that long.
 RETENTION_DAYS = ""
+# Days after offboard before the deactivated users row is deleted and the
+# audit_log subject pseudonymised. "0" = keep indefinitely.
+DELETED_ACCOUNT_RETENTION_DAYS = "0"
 # Task done-marking: Google Calendar colorId for events of tasks marked done.
 # MUST differ from the scheduler create color "5" — getDoneColorId() enforces this.
 DONE_COLOR_ID = "11"
@@ -162,6 +169,11 @@ SOLVER_ENGINE = "fallback"
 # Rollback is a flip back to "false" plus a redeploy; an RPC failure already
 # degrades to the in-process path on its own (`engine_fanout_degraded`).
 SOLVER_ENGINE_FANOUT = "true"
+# Hosted trial (env.ts): self-serve DELETE /v1/account and system mail
+# (SMTP2GO) are trial-only. Pinned "false" here so the posture is explicit,
+# not inferred from absence. PRIVACY_URL/TERMS_URL stay unset outside trial.
+SELF_SERVE_DELETE_ENABLED = "false"
+SYSTEM_MAIL_ENABLED = "false"
 
 # Secrets pushed via bin/bootstrap-secrets.sh:
 #   GOOGLE_OAUTH_CLIENT_SECRET
@@ -289,6 +301,10 @@ ACCESS_POLICY_AUD = "REPLACE_WITH_YOUR_ACCESS_AUD"
 # OAUTH_ISSUER. Start OAuth flows (mint-token, codemode authorize) on this host;
 # a flow started on the workers.dev URL now fails "Login session mismatch".
 # GOOGLE_OAUTH_REDIRECT_URI must be registered in the Google OAuth console.
+# OAUTH_ISSUER's origin is also this deployment's calendar-event identity: every
+# event Optical creates is stamped optical_deployment=<origin>, and a stamp that
+# doesn't match reads as another deployment's. Changing the origin orphans every
+# stamped chunk and booking; see runbook §I "Changing OAUTH_ISSUER".
 OAUTH_ISSUER = "https://scheduler-dev.example.com"
 GOOGLE_OAUTH_REDIRECT_URI = "https://scheduler-dev.example.com/auth/callback"
 GOOGLE_OAUTH_CLIENT_ID = "REPLACE_WITH_YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
@@ -308,10 +324,13 @@ MICROSOFT_TENANT = "common"
 OPERATOR_EMAIL = "operator@example.com,operator.alt@example.com,tester1@example.com,tester2@example.com"
 # Multi-user enablement knob (Plan 4). Set a wildcard/allowlist here to authorise
 # a 2nd org user in dev and exercise owner-scoped isolation end-to-end.
-MEMBERSHIP_ALLOWLIST = "*@example.com,operator.alt@example.com,tester1@example.com"
+MEMBERSHIP_ALLOWLIST = "*@example.com,operator.alt@example.com,tester1@example.com,tester3@example.com"
 WEEKLY_CRON_ENABLED = "false"
 TENTATIVE_IS_BUSY = "false"
 RETENTION_DAYS = ""
+# Days after offboard before the deactivated users row is deleted and the
+# audit_log subject pseudonymised. "0" = keep indefinitely.
+DELETED_ACCOUNT_RETENTION_DAYS = "0"
 # Task done-marking: MUST differ from the scheduler create color "5".
 DONE_COLOR_ID = "11"
 # Diagnostic logging master switch (src/log.ts). Off in dev by default.
@@ -380,6 +399,11 @@ SOLVER_ENGINE = "fallback"
 # one phase).
 SOLVER_ENGINE_FANOUT = "true"
 SOLVER_ENGINE_FANOUT_MIN_CHUNKS = "1"
+# Hosted trial (env.ts): self-serve DELETE /v1/account and system mail
+# (SMTP2GO) are trial-only. Pinned "false" here so the posture is explicit,
+# not inferred from absence. PRIVACY_URL/TERMS_URL stay unset outside trial.
+SELF_SERVE_DELETE_ENABLED = "false"
+SYSTEM_MAIL_ENABLED = "false"
 
 # Three crons: daily cleanup (also keeps the dev Google push channel renewed —
 # channels expire silently after ~7 days; cleanup + retention sweep are
@@ -393,4 +417,5 @@ crons = [
   "0 * * * *",   # Hourly meeting-poll sweep (books/nudges); inert unless MEETING_POLL_ENABLED="true"
   "*/5 * * * *", # Booking-page decline auto-cancel sweep; inert unless BOOKING_PAGE_ENABLED="true"
 ]
+
 

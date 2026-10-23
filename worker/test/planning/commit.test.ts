@@ -9,6 +9,7 @@ import type { NotificationProvider } from "../../src/providers/notification-prov
 import { MockNotificationProvider } from "../../src/providers/mock-notification-provider";
 import { hashToken } from "../../src/auth/tokens";
 import { getProposedPlan } from "../../src/planning/proposed-plans";
+import { OPTICAL_DEPLOYMENT_KEY } from "../../src/providers/types";
 
 type Vars = { calendarProvider: CalendarProvider; notificationProvider: NotificationProvider; ownerSubject?: string };
 
@@ -1168,5 +1169,148 @@ describe("POST /v1/commit", () => {
     expect(res.status).toBe(200);
     expect(cal.fetchCalls).toHaveLength(2);
     expect(cal.fetchCalls[1]?.opts).toEqual({ syncToken: false });
+  });
+
+  describe("deployment scoping (several Optical deployments on one calendar)", () => {
+    // Two deployments connected to one calendar: without scoping, one
+    // deployment's commit would delete the other's work blocks as "its"
+    // chunks. The provider strips another deployment's ownership tags on
+    // read, so commit sees a foreign chunk as an ordinary external event.
+    const ME = "https://optical-a.example.com";
+    const OTHER = "https://optical-b.example.com";
+    const stamped = (e: ReturnType<typeof existingMatchingEvent>, by: string) => ({
+      ...e,
+      extendedProperties: { private: { ...e.extendedProperties.private, [OPTICAL_DEPLOYMENT_KEY]: by } },
+    });
+
+    it("never deletes a chunk stamped by another deployment, but still reconciles its own and legacy chunks", async () => {
+      const foreign = {
+        id: "g-foreign",
+        summary: "Trial work block",
+        start: "2026-05-20T09:00:00Z",
+        end: "2026-05-20T10:00:00Z",
+        extendedProperties: { private: { scheduler_chunk_id: "other-task#0", [OPTICAL_DEPLOYMENT_KEY]: OTHER } },
+      };
+      const legacyOrphan = {
+        id: "g-legacy-9",
+        summary: "Deep work",
+        start: "2026-05-21T09:00:00Z",
+        end: "2026-05-21T10:00:00Z",
+        extendedProperties: { private: { scheduler_chunk_id: "task-deep-1#9" } },
+      };
+      const cal = new MockCalendarProvider({
+        deploymentId: ME,
+        events: [stamped(existingMatchingEvent(), ME), foreign, legacyOrphan],
+      });
+      const res = await postCommit(makeApp(cal), "h1");
+      expect(res.status).toBe(200);
+      expect(cal.getDeleted()).toEqual(["g-legacy-9"]);
+      expect(cal.getUpdated()).toEqual([]);
+      expect(cal.getCreated()).toHaveLength(0);
+    });
+
+    it("stamps a legacy (unstamped) chunk of its own plan, sending the whole private map", async () => {
+      // Its task is in this deployment's plan, so the chunk is provably ours.
+      // The PATCH carries every existing private key, so it is safe whether the
+      // provider merges or replaces the private map.
+      const cal = new MockCalendarProvider({ deploymentId: ME, events: [existingMatchingEvent()] });
+      const res = await postCommit(makeApp(cal), "h1");
+      expect(res.status).toBe(200);
+      expect(cal.getUpdated()).toEqual([
+        {
+          eventId: "g-existing-0",
+          changes: {
+            extendedProperties: { private: { scheduler_chunk_id: "task-deep-1#0", [OPTICAL_DEPLOYMENT_KEY]: ME } },
+          },
+        },
+      ]);
+      expect(cal.getCreated()).toHaveLength(0);
+      expect(cal.getDeleted()).toHaveLength(0);
+      // A second commit of a fresh plan over the now-stamped event is a no-op.
+      const again = (await cal.fetchEventsInWindow("2026-05-18T00:00:00Z", "2026-05-25T00:00:00Z")).events;
+      expect(again[0]!.extendedProperties.private?.[OPTICAL_DEPLOYMENT_KEY]).toBe(ME);
+      expect(again[0]!.extendedProperties.private?.scheduler_chunk_id).toBe("task-deep-1#0");
+    });
+
+    it("stamps a legacy chunk in the same PATCH that moves it", async () => {
+      const cal = new MockCalendarProvider({
+        deploymentId: ME,
+        events: [{ ...existingMatchingEvent(), start: "2026-05-19T13:00:00Z", end: "2026-05-19T14:30:00Z" }],
+      });
+      const res = await postCommit(makeApp(cal), "h1");
+      expect(res.status).toBe(200);
+      expect(cal.getUpdated()).toEqual([
+        {
+          eventId: "g-existing-0",
+          changes: {
+            start: "2026-05-19T09:00:00Z",
+            end: "2026-05-19T10:30:00Z",
+            summary: "Deep work",
+            extendedProperties: { private: { scheduler_chunk_id: "task-deep-1#0", [OPTICAL_DEPLOYMENT_KEY]: ME } },
+          },
+        },
+      ]);
+    });
+
+    it("stamps a legacy stray it relocates into the plan", async () => {
+      const cal = new MockCalendarProvider({
+        deploymentId: ME,
+        events: [strayEvent("e-stray", "task-deep-1#0", "2026-04-20T01:00:00Z", "2026-04-20T02:00:00Z", "11")],
+      });
+      const res = await postCommit(makeApp(cal), "h1");
+      expect(res.status).toBe(200);
+      const moved = cal.getUpdated().find((u) => u.eventId === "e-stray")!;
+      expect(moved.changes.extendedProperties).toEqual({
+        private: { scheduler_chunk_id: "task-deep-1#0", [OPTICAL_DEPLOYMENT_KEY]: ME },
+      });
+      expect(cal.getCreated()).toHaveLength(0);
+    });
+
+    it("never deletes an unstamped (legacy) chunk whose task is not in this deployment's D1", async () => {
+      // Another deployment's pre-stamp block reads as legacy: only the task
+      // UUID proves ownership, so without a tasks row here it is left alone.
+      const otherLegacy = {
+        id: "g-other-legacy",
+        summary: "Someone else's block",
+        start: "2026-05-21T09:00:00Z",
+        end: "2026-05-21T10:00:00Z",
+        extendedProperties: { private: { scheduler_chunk_id: "not-our-task#0" } },
+      };
+      const cal = new MockCalendarProvider({ deploymentId: ME, events: [stamped(existingMatchingEvent(), ME), otherLegacy] });
+      const res = await postCommit(makeApp(cal), "h1");
+      expect(res.status).toBe(200);
+      expect(cal.getDeleted()).toEqual([]);
+    });
+
+    it("still deletes this deployment's STAMPED chunk even when its task row is gone", async () => {
+      const ownOrphan = {
+        id: "g-own-orphan",
+        summary: "Gone task",
+        start: "2026-05-21T09:00:00Z",
+        end: "2026-05-21T10:00:00Z",
+        extendedProperties: { private: { scheduler_chunk_id: "deleted-task#0", [OPTICAL_DEPLOYMENT_KEY]: ME } },
+      };
+      const cal = new MockCalendarProvider({ deploymentId: ME, events: [stamped(existingMatchingEvent(), ME), ownOrphan] });
+      const res = await postCommit(makeApp(cal), "h1");
+      expect(res.status).toBe(200);
+      expect(cal.getDeleted()).toEqual(["g-own-orphan"]);
+    });
+
+    it("never relocates another deployment's stray carrying the same chunk id; mints its own, stamped", async () => {
+      const foreignStray = stamped(
+        strayEvent("e-foreign-stray", "task-deep-1#0", "2026-04-20T01:00:00Z", "2026-04-20T02:00:00Z", "5"),
+        OTHER,
+      );
+      const cal = new MockCalendarProvider({ deploymentId: ME, events: [foreignStray] });
+      const res = await postCommit(makeApp(cal), "h1");
+      expect(res.status).toBe(200);
+      expect(cal.getUpdated()).toEqual([]);
+      expect(cal.getDeleted()).toEqual([]);
+      expect(cal.getCreated()).toHaveLength(1);
+      expect(cal.getCreated()[0]!.extendedProperties.private).toEqual({
+        scheduler_chunk_id: "task-deep-1#0",
+        [OPTICAL_DEPLOYMENT_KEY]: ME,
+      });
+    });
   });
 });

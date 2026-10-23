@@ -207,3 +207,37 @@ describe("BOOKING_PAGE_CSP", () => {
     }
   });
 });
+
+// The agent-confirm page for publishing a booking page shows this renderer's
+// output inert (a sandboxed srcdoc iframe): no scripts, sample times instead of
+// a live calendar read, and the meeting-type picker shown rather than templated.
+describe("renderBookingPage preview mode", () => {
+  const preview = { ...opts, siteKey: "", preview: true as const };
+
+  it("carries no script at all (no client module, no Turnstile)", () => {
+    const html = renderBookingPage(preview);
+    expect(html).not.toMatch(/<script/i);
+    expect(html).not.toContain(CLIENT_SRC);
+    expect(html).not.toContain("challenges.cloudflare.com");
+  });
+
+  it("says the times are examples, and shows sample slots", () => {
+    const html = renderBookingPage(preview);
+    expect(html).toMatch(/Preview/);
+    expect(html).toMatch(/example times/i);
+    expect(html).not.toMatch(/Loading availability/);
+    expect((html.match(/class="slot"/g) ?? []).length).toBeGreaterThan(2);
+  });
+
+  it("shows the meeting-type picker visibly instead of in a <template>", () => {
+    const html = renderBookingPage({ ...preview, modes: [{ kind: "meet" }, { kind: "custom", detail: "<b>Zoom</b>" }] });
+    expect(html).not.toContain("<template");
+    expect(html).toMatch(/Google Meet/);
+    expect(html).toContain("&lt;b&gt;Zoom&lt;/b&gt;");
+  });
+
+  it("keeps the live page unchanged when preview is off", () => {
+    expect(renderBookingPage(opts)).toContain(CLIENT_SRC);
+    expect(renderBookingPage(opts)).toContain("<template");
+  });
+});

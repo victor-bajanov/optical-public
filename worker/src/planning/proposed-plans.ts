@@ -485,6 +485,22 @@ export async function attachRenderSnapshot(
     .run();
 }
 
+/** attachRenderSnapshot, owner-scoped and pending-only: never rewrites a
+ *  committed plan's snapshot (a resolve can return the hash of a plan already
+ *  committed) or another subject's row. Used by the agent-confirm resolve path
+ *  (O9.2), which attaches the review snapshot the accept email and page need. */
+export async function attachPendingRenderSnapshot(
+  db: D1Database,
+  planHash: string,
+  ownerSubject: string,
+  snapshot: unknown,
+): Promise<void> {
+  await db
+    .prepare("UPDATE proposed_plans SET render_snapshot = ? WHERE plan_hash = ? AND subject = ? AND committed_at IS NULL")
+    .bind(JSON.stringify(snapshot), planHash, ownerSubject)
+    .run();
+}
+
 /** Overwrite a committed plan's body. Used by the manual-move write-back to keep
  *  the churn baseline (the latest committed plan's schedule) in sync with events
  *  the user has hand-dragged on the calendar. Owner-scoped and committed-only for

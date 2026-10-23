@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import time as _time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -569,6 +570,30 @@ def _count(d1: DevD1, table: str, subject: str) -> int:
     return int(rows[0]["n"]) if rows else 0
 
 
+# Owner-scoped tables M7 seeds a B row into (beyond tasks), and every table
+# it asserts empty for B after the offboard. pending_actions (0042) holds
+# agent-confirm deferrals; it has no API path a smoke client can reach without
+# AGENT_CONFIRM_CLIENT_IDS, so its row is seeded straight into D1.
+M7_SEEDED_TABLES = (
+    "calendar_feed_tokens", "calendar_feed_reveals",
+    "config_weights", "config_contexts", "config_business_hours",
+    "pending_actions",
+)
+M7_PURGED_TABLES = (
+    "tasks", "task_templates", "calendar_sync",
+    *M7_SEEDED_TABLES,
+)
+
+
+def _seed_pending_action(d1: DevD1, subject: str) -> None:
+    d1.execute(
+        "INSERT INTO pending_actions (id, owner_subject, op, payload, summary, created_at, expires_at, consumed_at) "
+        f"VALUES ({sql_str(f'{TASK_PREFIX}-pa-{uuid.uuid4()}')}, {sql_str(subject)}, {sql_str('mu-smoke.noop')}, "
+        f"{sql_str('{}')}, {sql_str('{}')}, {sql_str('2026-01-01T00:00:00.000Z')}, "
+        f"{sql_str('2099-01-01T00:00:00.000Z')}, NULL)"
+    )
+
+
 def run_m7(menv, d1, sa, sb, ca, cb) -> None:
     """Offboarding: admin A offboards B; B's data is purged + audited; then re-onboard B.
 
@@ -576,7 +601,9 @@ def run_m7(menv, d1, sa, sb, ca, cb) -> None:
     tasks/templates/calendar_sync, the purge must also clear B's busy-feed
     endpoint + its pending reveal (OS2, calendar_feed_tokens and
     calendar_feed_reveals — the multi-endpoint /v1/calendar-feeds surface) and
-    per-user config (L9, the three config_* tables).
+    per-user config (L9, the three config_* tables), and agent-confirm
+    deferrals awaiting B's emailed confirmation (O9.1, pending_actions; needs
+    migration 0042 on the target D1).
 
     Under --provider microsoft, the calendar-side cleanup in this same path
     runs because MS_PROVIDER_ENABLED is on for the target env — offboard
@@ -602,15 +629,14 @@ def run_m7(menv, d1, sa, sb, ca, cb) -> None:
         _seed_business_hours(d1, b_sub, "09:00", "17:00")
         d1.execute(f"INSERT OR REPLACE INTO config_weights (owner_subject, body) VALUES ({sql_str(b_sub)}, {empty})")
         d1.execute(f"INSERT OR REPLACE INTO config_contexts (owner_subject, context, body) VALUES ({sql_str(b_sub)}, {sql_str('deep')}, {empty})")
+        # O9.1: an agent-confirm deferral awaiting B's emailed confirmation.
+        _seed_pending_action(d1, b_sub)
 
         assert _count(d1, "tasks", b_sub) >= 2, "M7: precondition — B has no tasks to purge"
         # OS2/L9 preconditions: the new owner-scoped tables actually hold B rows.
         # calendar_feed_reveals is included because creating a feed above also
         # stages a reveal row for the same owner; offboard must purge both.
-        for table in (
-            "calendar_feed_tokens", "calendar_feed_reveals",
-            "config_weights", "config_contexts", "config_business_hours",
-        ):
+        for table in M7_SEEDED_TABLES:
             assert _count(d1, table, b_sub) >= 1, f"M7: precondition — B has no {table} row to purge"
 
         # Admin A offboards B.
@@ -618,11 +644,7 @@ def run_m7(menv, d1, sa, sb, ca, cb) -> None:
         assert r.status_code == 200, f"M7: offboard expected 200, got {r.status_code}: {r.text[:200]}"
 
         # B's owned rows are gone — incl. OS2 feed tokens/reveals + L9 per-user config.
-        for table in (
-            "tasks", "task_templates", "calendar_sync",
-            "calendar_feed_tokens", "calendar_feed_reveals",
-            "config_weights", "config_contexts", "config_business_hours",
-        ):
+        for table in M7_PURGED_TABLES:
             n = _count(d1, table, b_sub)
             assert n == 0, f"M7: B still has {n} rows in {table} after offboard"
         # B deactivated.
@@ -652,6 +674,7 @@ def run_m7(menv, d1, sa, sb, ca, cb) -> None:
             _cleanup_config(d1, b_sub)
             d1.execute(f"DELETE FROM calendar_feed_tokens WHERE owner_subject = {sql_str(b_sub)}")
             d1.execute(f"DELETE FROM calendar_feed_reveals WHERE owner_subject = {sql_str(b_sub)}")
+            d1.execute(f"DELETE FROM pending_actions WHERE owner_subject = {sql_str(b_sub)}")
         except Exception:
             pass
 

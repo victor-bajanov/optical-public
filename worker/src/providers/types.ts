@@ -69,3 +69,14 @@ export const SCHEDULER_CHUNK_ID_KEY = "scheduler_chunk_id";
 // re-sync recognises it as already imported and recovers the owning task row id.
 // Mirrors SCHEDULER_CHUNK_ID_KEY (used for scheduler-created chunk events).
 export const OPTICAL_MEETING_TASK_ID_KEY = "optical_meeting_task_id";
+
+// Private extended-property key carrying the origin of the Optical deployment
+// that created the event (deploymentIdFromEnv, providers/deployment-scope.ts).
+// Several deployments can be connected to one calendar; an event stamped by
+// another deployment is foreign and its ownership tags are stripped on read.
+export const OPTICAL_DEPLOYMENT_KEY = "optical_deployment";
+
+// Private extended-property keys stamped on a booking-page booking's event
+// (booking/route.ts) and a meeting poll's booked event (polls/booking.ts).
+export const OPTICAL_BOOKING_KEY = "optical_booking";
+export const OPTICAL_POLL_ID_KEY = "optical_poll_id";

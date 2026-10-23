@@ -138,6 +138,25 @@ resource "cloudflare_zero_trust_access_application" "scheduler_dev" {
   }]
 }
 
+# Zone-wide scanner / secrets-probe block rules, shared by every zone's
+# http_request_firewall_custom ruleset below (scheduler zone and trial zone).
+locals {
+  scanner_block_rules = [
+    {
+      description = "Block WordPress / PHP scanner probes (wp-admin, wp-login, xmlrpc, .php, phpinfo, wlwmanifest)"
+      expression  = "lower(http.request.uri.path) contains \"wp-admin\" or lower(http.request.uri.path) contains \"wp-login\" or lower(http.request.uri.path) contains \"wp-content\" or lower(http.request.uri.path) contains \"wp-includes\" or lower(http.request.uri.path) contains \"wlwmanifest\" or lower(http.request.uri.path) contains \"xmlrpc.php\" or lower(http.request.uri.path) contains \"/wordpress/\" or ends_with(lower(http.request.uri.path), \".php\") or lower(http.request.uri.path) contains \"phpinfo\""
+      action      = "block"
+      enabled     = true
+    },
+    {
+      description = "Block secrets harvesting (.env, .git, service-account.json, appsettings.json, _environment)"
+      expression  = "lower(http.request.uri.path) contains \"/.env\" or lower(http.request.uri.path) contains \"/.git/\" or lower(http.request.uri.path) contains \"service-account.json\" or lower(http.request.uri.path) contains \"appsettings.json\" or lower(http.request.uri.path) contains \"/_environment\" or lower(http.request.uri.path) eq \"/env.json\" or lower(http.request.uri.path) eq \"/config.json\""
+      action      = "block"
+      enabled     = true
+    },
+  ]
+}
+
 # This zone's single http_request_firewall_custom entrypoint. Optical owns it
 # (example.com is the scheduler's zone). A sibling project used to
 # manage it via a for_each but dropped this zone — its presence here is just
@@ -159,19 +178,7 @@ resource "cloudflare_ruleset" "skip_bic_api" {
   kind    = "zone"
   phase   = "http_request_firewall_custom"
 
-  rules = [
-    {
-      description = "Block WordPress / PHP scanner probes (wp-admin, wp-login, xmlrpc, .php, phpinfo, wlwmanifest)"
-      expression  = "lower(http.request.uri.path) contains \"wp-admin\" or lower(http.request.uri.path) contains \"wp-login\" or lower(http.request.uri.path) contains \"wp-content\" or lower(http.request.uri.path) contains \"wp-includes\" or lower(http.request.uri.path) contains \"wlwmanifest\" or lower(http.request.uri.path) contains \"xmlrpc.php\" or lower(http.request.uri.path) contains \"/wordpress/\" or ends_with(lower(http.request.uri.path), \".php\") or lower(http.request.uri.path) contains \"phpinfo\""
-      action      = "block"
-      enabled     = true
-    },
-    {
-      description = "Block secrets harvesting (.env, .git, service-account.json, appsettings.json, _environment)"
-      expression  = "lower(http.request.uri.path) contains \"/.env\" or lower(http.request.uri.path) contains \"/.git/\" or lower(http.request.uri.path) contains \"service-account.json\" or lower(http.request.uri.path) contains \"appsettings.json\" or lower(http.request.uri.path) contains \"/_environment\" or lower(http.request.uri.path) eq \"/env.json\" or lower(http.request.uri.path) eq \"/config.json\""
-      action      = "block"
-      enabled     = true
-    },
+  rules = concat(local.scanner_block_rules, [
     {
       ref         = "skip_bic_oauth_v1"
       description = "Skip Browser Integrity Check for Worker-authenticated OAuth and bearer API paths"
@@ -181,5 +188,47 @@ resource "cloudflare_ruleset" "skip_bic_api" {
         products = ["bic"]
       }
     },
-  ]
+  ])
+}
+
+# The hosted-trial zone's single http_request_firewall_custom entrypoint
+# (planned only when var.trial_zone_id is set). Mirrors skip_bic_api above:
+# the same two scanner block rules, then a BIC skip for the Worker-authenticated
+# /oauth and /v1 paths, scoped to the trial worker's host so anything else on
+# that zone keeps Browser Integrity Check. The DNS record is left to wrangler
+# (the trial env's custom_domain route).
+#
+# BEFORE THE FIRST APPLY: a zone has exactly one entrypoint for this phase, so
+# check whether the trial zone already has one:
+#   GET zones/<trial_zone_id>/rulesets/phases/http_request_firewall_custom/entrypoint
+# If it exists (404 means it doesn't), import it rather than let apply fail:
+#   tofu import 'cloudflare_ruleset.trial_skip_bic_api[0]' 'zones/<trial_zone_id>/<ruleset_id>'
+# and fold any rules it carries that aren't below into this resource first,
+# since apply replaces the entrypoint's whole rule list.
+resource "cloudflare_ruleset" "trial_skip_bic_api" {
+  count = var.trial_zone_id == null ? 0 : 1
+
+  zone_id = var.trial_zone_id
+  name    = "hosted trial custom rules"
+  kind    = "zone"
+  phase   = "http_request_firewall_custom"
+
+  rules = concat(local.scanner_block_rules, [
+    {
+      ref         = "trial_skip_bic_oauth_v1"
+      description = "Skip Browser Integrity Check for the trial worker's OAuth and bearer API paths"
+      expression  = "http.host eq \"${coalesce(var.trial_hostname, "unset")}\" and (starts_with(http.request.uri.path, \"/oauth\") or starts_with(http.request.uri.path, \"/v1\"))"
+      action      = "skip"
+      action_parameters = {
+        products = ["bic"]
+      }
+    },
+  ])
+
+  lifecycle {
+    precondition {
+      condition     = var.trial_hostname != null && var.trial_hostname != ""
+      error_message = "trial_hostname must be set when trial_zone_id is set."
+    }
+  }
 }

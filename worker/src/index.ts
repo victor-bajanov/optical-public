@@ -19,7 +19,9 @@ import { mountCalendarFeedRoute } from "./calendar-feed/feed-route";
 import { mountCalendarRevealRoute } from "./calendar-feed/reveal-route";
 import { mountBookingRoutes } from "./booking/route";
 import { mountPollRoutes } from "./polls/route";
+import { mountConfirmRoutes } from "./confirm/route";
 import { dispatchScheduled } from "./cron/scheduled-entry";
+import { publicPageTrailingSlash } from "./public-page-slash";
 
 export {
   defaultCalendarProvider,
@@ -55,6 +57,8 @@ export class EngineRpc extends WorkerEntrypoint<Env> {
 
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
+app.use("*", publicPageTrailingSlash);
+
 app.get("/", (c) => c.json({ name: "weekly-scheduling-assistant", version: "0.1.0" }));
 
 app.route("/oauth", oauthProviderApp);
@@ -69,6 +73,7 @@ mountCalendarFeedRoute(app);
 mountCalendarRevealRoute(app);
 mountBookingRoutes(app);
 mountPollRoutes(app);
+mountConfirmRoutes(app);
 
 app.route("/v1", v1);
 

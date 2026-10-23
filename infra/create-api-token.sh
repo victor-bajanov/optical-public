@@ -20,13 +20,26 @@ set -euo pipefail
 # Usage:
 #   export CF_CREATE_TOKEN='<single-use token with User API Tokens: Edit>'
 #   ./infra/create-api-token.sh
+#   # Hosted trial: also grant the zone permissions on the trial zone.
+#   CF_TRIAL_ZONE_ID='<trial zone id>' ./infra/create-api-token.sh
 #
 # Account / zone are not secrets — hardcoded from infra/terraform.tfvars.
 CF_ACCOUNT_ID="REPLACE_WITH_YOUR_CLOUDFLARE_ACCOUNT_ID"   # your Cloudflare account
 CF_ZONE_ID="REPLACE_WITH_YOUR_ZONE_ID"       # example.com
 TOKEN_NAME="optical-deploy"
 
+# Optional second zone: the hosted-trial deployment's zone (its worker custom
+# domain + the infra/main.tf trial_skip_bic_api WAF ruleset live there). Set it
+# to that zone's id (same value as terraform's trial_zone_id) to extend the
+# zone policy to it; leave unset to scope the token to CF_ZONE_ID only.
+CF_TRIAL_ZONE_ID="${CF_TRIAL_ZONE_ID:-}"
+
 : "${CF_CREATE_TOKEN:?Set CF_CREATE_TOKEN to a single-use token with 'User > API Tokens > Edit'}"
+
+if [ -n "$CF_TRIAL_ZONE_ID" ] && ! [[ "$CF_TRIAL_ZONE_ID" =~ ^[0-9a-f]{32}$ ]]; then
+  echo "CF_TRIAL_ZONE_ID must be a 32-char hex zone id (got '${CF_TRIAL_ZONE_ID}')" >&2
+  exit 1
+fi
 
 API="https://api.cloudflare.com/client/v4"
 AUTH=(-H "Authorization: Bearer ${CF_CREATE_TOKEN}")
@@ -82,7 +95,7 @@ WANTED=(
   "account|Access: Organizations, Identity Providers, and Groups Read"
   "account|Access: Organizations, Identity Providers, and Groups Write"
 
-  # --- zone (example.com) ---
+  # --- zone (example.com, plus CF_TRIAL_ZONE_ID when set) ---
   # Workers Routes: the worker's custom domain (scheduler.example.com).
   # DNS: terraform manages the proxied AAAA record for the hostname.
   # Zone WAF: terraform's http_request_firewall_custom ruleset that skips
@@ -155,10 +168,15 @@ POLICIES="[{
   \"permission_groups\": [${ACCOUNT_PG_JSON}]
 }"
 
+ZONE_RESOURCES="\"com.cloudflare.api.account.zone.${CF_ZONE_ID}\": \"*\""
+if [ -n "$CF_TRIAL_ZONE_ID" ]; then
+  ZONE_RESOURCES+=", \"com.cloudflare.api.account.zone.${CF_TRIAL_ZONE_ID}\": \"*\""
+fi
+
 if [ -n "$ZONE_PG_JSON" ]; then
   POLICIES+=",{
   \"effect\": \"allow\",
-  \"resources\": {\"com.cloudflare.api.account.zone.${CF_ZONE_ID}\": \"*\"},
+  \"resources\": {${ZONE_RESOURCES}},
   \"permission_groups\": [${ZONE_PG_JSON}]
 }"
 fi

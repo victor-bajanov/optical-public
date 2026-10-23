@@ -1,9 +1,12 @@
-import { escAttr } from "../util/html-escape";
+import { escAttr, escText } from "../util/html-escape";
+import type { ProviderName } from "../providers/provider-name";
 
-// Sign-in provider chooser shown by /oauth/authorize when MS_PROVIDER_ENABLED
-// is on and no ?provider= was given. Plain HTML, no client JS, no external
+// Sign-in provider chooser shown by /oauth/authorize when no ?provider= was
+// given and either more than one provider is offered or PRIVACY_URL is set
+// (the hosted trial's in-app disclosure before consent). Plain HTML, no client JS, no external
 // assets: the brand marks are inline SVG. Palette matches the booking page.
-const STYLE =
+// Exported so the sign-in-refused page (O4/O6) shares the same card styling.
+export const SIGN_IN_PAGE_STYLE =
   `:root{--fg:#1f2328;--muted:#6b7480;--line:#d8dde3;--accent:#c9a227;--pane:#fff;--bg:#eef1f5}` +
   `*{box-sizing:border-box}` +
   `body{font:15px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--fg);background:var(--bg);margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}` +
@@ -19,6 +22,11 @@ const STYLE =
   `.btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}` +
   `.btn svg{width:20px;height:20px;flex:none}` +
   `.fine{margin:18px 0 0;font-size:12px;color:var(--muted);text-align:center}` +
+  `.badge{margin-left:auto;padding:2px 9px;border:1px solid var(--accent);border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--accent)}` +
+  `.disclosure{margin:20px 0 0;padding-top:16px;border-top:1px solid var(--line);font-size:12px;line-height:1.55;color:var(--muted)}` +
+  `.disclosure p{margin:0 0 8px}` +
+  `.disclosure a{color:inherit;text-decoration:underline}` +
+  `.legal{text-align:center}` +
   `@media (prefers-color-scheme:dark){:root{--fg:#e8eaed;--muted:#9aa3ad;--line:#3a404a;--pane:#1c1f24;--bg:#121417}.btn{background:#23272e}.btn:hover{border-color:var(--accent)}}`;
 
 const GOOGLE_MARK =
@@ -29,21 +37,89 @@ const MICROSOFT_MARK =
 
 export interface ChooserLinks { google: string; microsoft: string }
 
+export interface ChooserOptions {
+  /** Providers offered. Only these get a button (Google first, then Microsoft). */
+  providers: ProviderName[];
+  /** PRIVACY_URL. Non-blank turns the disclosure block on; linked only
+   *  when it parses as an http(s) URL. */
+  privacyUrl?: string;
+  /** TERMS_URL. Linked only when it parses as an http(s) URL. */
+  termsUrl?: string;
+  /** DEPLOYMENT_LABEL, shown as a badge beside the wordmark (e.g. "Trial").
+   *  Like the rest of the disclosure, only rendered when privacyUrl is set. */
+  label?: string;
+}
+
+/** Google API Services User Data Policy disclosure. Verbatim wording required
+ *  by Google's OAuth verification (Google's official word order); do not paraphrase. */
+export const LIMITED_USE_SENTENCE =
+  "Optical's use and transfer to any other app of information received from Google APIs will adhere to Google API Services User Data Policy, including the Limited Use requirements.";
+const USER_DATA_POLICY_URL = "https://developers.google.com/terms/api-services-user-data-policy";
+const USER_DATA_POLICY_NAME = "Google API Services User Data Policy";
+
+/** An operator-supplied URL is linked only if it is absolute http(s); anything
+ *  else (blank, relative, javascript:) is dropped rather than rendered. */
+function safeHttpUrl(raw: string | undefined): string | null {
+  const v = (raw ?? "").trim();
+  if (!v) return null;
+  try {
+    const u = new URL(v);
+    return u.protocol === "https:" || u.protocol === "http:" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function limitedUseHtml(): string {
+  const [before, after] = LIMITED_USE_SENTENCE.split(USER_DATA_POLICY_NAME) as [string, string];
+  return `${escText(before)}<a href="${escAttr(USER_DATA_POLICY_URL)}" rel="noopener">${escText(USER_DATA_POLICY_NAME)}</a>${escText(after)}`;
+}
+
+function disclosureHtml(opts: ChooserOptions): string {
+  const privacy = safeHttpUrl(opts.privacyUrl);
+  const terms = safeHttpUrl(opts.termsUrl);
+  const legal = [
+    privacy ? `<a href="${escAttr(privacy)}" rel="noopener">Privacy policy</a>` : "",
+    terms ? `<a href="${escAttr(terms)}" rel="noopener">Terms of service</a>` : "",
+  ].filter(Boolean).join(" &middot; ");
+  return (
+    `<section class="disclosure">` +
+    `<p>Optical reads and writes your calendar events, reads free/busy for you and the people you meet, ` +
+    `and sends email as you (plan summaries and meeting invitations). ` +
+    `Your data reaches the AI client you connect only when you ask it to, and is never used to train AI models.</p>` +
+    `<p>${limitedUseHtml()}</p>` +
+    (legal ? `<p class="legal">${legal}</p>` : "") +
+    `</section>`
+  );
+}
+
 /** Full HTML document for the provider chooser. `links` are the re-entry
  *  URLs for /oauth/authorize with ?provider= appended (path + query, already
- *  built by the caller); they are attribute-escaped here. */
-export function renderProviderChooserPage(links: ChooserLinks): string {
+ *  built by the caller); they are attribute-escaped here. With no `opts` both
+ *  provider buttons render. */
+export function renderProviderChooserPage(
+  links: ChooserLinks,
+  opts: ChooserOptions = { providers: ["google", "microsoft"] },
+): string {
+  // The disclosure (paragraph, Limited Use, links, badge) is a hosted-trial
+  // surface keyed on PRIVACY_URL; without it the chooser is exactly today's.
+  const disclose = (opts.privacyUrl ?? "").trim().length > 0;
+  const label = disclose ? (opts.label ?? "").trim() : "";
+  const offers = (p: ProviderName) => opts.providers.includes(p);
   return (
     `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
-    `<title>Sign in &middot; Optical</title><style>${STYLE}</style></head><body>` +
+    `<title>Sign in &middot; Optical</title><style>${SIGN_IN_PAGE_STYLE}</style></head><body>` +
     `<main class="card">` +
-    `<div class="brand"><span class="dot"></span><span>Optical</span></div>` +
+    `<div class="brand"><span class="dot"></span><span>Optical</span>` +
+    (label ? `<span class="badge">${escText(label)}</span>` : "") +
+    `</div>` +
     `<h1>Sign in</h1>` +
     `<p class="lead">Choose the calendar you want Optical to plan around.</p>` +
-    `<a class="btn btn-google" href="${escAttr(links.google)}">${GOOGLE_MARK}Continue with Google</a>` +
-    `<a class="btn btn-microsoft" href="${escAttr(links.microsoft)}">${MICROSOFT_MARK}Continue with Microsoft 365</a>` +
+    (offers("google") ? `<a class="btn btn-google" href="${escAttr(links.google)}">${GOOGLE_MARK}Continue with Google</a>` : "") +
+    (offers("microsoft") ? `<a class="btn btn-microsoft" href="${escAttr(links.microsoft)}">${MICROSOFT_MARK}Continue with Microsoft 365</a>` : "") +
     `<p class="fine">You&rsquo;ll be asked to grant calendar access on the next screen.</p>` +
+    (disclose ? disclosureHtml(opts) : "") +
     `</main></body></html>`
   );
 }

@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { defaultProviders } from "../index-providers";
 import { runWebhookReplan } from "../webhooks/google-calendar";
+import { isActiveMember } from "../auth/membership";
 
 /** Fixed-window debounce: a pending alarm is NOT pushed out by later changes,
  *  so worst-case resolve latency is bounded and a stream of edits cannot starve. */
@@ -31,6 +32,11 @@ export function __setWebhookReplanForTests(fn: WebhookReplan | null): void {
 }
 
 export async function defaultRunner(env: Env, accountEmail: string): Promise<void> {
+  // Card C: both providers' webhook routes funnel here, so this one check
+  // stops every webhook-driven replan (and the booking-decline detection it
+  // carries) for a delisted-but-not-offboarded owner, before any provider is
+  // built — including a delisting that lands inside the debounce window.
+  if (!(await isActiveMember(env, accountEmail, "webhook_replan"))) return;
   // Bind both providers to the webhook OWNER's subject. Omitting it makes
   // subjectFor() fall back to resolveActiveSubject() — the globally
   // most-recently-active user — so the replan would read THAT user's Google

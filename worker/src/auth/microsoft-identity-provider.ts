@@ -57,13 +57,23 @@ export interface MicrosoftConfig {
   mailReadScopeEnabled?: boolean;
 }
 
+/** The Microsoft scope list Optical requests at /authorize, for this flag.
+ *  The single source: MicrosoftIdentityProvider requests exactly this, and
+ *  auth/scope-check.ts derives the callback's required-scope check from it. */
+export function microsoftRequestedScopes(
+  opts: Pick<MicrosoftConfig, "mailReadScopeEnabled"> = {},
+): string[] {
+  const scopes = [...MICROSOFT_SCOPES];
+  if (opts.mailReadScopeEnabled) scopes.push(MICROSOFT_MAIL_READ_SCOPE);
+  return scopes;
+}
+
 export class MicrosoftIdentityProvider implements IdentityProvider {
   readonly scopes: string[];
   private readonly tenant: string;
   constructor(private cfg: MicrosoftConfig) {
     this.tenant = cfg.tenant ?? "common";
-    this.scopes = [...MICROSOFT_SCOPES];
-    if (cfg.mailReadScopeEnabled) this.scopes.push(MICROSOFT_MAIL_READ_SCOPE);
+    this.scopes = microsoftRequestedScopes(cfg);
   }
 
   private tokenEndpoint(): string {
@@ -155,4 +165,15 @@ export class MicrosoftIdentityProvider implements IdentityProvider {
     // Microsoft rotates: pass the new refresh token up so identity-store persists it.
     return { accessToken: t.access_token, expiresIn: t.expires_in, refreshToken: t.refresh_token };
   }
+
+  // Deliberate no-op. Entra has no per-app revoke endpoint for a delegated
+  // grant: the alternatives are wrong-sized — Graph `revokeSignInSessions`
+  // kills every session the user has in every app, and deleting the
+  // oauth2PermissionGrant needs an admin-consented
+  // DelegatedPermissionGrant.ReadWrite.All. Offboard deletes the stored
+  // tokens instead (an unstored refresh token is unusable to us), and the
+  // user removes the app themselves: work/school accounts at
+  // https://myapps.microsoft.com, personal accounts at
+  // https://account.live.com/consent/Manage. See runbook "Offboarding".
+  async revokeGrant(_token: string): Promise<void> {}
 }

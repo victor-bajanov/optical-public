@@ -1,8 +1,12 @@
 import { env, applyD1Migrations } from "cloudflare:test";
-import { describe, it, expect, beforeEach, beforeAll } from "vitest";
+import { describe, it, expect, beforeEach, beforeAll, afterEach, vi } from "vitest";
 import { offboardUser } from "../../src/lifecycle/offboard";
-import { upsertUser, getUser } from "../../src/db/users";
+import { upsertUser, getUser, seedDoneColorIdIfUnset } from "../../src/db/users";
+import { OPTICAL_DONE_CATEGORY } from "../../src/providers/graph-event-mapping";
 import { ProviderDisabledError } from "../../src/index-providers";
+import { storeIdentityTokens } from "../../src/auth/identity-store";
+import { MockCalendarProvider } from "../../src/providers/mock-calendar-provider";
+import { OPTICAL_DEPLOYMENT_KEY } from "../../src/providers/types";
 // Vite ?raw import resolves to the file's string contents at build time, same
 // pattern as test/setup.ts for every other migration. Applied locally here
 // (rather than in the shared setup file, which is outside this correction's
@@ -20,6 +24,11 @@ beforeAll(async () => {
 });
 
 const SUBJECT = "leaver@org";
+
+async function seedTaskRow(subject: string, id: string) {
+  await env.DB.prepare("INSERT INTO tasks (id, owner_subject, body, status, created_at, updated_at) VALUES (?,?,?,?,?,?)")
+    .bind(id, subject, "{}", "pending", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z").run();
+}
 
 async function seedSubject() {
   await upsertUser(env.DB, SUBJECT);
@@ -71,6 +80,28 @@ describe("offboardUser", () => {
     expect((await getUser(env.DB, SUBJECT))?.is_active).toBe(0);
     const audit = await env.DB.prepare("SELECT subject, actor, action, source FROM audit_log").first<Record<string, unknown>>();
     expect(audit).toEqual({ subject: SUBJECT, actor: "admin@org", action: "offboard", source: "admin" });
+  });
+
+  it("clears the user's settings (home_tz, done_color_id) on the kept row; a later sign-in re-seeds the done marker", async () => {
+    await seedSubject();
+    await env.DB.prepare("UPDATE users SET home_tz = 'Europe/London', done_color_id = '5', retention_warned_at = '2026-01-02T00:00:00Z' WHERE subject = ?")
+      .bind(SUBJECT).run();
+    const calendarFor = () => ({ stopChannel: async () => {} }) as any;
+
+    await offboardUser(env, SUBJECT, "admin@org", { calendarFor });
+
+    const row = await env.DB.prepare("SELECT subject, is_active, home_tz, done_color_id, retention_warned_at FROM users WHERE subject = ?")
+      .bind(SUBJECT).first<Record<string, unknown>>();
+    expect(row).toEqual({ subject: SUBJECT, is_active: 0, home_tz: null, done_color_id: null, retention_warned_at: "2026-01-02T00:00:00Z" });
+
+    // Re-activation (Microsoft sign-in after offboard): the seed-if-unset path
+    // now fills the cleared marker instead of being blocked by the stale one.
+    await upsertUser(env.DB, SUBJECT);
+    await seedDoneColorIdIfUnset(env.DB, SUBJECT, OPTICAL_DONE_CATEGORY);
+    const back = await getUser(env.DB, SUBJECT);
+    expect(back?.is_active).toBe(1);
+    expect(back?.home_tz).toBeNull();
+    expect(back?.done_color_id).toBe(OPTICAL_DONE_CATEGORY);
   });
 
   it("stops a Microsoft channel whose stored resourceId is the empty string", async () => {
@@ -178,6 +209,10 @@ describe("offboardUser", () => {
   it("OS3: deletes only in-horizon scheduler-owned events on offboard", async () => {
     const S = "os3@org";
     await upsertUser(env.DB, S);
+    // Unstamped (legacy) chunks are deleted only when their task is a row of
+    // this deployment's D1 for the subject.
+    await seedTaskRow(S, "chunk-soon");
+    await seedTaskRow(S, "chunk-far");
 
     const dayMs = 24 * 60 * 60 * 1000;
     const iso = (offsetDays: number) => new Date(Date.now() + offsetDays * dayMs).toISOString();
@@ -208,6 +243,38 @@ describe("offboardUser", () => {
     await offboardUser(env, S, "admin@org", { calendarFor });
 
     expect(deleted).toEqual(["chunk-soon"]);
+  });
+
+  it("OS3: never deletes another deployment's chunks; own and legacy ones go", async () => {
+    // Several Optical deployments can share one calendar. The provider strips
+    // another deployment's chunk tag on read, so the sweep sees it as an
+    // ordinary event (providers/deployment-scope.ts).
+    const S = "os3-scope@org";
+    await upsertUser(env.DB, S);
+    await seedTaskRow(S, "legacy");
+    const soon = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
+    const chunk = (id: string, priv: Record<string, string>) => ({
+      id,
+      summary: "chunk",
+      start: soon.toISOString(),
+      end: new Date(soon.getTime() + 3600_000).toISOString(),
+      extendedProperties: { private: { scheduler_chunk_id: `${id}#0`, ...priv } },
+    });
+    const cal = new MockCalendarProvider({
+      deploymentId: "https://optical-a.example.com",
+      events: [
+        chunk("own", { [OPTICAL_DEPLOYMENT_KEY]: "https://optical-a.example.com" }),
+        chunk("legacy", {}),
+        chunk("foreign", { [OPTICAL_DEPLOYMENT_KEY]: "https://optical-b.example.com" }),
+        // Unstamped, and its task is not in this deployment's D1: another
+        // deployment's pre-stamp block (or an orphan). Left alone.
+        chunk("legacy-unknown", {}),
+      ],
+    });
+
+    await offboardUser(env, S, "admin@org", { calendarFor: () => cal as any });
+
+    expect(cal.getDeleted().sort()).toEqual(["legacy", "own"]);
   });
 
   it("OS3: a calendar sweep failure does not block D1 deletion", async () => {
@@ -292,4 +359,144 @@ describe("offboardUser", () => {
     expect(await count("poll_join_attempts", "poll_id", "poll-b")).toBe(1);
   });
 
+
+  describe("step 2.7: upstream grant revocation", () => {
+    const REFRESH = "1//decrypted-refresh-secret";
+    // Upstream revoke is gated (UPSTREAM_REVOKE_ENABLED, trial only): the
+    // other envs share one Google OAuth client, so a revoke there would kill
+    // the user's grant in every one of them.
+    const ON = () => ({ ...env, UPSTREAM_REVOKE_ENABLED: "true" }) as typeof env;
+    afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+    async function seedWithRealToken(provider: "google" | "microsoft" = "google") {
+      await seedSubject();
+      await storeIdentityTokens(env, SUBJECT, { refreshToken: REFRESH, accessToken: "at", expiresIn: 3600, scope: "s" }, provider, "psub-1");
+    }
+    const countTokens = async () =>
+      (await env.DB.prepare("SELECT COUNT(*) AS n FROM identity_tokens WHERE account_email = ?").bind(SUBJECT).first<{ n: number }>())?.n;
+    const warnLines = (spy: ReturnType<typeof vi.spyOn>) =>
+      spy.mock.calls.map((args: unknown[]) => args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+
+    it("flag off (the default): no revoke call, no token read, rows still deleted", async () => {
+      await seedWithRealToken();
+      const revokeGrant = vi.fn(async () => {});
+      const identityFor = vi.fn(() => ({ revokeGrant }));
+      const f = vi.fn(async () => new Response("{}", { status: 200 }));
+      vi.stubGlobal("fetch", f);
+      await offboardUser(env, SUBJECT, "admin@org", { calendarFor: () => ({ stopChannel: async () => {} }) as any, identityFor });
+      expect(await countTokens()).toBe(0);
+      // And the default seam (real Google IdP) makes no network call either.
+      await seedWithRealToken();
+      await offboardUser(env, SUBJECT, "admin@org", { calendarFor: () => ({ stopChannel: async () => {} }) as any });
+      expect(identityFor).not.toHaveBeenCalled();
+      expect(revokeGrant).not.toHaveBeenCalled();
+      expect(f).not.toHaveBeenCalled();
+      expect(await countTokens()).toBe(0);
+    });
+
+    it("revokes AFTER the channel stop and chunk sweep and BEFORE the D1 batch, with the decrypted refresh token", async () => {
+      await seedWithRealToken();
+      const order: string[] = [];
+      const revoked: string[] = [];
+      let rowsAtRevoke: number | undefined;
+      const calendarFor = () => ({
+        stopChannel: async () => { order.push("stopChannel"); },
+        fetchEventsInWindow: async () => { order.push("sweep"); return { events: [] }; },
+        deleteEvent: async () => {},
+      }) as any;
+      const identityFor = () => ({
+        revokeGrant: async (token: string) => {
+          order.push("revoke");
+          revoked.push(token);
+          rowsAtRevoke = await countTokens();
+        },
+      });
+
+      await offboardUser(ON(), SUBJECT, "admin@org", { calendarFor, identityFor });
+
+      expect(order).toEqual(["stopChannel", "sweep", "revoke"]);
+      expect(revoked).toEqual([REFRESH]);
+      expect(rowsAtRevoke).toBe(1); // the D1 batch had not run yet
+      expect(await countTokens()).toBe(0);
+    });
+
+    it("a revoke failure logs offboard_revoke_failed without the token and still deletes every row", async () => {
+      await seedWithRealToken();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const identityFor = () => ({
+        revokeGrant: async (token: string) => { throw new Error(`google revoke exploded for ${token}`); },
+      });
+
+      await expect(offboardUser(ON(), SUBJECT, "admin@org", { calendarFor: () => ({ stopChannel: async () => {} }) as any, identityFor }))
+        .resolves.toBeUndefined();
+
+      const lines = warnLines(warn);
+      const failed = lines.filter((l) => l.includes("offboard_revoke_failed"));
+      expect(failed).toHaveLength(1);
+      for (const l of lines) expect(l).not.toContain(REFRESH);
+      expect(await countTokens()).toBe(0);
+      expect((await getUser(env.DB, SUBJECT))?.is_active).toBe(0);
+    });
+
+    it("an identity-provider construction error that is not the kill switch also logs and continues", async () => {
+      await seedWithRealToken();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const identityFor = () => { throw new Error("boom"); };
+      await expect(offboardUser(ON(), SUBJECT, "admin@org", { calendarFor: () => ({ stopChannel: async () => {} }) as any, identityFor }))
+        .resolves.toBeUndefined();
+      expect(warnLines(warn).some((l) => l.includes("offboard_revoke_failed"))).toBe(true);
+      expect(await countTokens()).toBe(0);
+    });
+
+    it("a refresh token that cannot be decrypted logs offboard_revoke_failed and continues", async () => {
+      await seedSubject(); // identity_tokens holds 3 garbage bytes, not ciphertext
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const revokeGrant = vi.fn(async () => {});
+      await offboardUser(ON(), SUBJECT, "admin@org", { calendarFor: () => ({ stopChannel: async () => {} }) as any, identityFor: () => ({ revokeGrant }) });
+      expect(revokeGrant).not.toHaveBeenCalled();
+      expect(warnLines(warn).some((l) => l.includes("offboard_revoke_failed"))).toBe(true);
+      expect(await countTokens()).toBe(0);
+    });
+
+    it("ProviderDisabledError skips the revoke (not a failure) and still deletes every row", async () => {
+      await seedWithRealToken();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const identityFor = () => { throw new ProviderDisabledError(); };
+      await expect(offboardUser(ON(), SUBJECT, "admin@org", { calendarFor: () => ({ stopChannel: async () => {} }) as any, identityFor }))
+        .resolves.toBeUndefined();
+      const lines = warnLines(warn);
+      expect(lines.some((l) => l.includes("offboard_revoke_failed"))).toBe(false);
+      expect(lines.some((l) => l.includes("offboard_revoke_skipped"))).toBe(true);
+      expect(await countTokens()).toBe(0);
+    });
+
+    it("skips the revoke when the subject has no stored credential", async () => {
+      await upsertUser(env.DB, SUBJECT);
+      const revokeGrant = vi.fn(async () => {});
+      await offboardUser(ON(), SUBJECT, "admin@org", { calendarFor: () => ({ stopChannel: async () => {} }) as any, identityFor: () => ({ revokeGrant }) });
+      expect(revokeGrant).not.toHaveBeenCalled();
+      expect((await getUser(env.DB, SUBJECT))?.is_active).toBe(0);
+    });
+
+    it("default seam: a Google subject's refresh token is POSTed to Google's revoke endpoint", async () => {
+      await seedWithRealToken("google");
+      const f = vi.fn(async () => new Response("{}", { status: 200 }));
+      vi.stubGlobal("fetch", f);
+      await offboardUser(ON(), SUBJECT, "admin@org", { calendarFor: () => ({ stopChannel: async () => {} }) as any });
+      const revokes = (f.mock.calls as unknown as Array<[string, RequestInit]>).filter(([u]) => String(u) === "https://oauth2.googleapis.com/revoke");
+      expect(revokes).toHaveLength(1);
+      expect(new URLSearchParams(String(revokes[0]![1].body)).get("token")).toBe(REFRESH);
+      expect(await countTokens()).toBe(0);
+    });
+
+    it("default seam: a Microsoft subject under the kill switch skips the revoke and never calls Google", async () => {
+      await seedWithRealToken("microsoft");
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const f = vi.fn(async () => new Response("{}", { status: 200 }));
+      vi.stubGlobal("fetch", f);
+      await offboardUser({ ...ON(), MS_PROVIDER_ENABLED: "false" }, SUBJECT, "admin@org", { calendarFor: () => ({ stopChannel: async () => {} }) as any });
+      expect(f).not.toHaveBeenCalled();
+      expect(await countTokens()).toBe(0);
+    });
+  });
 });

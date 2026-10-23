@@ -259,6 +259,11 @@ describe("runMondayResolve", () => {
 
   it("reports added for a new proposed chunk and removed for an orphaned calendar event", async () => {
     // Calendar holds t-gone#0 (in window) which the solver does NOT place.
+    // Its task is a (done) row of this D1: an unstamped chunk is ours, and so
+    // diffed as "removed", only when that row proves it (externaliseUnprovenChunks).
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, owner_subject, body, status, created_at, updated_at) VALUES ('t-gone', 'primary', '{}', 'done', '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z')",
+    ).run();
     const cal = new MockCalendarProvider({
       events: [{ id: "sch-gone", summary: "Old task", start: "2026-05-20T23:00:00.000Z", end: "2026-05-21T00:00:00.000Z", extendedProperties: { private: { scheduler_chunk_id: "t-gone#0" } } }],
     });

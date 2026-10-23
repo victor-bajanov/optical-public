@@ -103,6 +103,18 @@ export interface BookingPageOptions {
   /** The meeting types this page offers, in the order the owner set. Already
    *  filtered to what is actually usable — see `offerableModes`. */
   modes: LocationOption[];
+  /** Inert preview for the owner's agent-confirm page: no scripts, sample
+   *  times instead of a live calendar read, the meeting-type picker shown
+   *  rather than templated. Never served on /book/{slug}. */
+  preview?: boolean;
+}
+
+/** Illustrative only: the preview never reads a calendar. */
+const SAMPLE_TIMES = ["9:00 am", "9:30 am", "10:30 am", "1:00 pm", "2:30 pm", "4:00 pm"];
+
+function sampleSlots(): string {
+  return `<div class="grid" style="grid-template-columns:repeat(4,1fr)">` +
+    SAMPLE_TIMES.map((t) => `<div class="slot">${t}</div>`).join("") + `</div>`;
 }
 
 /** Booker-facing wording. `custom` is rendered from the owner's own text, so it
@@ -119,7 +131,9 @@ const MODE_LABEL: Record<Exclude<LocationKind, "custom">, string> = {
  *  not be: routing it through the same escText as the rest of the page keeps it
  *  on one escaping path, instead of a second one via JSON in a data attribute.
  *  The client clones this markup into the form. */
-function locationTemplate(modes: LocationOption[]): string {
+function locationTemplate(modes: LocationOption[], visible = false): string {
+  const wrap = (inner: string) =>
+    visible ? `<div id="loctpl" style="margin-top:18px">${inner}</div>` : `<template id="loctpl">${inner}</template>`;
   const label = (m: LocationOption) =>
     m.kind === "custom" ? escText((m.detail ?? "").trim()) : MODE_LABEL[m.kind];
 
@@ -127,10 +141,7 @@ function locationTemplate(modes: LocationOption[]): string {
   // `data-single` is how the client learns which kind the form means.
   if (modes.length === 1) {
     const only = modes[0] as LocationOption;
-    return (
-      `<template id="loctpl"><div class="locpick" data-single="${escAttr(only.kind)}">` +
-      `<div class="msg">${label(only)}</div></div></template>`
-    );
+    return wrap(`<div class="locpick" data-single="${escAttr(only.kind)}"><div class="msg">${label(only)}</div></div>`);
   }
   const radios = modes
     .map(
@@ -139,7 +150,7 @@ function locationTemplate(modes: LocationOption[]): string {
         `value="${escAttr(m.kind)}"${i === 0 ? " checked" : ""}> ${label(m)}</label>`,
     )
     .join("");
-  return `<template id="loctpl"><div class="locpick">${radios}</div></template>`;
+  return wrap(`<div class="locpick">${radios}</div>`);
 }
 
 /** Server-rendered shell. All interactivity lives in booking.client.js, which
@@ -181,24 +192,27 @@ export function renderBookingPage(o: BookingPageOptions): string {
     // logged two "Unable to find onload callback" warnings.
     // Content-hashed filename: the asset is cached immutably, so this url is
     // what makes a deploy visible. Build-time constant, never user input.
-    `<script type="module" src="/book/_static/booking.${BOOKING_CLIENT_HASH}.js"></script>` +
-    `<script src="https://challenges.cloudflare.com/turnstile/v0/api.js` +
-    `?onload=${TURNSTILE_READY_CALLBACK}&amp;render=explicit" defer></script>` +
+    (o.preview
+      ? ""
+      : `<script type="module" src="/book/_static/booking.${BOOKING_CLIENT_HASH}.js"></script>` +
+        `<script src="https://challenges.cloudflare.com/turnstile/v0/api.js` +
+        `?onload=${TURNSTILE_READY_CALLBACK}&amp;render=explicit" defer></script>`) +
     `</head><body>` +
     `<div class="pane" id="app" data-slug="${escAttr(o.slug)}" ` +
     `data-durations="${escAttr(o.durations.join(","))}" ` +
     `data-sitekey="${escAttr(o.siteKey)}">` +
     `<div class="head"><div><h1>Book time with ${escText(o.slug)}</h1>` +
-    `<p class="muted" id="tzline">Loading availability&hellip;</p></div>${chips}</div>` +
+    `<p class="muted" id="tzline">${o.preview ? "Preview with example times, not your real availability" : "Loading availability&hellip;"}</p></div>${chips}</div>` +
     `<div class="tools"><label for="overlay">Compare with your calendar:</label>` +
     `<input type="file" id="overlay" accept=".ics,text/calendar">` +
     `<span class="ok" id="overlay-state"></span>` +
     `<label for="tzsel">Times in:</label>` +
     `<select id="tzsel"><option value="">Detecting&hellip;</option></select>` +
     `</div>` +
-    `<div class="strip" id="strip"></div>` +
-    `<div class="body"><div id="slots"></div><div id="confirm"></div></div>` +
-    locationTemplate(o.modes) +
+    (o.preview ? "" : `<div class="strip" id="strip"></div>`) +
+    (o.preview
+      ? `<div class="body"><div id="slots">${sampleSlots()}</div>${locationTemplate(o.modes, true)}</div>`
+      : `<div class="body"><div id="slots"></div><div id="confirm"></div></div>` + locationTemplate(o.modes)) +
     `</div>` +
     `</body></html>`
   );

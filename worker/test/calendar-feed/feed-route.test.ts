@@ -111,3 +111,41 @@ describe("GET /cal/:token/busy.ics", () => {
     expect(icsB).toContain("SUMMARY:Busy");
   });
 });
+
+// Card C (decision C, O14b #3): a busy feed is a per-user public URL whose
+// every fetch reads the owner's calendar with their grant, so a delisted-
+// but-not-offboarded owner's feed serves nothing (the same opaque 404 as an
+// unknown token) while an allow-list is set. The token is not revoked, so
+// re-listing restores the subscribed URL unchanged.
+describe("GET /cal/:token/busy.ics — delisted owner (card C)", () => {
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM calendar_feed_tokens").run();
+    await env.DB.prepare("DELETE FROM tasks").run();
+  });
+
+  it("404s like an unknown token, with no calendar read", async () => {
+    const { secret } = await createFeed(env.DB, env, OWNER, "default", []);
+    const provider = new MockCalendarProvider({ events: [ev("ext-meeting")] });
+    let reads = 0;
+    const real = provider.fetchEventsInWindow.bind(provider);
+    provider.fetchEventsInWindow = async (...args: Parameters<typeof real>) => { reads += 1; return real(...args); };
+    const delisted = { ...env, MEMBERSHIP_ALLOWLIST: "someone-else@org", OPERATOR_EMAIL: "" };
+
+    const res = await appWith(provider).request(`/cal/${secret}/busy.ics`, {}, delisted);
+    const unknown = await appWith(provider).request("/cal/bogus/busy.ics", {}, delisted);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe(await unknown.text());
+    expect(reads).toBe(0);
+  });
+
+  it("still serves a listed owner's feed", async () => {
+    const { secret } = await createFeed(env.DB, env, OWNER, "default", []);
+    const provider = new MockCalendarProvider({ events: [ev("ext-meeting")] });
+    const res = await appWith(provider).request(
+      `/cal/${secret}/busy.ics`,
+      {},
+      { ...env, MEMBERSHIP_ALLOWLIST: OWNER, OPERATOR_EMAIL: "" },
+    );
+    expect(res.status).toBe(200);
+  });
+});

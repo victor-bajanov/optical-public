@@ -4,7 +4,7 @@
 # dependencies = ["httpx>=0.27"]
 # ///
 """Live smoke for per-user cost-curve & weights customisation
-(internal design notes). Runs against dev or ms with
+(internal design notes). Runs against any non-prod env with
 either provider's bearer — the resolve lands on whichever calendar the
 bearer belongs to; nothing here is provider-specific.
 

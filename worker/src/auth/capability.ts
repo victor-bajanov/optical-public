@@ -41,15 +41,36 @@ export interface PollStatusCapabilityClaims {
   planHash?: undefined;
   window?: undefined;
 }
+// O9.1 agent-confirm: owner-scoped single-action grant. Lets the browser that
+// holds the emailed link view (GET) and confirm (POST) exactly one
+// pending_actions row, /confirm/{actionId} (worker/src/confirm/route.ts). The
+// route also checks the row's owner_subject equals `subject`, and the row's
+// CAS makes the grant single-use; the token itself is just the bearer of
+// "this human may confirm this action until exp".
+export interface ConfirmActionCapabilityClaims {
+  purpose: "confirm-action";
+  actionId: string;
+  subject: string;
+  exp: number;
+  planHash?: undefined;
+  window?: undefined;
+  pollId?: undefined;
+  inviteeId?: undefined;
+}
 // Discriminated on `purpose` — callers must narrow before reading
 // purpose-specific fields (see accept.ts for the established pattern).
-export type CapabilityClaims = AcceptCapabilityClaims | PollCapabilityClaims | PollStatusCapabilityClaims;
+export type CapabilityClaims =
+  | AcceptCapabilityClaims
+  | PollCapabilityClaims
+  | PollStatusCapabilityClaims
+  | ConfirmActionCapabilityClaims;
 
 // Signing inputs mirror the claims union minus `exp` (derived from ttlSeconds).
 export type CapabilityInput =
   | { purpose: "accept"; planHash: string; subject: string; ttlSeconds: number; window?: CapabilityWindow }
   | { purpose: "poll-response"; pollId: string; inviteeId: string; subject: string; ttlSeconds: number }
-  | { purpose: "poll-status"; pollId: string; subject: string; ttlSeconds: number };
+  | { purpose: "poll-status"; pollId: string; subject: string; ttlSeconds: number }
+  | { purpose: "confirm-action"; actionId: string; subject: string; ttlSeconds: number };
 
 function b64url(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -70,7 +91,9 @@ export async function signCapability(p: CapabilityInput, pepper: string): Promis
       ? { purpose: "accept", planHash: p.planHash, subject: p.subject, exp, ...(p.window ? { window: p.window } : {}) }
       : p.purpose === "poll-response"
         ? { purpose: "poll-response", pollId: p.pollId, inviteeId: p.inviteeId, subject: p.subject, exp }
-        : { purpose: "poll-status", pollId: p.pollId, subject: p.subject, exp };
+        : p.purpose === "poll-status"
+          ? { purpose: "poll-status", pollId: p.pollId, subject: p.subject, exp }
+          : { purpose: "confirm-action", actionId: p.actionId, subject: p.subject, exp };
   const payload = b64url(new TextEncoder().encode(JSON.stringify(claims)));
   const sig = await crypto.subtle.sign("HMAC", await hmacKey(pepper), new TextEncoder().encode(payload));
   return `${payload}.${b64url(new Uint8Array(sig))}`;

@@ -7,13 +7,15 @@ import { __setVerifierForTests, requireAccess } from "../../src/middleware/auth-
 import { requireAdmin } from "../../src/middleware/admin-role";
 import { upsertUser, getUser } from "../../src/db/users";
 import { offboardUser } from "../../src/lifecycle/offboard";
+import { FULL_UPSTREAM_GRANT } from "../fixtures/upstream-grant";
 
 function idp(email: string): IdentityProvider {
   return {
     scopes: ["s"],
     authorizeUrl: ({ state }) => `https://idp.test/auth?state=${state}`,
-    exchangeCode: async () => ({ accessToken: "a", refreshToken: "r", expiresIn: 3600, scope: "s" }),
+    exchangeCode: async () => ({ accessToken: "a", refreshToken: "r", expiresIn: 3600, scope: FULL_UPSTREAM_GRANT }),
     fetchIdentity: async () => ({ email, providerSubject: `sub-${email}` }),
+    revokeGrant: async () => {},
     refreshAccessToken: async () => ({ accessToken: "a", expiresIn: 3600 }),
   };
 }
@@ -43,8 +45,14 @@ describe("MERGE GATE: multi-user identity boundary", () => {
     const { state, cookie } = await startLogin();
     const res = await SELF.fetch(`https://x/auth/callback?code=g&state=${state}`,
       { redirect: "manual", headers: { cookie } });
-    const loc = new URL(res.headers.get("location")!);
-    expect(loc.searchParams.get("error")).toBe("access_denied");
+    // O4: refused with a 403 invitation-only page, never redirected to the client.
+    expect(res.status).toBe(403);
+    expect(res.headers.get("location")).toBeNull();
+    // The membership gate refused it, not the O6 scope gate (the mock grants
+    // every scope).
+    expect(await res.text()).toMatch(/invitation-only/i);
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM oauth_codes").first<{ n: number }>()).toMatchObject({ n: 0 });
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM identity_tokens").first<{ n: number }>()).toMatchObject({ n: 0 });
     expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first<{ n: number }>()).toMatchObject({ n: 0 });
   });
 

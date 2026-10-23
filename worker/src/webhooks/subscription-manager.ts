@@ -1,5 +1,5 @@
 import type { CalendarProvider } from "../providers/calendar-provider";
-import { getCalendarSync, upsertCalendarSync, PRIMARY_CALENDAR_ID } from "../db/calendar-sync";
+import { getCalendarSync, casCalendarSyncChannel, casCalendarSyncChannelExpiry, PRIMARY_CALENDAR_ID } from "../db/calendar-sync";
 import { requireOwner } from "../db/d1";
 
 // 48h, not 24h: the renewal cron runs daily, so a 24h threshold gives exactly
@@ -37,6 +37,22 @@ function generateChannelToken(): string {
   return s;
 }
 
+// Stop a channel no calendar_sync row references any more. Best-effort: a
+// failed stop leaves the channel to expire. Meanwhile its pushes get 404
+// unknown_channel on Google, and the Microsoft webhook answers 202 and drops
+// them. The logged ids are what the /admin/stop-channel one-shot needs.
+async function stopBestEffort(calendar: CalendarProvider, channelId: string, resourceId: string): Promise<void> {
+  try {
+    await calendar.stopChannel(channelId, resourceId);
+  } catch (e) {
+    console.warn("ensureSubscription: stopChannel failed (continuing)", {
+      channelId,
+      resourceId,
+      error: String(e),
+    });
+  }
+}
+
 export async function ensureSubscription(args: EnsureSubscriptionArgs): Promise<EnsureSubscriptionResult> {
   const { db, calendar, callbackUrl } = args;
   const owner = requireOwner(args.ownerSubject);
@@ -72,9 +88,21 @@ export async function ensureSubscription(args: EnsureSubscriptionArgs): Promise<
   ) {
     try {
       const renewed = await calendar.renewSubscription(existing.channel_id);
-      await upsertCalendarSync(db, owner, PRIMARY_CALENDAR_ID, {
-        channel_expires_at: renewed.expiresAt,
-      });
+      // Update-only CAS on the renewed channel id: an offboard that deleted
+      // the row while the renew was in flight must not be undone by an
+      // insert, and a channel a concurrent rotation stored keeps its own
+      // expiry. Refused, the renewed channel is no longer referenced by any
+      // row, so stop it (best-effort, like the rotate path's loser below).
+      const stored = await casCalendarSyncChannelExpiry(
+        db, owner, PRIMARY_CALENDAR_ID, existing.channel_id, renewed.expiresAt,
+      );
+      if (!stored) {
+        console.warn("ensureSubscription: renewed channel no longer stored, stopping it", {
+          channelId: existing.channel_id,
+        });
+        await stopBestEffort(calendar, existing.channel_id, existing.channel_resource_id ?? "");
+        return { subscribed: false };
+      }
       return { subscribed: true };
     } catch (e) {
       console.warn("ensureSubscription: renew failed, rotating", {
@@ -93,13 +121,27 @@ export async function ensureSubscription(args: EnsureSubscriptionArgs): Promise<
   // (no D1 row references it) with no trail to find it by; this log line is
   // what makes it recoverable via the /admin/stop-channel one-shot.
   console.info("ensureSubscription: new subscription created", { channelId: sub.channelId });
-  await upsertCalendarSync(db, owner, PRIMARY_CALENDAR_ID, {
+  // Compare-and-set on the channel_id read above. Two writers can race here
+  // (a sign-in's waitUntil against the daily sweep, two quick sign-ins): both
+  // saw the same channel and both created one. Only the first write lands;
+  // the loser stops its own channel, or it would stay live until expiry with
+  // no row referencing it, and leaves the prior channel to the winner. The
+  // write is also refused when the subject no longer holds a stored grant
+  // (offboarded while this subscribe was in flight, e.g. by the retention
+  // sweep that the cron runs alongside renewal): that is handled exactly like
+  // a lost race, so no calendar_sync row is recreated for a gone subject.
+  const won = await casCalendarSyncChannel(db, owner, PRIMARY_CALENDAR_ID, priorChannelId, {
     channel_id: sub.channelId,
     channel_token: sub.channelToken,
     channel_expires_at: sub.expiresAt,
     channel_resource_id: sub.resourceId,
     channel_callback_url: callbackUrl,
   });
+  if (!won) {
+    console.warn("ensureSubscription: lost a concurrent write, stopping own channel", { channelId: sub.channelId });
+    await stopBestEffort(calendar, sub.channelId, sub.resourceId);
+    return { subscribed: false };
+  }
 
   // Subscribe the new channel FIRST (never go dark), then best-effort stop the
   // old one so Google stops delivering on it. A stale channel that 404s is fine

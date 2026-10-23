@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { taskBelongsInWindow } from "../../src/planning/task-window";
+import { taskBelongsInWindow, taskWindowVerdict } from "../../src/planning/task-window";
 
 // Window under test: [2026-05-18, 2026-05-25) (a Mon–Mon week).
 const S = Date.parse("2026-05-18T00:00:00Z");
@@ -186,5 +186,61 @@ describe("taskBelongsInWindow — malformed anchors never silently shed", () => 
 
   it("includes a task with an unparseable deadline and no anchor", () => {
     expect(include({ deadline: { at: "garbage" } })).toBe(true);
+  });
+});
+
+describe("taskWindowVerdict", () => {
+  const verdict = (
+    a: Parameters<typeof taskWindowVerdict>[0],
+    nowMs: number = NOW,
+  ) => taskWindowVerdict(a, S, E, nowMs);
+  const beforeWindow = Date.parse("2026-05-14T12:00:00Z");
+
+  it("future: earliest_start floor at/after the window end", () => {
+    expect(verdict({ earliest_start: nextWeek })).toBe("future");
+  });
+
+  it("future: the earliest_start guard overrides an in-window anchor", () => {
+    expect(verdict({ earliest_start: nextWeek, scheduled_for: thisWeek })).toBe("future");
+  });
+
+  it("past: anchor before the window", () => {
+    expect(verdict({ scheduled_for: lastWeek })).toBe("past");
+  });
+
+  it("future: anchor at/after the window end", () => {
+    expect(verdict({ pinned_at: nextWeek })).toBe("future");
+  });
+
+  it("in: anchor inside the window", () => {
+    expect(verdict({ scheduled_for: thisWeek })).toBe("in");
+  });
+
+  it("past: a recurring occurrence's earliest_start is an anchor", () => {
+    expect(verdict({ template_id: "tmpl-1", earliest_start: lastWeek })).toBe("past");
+  });
+
+  it("past: no anchor, deadline before the window (overdue)", () => {
+    expect(verdict({ deadline: { at: pastDeadline } })).toBe("past");
+  });
+
+  it("unclaimed: pure backlog in a not-yet-started window", () => {
+    expect(verdict({}, beforeWindow)).toBe("unclaimed");
+  });
+
+  it("unclaimed: a past earliest_start floor does not claim a future window", () => {
+    expect(verdict({ earliest_start: lastWeek }, beforeWindow)).toBe("unclaimed");
+  });
+
+  it("in: an earliest_start floor inside a not-yet-started window", () => {
+    expect(verdict({ earliest_start: thisWeek }, beforeWindow)).toBe("in");
+  });
+
+  it("in: a future deadline claims a not-yet-started window (work ahead)", () => {
+    expect(verdict({ deadline: { at: futureDeadline } }, beforeWindow)).toBe("in");
+  });
+
+  it("in: backlog in a started window", () => {
+    expect(verdict({})).toBe("in");
   });
 });

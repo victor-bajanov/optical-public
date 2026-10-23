@@ -3,6 +3,7 @@ import type { Env } from "../env";
 import type { AppVariables } from "../index-providers";
 import { requireOwner } from "../middleware/owner-gate";
 import { PlanBodySchema } from "../schema/plan-response";
+import { getExistingTaskIds } from "../db/tasks";
 import { getLatestCommittedPlanForSubject } from "./proposed-plans";
 
 export function mountScheduleRoute(
@@ -13,7 +14,8 @@ export function mountScheduleRoute(
     path: "/schedule",
     operationId: "getSchedule",
     summary: "Retrieve the latest committed plan body (current schedule).",
-    description: "Return the body of the latest committed plan — the current live schedule.",
+    description:
+      "Return the body of the latest committed plan — the current live schedule. Entries (in both schedule and dropped) whose task has since been deleted are omitted: the response reflects the caller's tasks as they exist now, even though the committed plan itself is not rewritten. Owned meetings follow the same rule.",
     security: [{ BearerAuth: [] }],
     responses: {
       200: {
@@ -38,6 +40,20 @@ export function mountScheduleRoute(
     // committed plan, never the globally-latest one.
     const plan = await getLatestCommittedPlanForSubject(c.env.DB, owner);
     if (!plan) return c.json({ error: "no_committed_plan" }, 404);
-    return c.json(plan.body as z.infer<typeof PlanBodySchema>);
+    const body = plan.body as z.infer<typeof PlanBodySchema>;
+    // The committed plan is a snapshot: a task deleted after commit (its chunk
+    // events already removed by DELETE /v1/tasks/{id}) would otherwise linger
+    // here until the next commit, which an empty-diff plan can't produce on
+    // agent-confirm deployments. Filter read-side, owner-scoped; the stored
+    // plan row is left untouched.
+    const existing = await getExistingTaskIds(c.env.DB, owner, [
+      ...body.schedule.map((e) => e.task_id),
+      ...body.dropped.map((e) => e.task_id),
+    ]);
+    return c.json({
+      ...body,
+      schedule: body.schedule.filter((e) => existing.has(e.task_id)),
+      dropped: body.dropped.filter((e) => existing.has(e.task_id)),
+    });
   });
 }

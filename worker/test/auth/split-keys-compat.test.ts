@@ -11,6 +11,7 @@ function idp(): IdentityProvider {
     authorizeUrl: () => "https://idp.test",
     exchangeCode: async () => ({ accessToken: "a", refreshToken: "r", expiresIn: 3600, scope: "s" }),
     fetchIdentity: async () => ({ email: "u@org", providerSubject: "sub-u@org" }),
+    revokeGrant: async () => {},
     refreshAccessToken: async () => ({ accessToken: "fresh", expiresIn: 3600 }),
   };
 }

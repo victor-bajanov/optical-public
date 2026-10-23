@@ -196,6 +196,21 @@ def test_assert_dev_url_still_allows_smoke_workers_dev_subdomains():
 
 
 # =============================================================================
+# O13 — bin/_env_hosts.py (the operator CLI's per-env table) agrees with the
+# smoke guards' hosts, and a non-smoke env in it stays refused by the guard
+# =============================================================================
+
+env_hosts = _load("env_hosts_smoke_guard_test", "_env_hosts.py")
+
+
+def test_env_hosts_agree_with_smoke_lib_hosts():
+    assert env_hosts.ENV_HOSTS["dev"] == lib._DEV_HOST
+    assert env_hosts.ENV_HOSTS["prod"] == lib._PROD_HOST
+
+
+
+
+# =============================================================================
 # D8/m2 — _smoke_lib.py defines the dev/prod host constants exactly once
 # (only the underscore-prefixed pair; the old duplicate public DEV_HOST/
 # PROD_HOST pair — dead since only the underscore pair was ever read — is

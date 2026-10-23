@@ -5,6 +5,26 @@ import type { AppVariables } from "../index-providers";
 import { requireOwner } from "../middleware/owner-gate";
 import { defaultProviders } from "../index-providers";
 import { runWebhookReplan } from "../webhooks/google-calendar";
+import { redactRenderSnapshot } from "../diff/redact-snapshot";
+import { RenderSnapshotSchema, type RenderSnapshot } from "../schema/render-snapshot";
+
+const ReplanNowResponse = z.object({
+  ok: z.literal(true),
+  replanned: z.boolean().describe("Whether a new proposed plan was produced."),
+  reason: z.enum(["no_changes", "no_diff"]).optional().describe("Why nothing was replanned: no_changes = no relevant calendar change; no_diff = the resolve matched the calendar."),
+  unsat: z.boolean().optional().describe("True when the week is infeasible; see unsat_core."),
+  unsat_core: z.unknown().optional().describe("Solver infeasibility core, when unsat."),
+  solver_error: z.object({
+    status: z.number().describe("Solver HTTP status."),
+    detail: z.string().describe("Solver error detail."),
+  }).optional().describe("Present when the solver failed."),
+  plan_hash: z.string().optional().describe("Hash of the new proposed plan, when replanned."),
+  email_sent: z.boolean().optional().describe("Whether the replan email was sent (false on dry_run, and when email_skipped is set)."),
+  email_skipped: z.enum(["duplicate", "too_many_pending_actions", "undeliverable"]).optional().describe(
+    "Why no email went out although the plan was produced and stored (absent when sent or on dry_run). duplicate: this plan's accept email was already sent and its link is still live (sent at most once per plan_hash for up to 72 hours). too_many_pending_actions: the account already has 20 emailed plans/actions waiting for the user. undeliverable: the user's mailbox send failed and Optical's own fallback mailer was off or at its per-account limit (3 per 24 hours). In every case nothing was applied; the plan can still be accepted from an earlier email or committed directly.",
+  ),
+  model: RenderSnapshotSchema.optional().describe("The plan's render model, when replanned. Titles of calendar events the user does not organise are redacted to \"Busy\"; the emailed copy keeps the real titles."),
+}).describe("Replan result.");
 
 export function mountReplanNowRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: AppVariables }>) {
   const route = createRoute({
@@ -13,7 +33,7 @@ export function mountReplanNowRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: 
     operationId: "replanNow",
     summary: "Manually trigger the caller's webhook-style replan.",
     description:
-      "Run the same diff-and-email replan pipeline the Google push fires, for the caller's own account: auto-detect affected weeks, diff vs the calendar, and (unless dry_run) send the diff email. Query: dry_run, force, trigger.",
+      "Run the same diff-and-email replan pipeline the Google push fires, for the caller's own account: auto-detect affected weeks, diff vs the calendar, and (unless dry_run) send the diff email. Each plan's email goes out at most once while its accept link is live: a repeat call that lands on the same plan_hash sends nothing and reports email_skipped=\"duplicate\". The email also counts toward the account's limit of 20 emailed plans/actions waiting for the user (email_skipped=\"too_many_pending_actions\"). Query: dry_run, force, trigger.",
     security: [{ BearerAuth: [] }],
     request: {
       query: z.object({
@@ -24,7 +44,7 @@ export function mountReplanNowRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: 
     },
     responses: {
       200: {
-        content: { "application/json": { schema: z.record(z.unknown()) } },
+        content: { "application/json": { schema: ReplanNowResponse } },
         description: "Replan result",
       },
       401: {
@@ -64,6 +84,8 @@ export function mountReplanNowRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: 
       dryRun,
       forceResolve: force,
       triggerInviteTitle: trigger,
+      // Decision L: a looping caller can't flood the inbox (confirm/plan-mail.ts).
+      dedupeMail: true,
     });
 
     if (result.kind === "no_changes") {
@@ -88,7 +110,9 @@ export function mountReplanNowRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: 
         replanned: true,
         plan_hash: result.planHash,
         email_sent: result.sent,
-        model: result.model,
+        ...(result.mailSkipped ? { email_skipped: result.mailSkipped } : {}),
+        // The API copy is redacted (O9.6); the email already went out unredacted.
+        model: redactRenderSnapshot(result.model) as RenderSnapshot,
       },
       200,
     );

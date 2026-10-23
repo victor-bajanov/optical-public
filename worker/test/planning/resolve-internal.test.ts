@@ -178,8 +178,66 @@ describe("runResolve", () => {
     });
     expect(capturedIds).toContain("keep-me");
     expect(capturedIds).not.toContain("shed-me");
-    expect(infoSpy).toHaveBeenCalledWith("resolve_window_shed", expect.objectContaining({ excluded_past: 1, kept: 1 }));
+    expect(infoSpy).toHaveBeenCalledWith("resolve_window_shed", {
+      window_start: "2026-05-18T00:00:00.000Z",
+      excluded_past: 1,
+      excluded_future: 0,
+      excluded_unclaimed: 0,
+      kept: 1,
+    });
     infoSpy.mockRestore();
+  });
+
+  it("resolve_window_shed splits past, future and unclaimed on a future-week resolve", async () => {
+    await env.DB.prepare("DELETE FROM tasks").run();
+    const base = { context: "deep", priority: 60, duration_minutes: 60 };
+    const insert = (id: string, status: string, body: object, scheduledFor: string | null) =>
+      env.DB
+        .prepare("INSERT INTO tasks (id, owner_subject, body, status, scheduled_for, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '2026-05-11T00:00:00Z', '2026-05-11T00:00:00Z')")
+        .bind(id, "primary", JSON.stringify(body), status, scheduledFor)
+        .run();
+    await insert("past-1", "committed", { ...base, title: "Past" }, "2026-05-11T09:00:00Z");
+    await insert("future-1", "pending", { ...base, title: "Future", earliest_start: "2026-06-10T00:00:00Z" }, null);
+    await insert("backlog-1", "pending", { ...base, title: "Backlog" }, null);
+    await insert("in-1", "pending", { ...base, title: "In", earliest_start: "2026-05-26T00:00:00Z" }, null);
+
+    const stubSolver = { fetch: async () => new Response(JSON.stringify({ schedule: [], dropped: [], objective: { total: 0, components: { lateness: 0, fit: 0, churn: 0, daily_cap: 0, streak_cap: 0, drop: 0 } }, diagnostics: { pass1_wall_seconds: 0, pass2_wall_seconds: 0, status: "OPTIMAL" } }), { status: 200, headers: { "content-type": "application/json" } }) } as unknown as Fetcher;
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    await runResolve({
+      env: { ...env, OWNED_MEETINGS_ENABLED: "false", SOLVER: stubSolver },
+      calendar: new MockCalendarProvider(),
+      windowStart: "2026-05-25T00:00:00Z",
+      windowEnd: "2026-06-01T00:00:00Z",
+      accountEmail: "primary",
+      trigger: "api",
+    });
+    const shed = infoSpy.mock.calls.filter((c) => c[0] === "resolve_window_shed");
+    infoSpy.mockRestore();
+    expect(shed).toHaveLength(1);
+    expect(shed[0]![1]).toEqual({
+      window_start: "2026-05-25T00:00:00.000Z",
+      excluded_past: 1,
+      excluded_future: 1,
+      excluded_unclaimed: 1,
+      kept: 1,
+    });
+  });
+
+  it("emits one resolve_window_shed line per resolve with owned meetings on", async () => {
+    const stubSolver = { fetch: async () => new Response(JSON.stringify({ schedule: [], dropped: [], objective: { total: 0, components: { lateness: 0, fit: 0, churn: 0, daily_cap: 0, streak_cap: 0, drop: 0 } }, diagnostics: { pass1_wall_seconds: 0, pass2_wall_seconds: 0, status: "OPTIMAL" } }), { status: 200, headers: { "content-type": "application/json" } }) } as unknown as Fetcher;
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    await runResolve({
+      env: { ...env, OWNED_MEETINGS_ENABLED: "true", SOLVER: stubSolver },
+      calendar: new MockCalendarProvider(),
+      windowStart: "2026-05-18T00:00:00Z",
+      windowEnd: "2026-05-25T00:00:00Z",
+      accountEmail: "primary",
+      trigger: "api",
+    });
+    const shed = infoSpy.mock.calls.filter((c) => c[0] === "resolve_window_shed");
+    infoSpy.mockRestore();
+    expect(shed).toHaveLength(1);
+    expect(shed[0]![1]).toEqual(expect.objectContaining({ kept: 1 }));
   });
 
   it("returns 200 (not unsat) for a committed task with a hard deadline before the window", async () => {

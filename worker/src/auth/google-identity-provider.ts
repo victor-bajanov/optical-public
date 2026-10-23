@@ -27,12 +27,24 @@ export interface GoogleConfig {
   gmailReadScopeEnabled?: boolean;
 }
 
+/** The Google scope list Optical requests at /authorize, for these flags.
+ *  The single source: GoogleIdentityProvider requests exactly this, and
+ *  auth/scope-check.ts derives the callback's required-scope check from it
+ *  (so a scope change here, e.g. calendar.events -> .owned, needs no second
+ *  edit there). */
+export function googleRequestedScopes(
+  opts: Pick<GoogleConfig, "aclScopeEnabled" | "gmailReadScopeEnabled"> = {},
+): string[] {
+  const scopes = [...BASE_GOOGLE_SCOPES];
+  if (opts.aclScopeEnabled) scopes.push(GOOGLE_ACL_SCOPE);
+  if (opts.gmailReadScopeEnabled) scopes.push(GOOGLE_GMAIL_READ_SCOPE);
+  return scopes;
+}
+
 export class GoogleIdentityProvider implements IdentityProvider {
   readonly scopes: string[];
   constructor(private cfg: GoogleConfig) {
-    this.scopes = [...BASE_GOOGLE_SCOPES];
-    if (cfg.aclScopeEnabled) this.scopes.push(GOOGLE_ACL_SCOPE);
-    if (cfg.gmailReadScopeEnabled) this.scopes.push(GOOGLE_GMAIL_READ_SCOPE);
+    this.scopes = googleRequestedScopes(cfg);
   }
 
   authorizeUrl({ state, redirectUri }: { state: string; redirectUri: string }): string {
@@ -96,5 +108,26 @@ export class GoogleIdentityProvider implements IdentityProvider {
     if (!resp.ok) throw new Error(`google refresh failed: ${await resp.text()}`);
     const t = (await resp.json()) as { access_token: string; expires_in: number };
     return { accessToken: t.access_token, expiresIn: t.expires_in };
+  }
+
+  // https://developers.google.com/identity/protocols/oauth2/web-server#tokenrevoke
+  // Accepts a refresh OR access token; either revokes the whole grant. A 400
+  // `invalid_token` means it is already revoked or expired — the goal state.
+  // The error message carries the status and Google's error code only, never
+  // the response body or the token.
+  async revokeGrant(token: string): Promise<void> {
+    const resp = await fetch("https://oauth2.googleapis.com/revoke", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token }),
+    });
+    if (resp.ok) return;
+    let code = "";
+    try {
+      const j = (await resp.json()) as { error?: unknown };
+      if (typeof j.error === "string") code = j.error;
+    } catch { /* non-JSON body: status alone */ }
+    if (resp.status === 400 && code === "invalid_token") return;
+    throw new Error(`google revoke failed: ${resp.status}${code ? ` ${code}` : ""}`);
   }
 }

@@ -146,6 +146,39 @@ describe("runWebhookReplan", () => {
     expect(result.planHash).toMatch(/^[0-9a-f]+$/);
   });
 
+  it("records whether the triggering invite and each external event are the user's own (O9.6 redaction provenance)", async () => {
+    const foreign = {
+      id: "ext-1", summary: "Their invite", start: "2026-05-19T11:00:00Z", end: "2026-05-19T12:00:00Z",
+      extendedProperties: {}, organizer: { email: "them@example.com", self: false },
+    };
+    const own = {
+      id: "ext-2", summary: "My dentist", start: "2026-05-19T13:00:00Z", end: "2026-05-19T14:00:00Z",
+      extendedProperties: {}, organizer: { email: "me@example.com", self: true },
+    };
+    const run = async (trigger: typeof foreign) => {
+      const cal = new MockCalendarProvider({ events: [foreign, own] });
+      cal.fetchIncrementalChanges = async () => ({
+        changes: [{ kind: "upsert", event: trigger }], nextSyncToken: "tok-new", syncTokenInvalidated: false,
+      });
+      const result = await runWebhookReplan({
+        env: makeEnv(), calendar: cal, notify: new MockNotificationProvider(), accountEmail: "primary",
+        oauthIssuer: "https://scheduler.example.com", dryRun: true,
+      });
+      if (result.kind !== "replanned") throw new Error(`expected replanned, got ${result.kind}`);
+      return result.model;
+    };
+
+    const m1 = await run(foreign);
+    expect(m1.trigger).toEqual({ kind: "webhook", inviteTitle: "Their invite", inviteOrganizedBySelf: false });
+    const origins = Object.fromEntries(m1.days.flatMap((d) => d.before).map((e) => [e.title, e.origin]));
+    expect(origins["Their invite"]).toBe("others_event");
+    expect(origins["My dentist"]).toBe("own_event");
+
+    await seedDb();
+    const m2 = await run(own);
+    expect(m2.trigger).toEqual({ kind: "webhook", inviteTitle: "My dentist", inviteOrganizedBySelf: true });
+  });
+
   it("forceResolve: resolves and sends even when there are no incremental changes", async () => {
     const cal = new MockCalendarProvider();
     cal.fetchIncrementalChanges = async () => ({
@@ -170,6 +203,7 @@ describe("runWebhookReplan", () => {
     expect(result.sent).toBe(true);
     expect(notify.sent).toHaveLength(1);
     expect((notify.sent[0]!.model.trigger as { kind: string; inviteTitle: string }).inviteTitle).toContain("manual replan");
+    expect((notify.sent[0]!.model.trigger as { inviteOrganizedBySelf?: boolean }).inviteOrganizedBySelf).toBe(true);
   });
 
   it("no_changes: returns early when nothing changed and forceResolve is false", async () => {
@@ -689,6 +723,119 @@ describe("runWebhookReplan", () => {
       "SELECT COUNT(*) AS n FROM proposed_plans WHERE committed_at IS NULL",
     ).first<{ n: number }>();
     expect(pending?.n).toBe(0);
+  });
+
+  it("an unstamped chunk whose task is not in this D1 is external busy time, not a 'removed' chunk: no_diff, no email", async () => {
+    // A legacy (pre-stamp) chunk of a task this deployment doesn't have: a
+    // task deleted mid-week (DELETE cleans chunks only from now on) or another
+    // deployment's pre-stamp block. Commit won't delete it (deletableChunks),
+    // so if it sat in the diff baseline it would read as "removed" on every
+    // replan and email forever, with no accept able to clear it.
+    const captured: Array<{ external_pinned: Array<{ id: string }> }> = [];
+    const emptySolver = {
+      fetch: async (_url: string, init: RequestInit) => {
+        captured.push(JSON.parse(init.body as string));
+        return new Response(JSON.stringify({ schedule: [], dropped: [], objective: { total: 0, components: { lateness: 0, fit: 0, churn: 0, daily_cap: 0, streak_cap: 0, drop: 0 } }, diagnostics: { pass1_wall_seconds: 0, pass2_wall_seconds: 0, status: "OPTIMAL" } }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    } as unknown as Fetcher;
+    const cal = new MockCalendarProvider({
+      deploymentId: "https://scheduler.example.com",
+      events: [{
+        id: "orphan-legacy",
+        summary: "Deleted task's block",
+        start: "2026-05-20T01:00:00Z",
+        end: "2026-05-20T02:00:00Z",
+        extendedProperties: { private: { [SCHEDULER_CHUNK_ID_KEY]: "gone-task#0" } },
+      }],
+    });
+    cal.fetchIncrementalChanges = async () => ({ changes: [], nextSyncToken: "tok-fresh", syncTokenInvalidated: false });
+    const notify = new MockNotificationProvider();
+    const result = await runWebhookReplan({
+      env: { ...env, SOLVER: emptySolver, OAUTH_ISSUER: "https://scheduler.example.com" },
+      calendar: cal,
+      notify,
+      accountEmail: "primary",
+      oauthIssuer: "https://scheduler.example.com",
+      forceResolve: true,
+    });
+    expect(result.kind).toBe("no_diff");
+    expect(notify.sent).toHaveLength(0);
+    expect(captured[0]!.external_pinned.map((b) => b.id)).toEqual(["orphan-legacy"]);
+  });
+
+  describe("a changed unstamped (legacy) chunk", () => {
+    // The webhook must apply resolve's own rule (externaliseUnprovenChunks):
+    // an unstamped chunk whose task is not a tasks row here is ordinary busy
+    // time, so a drag of it is an ordinary external change that replans its
+    // week. A proven one (task row present) is still our own chunk.
+    const countingEmptySolver = (calls: { n: number }) =>
+      ({
+        fetch: async () => {
+          calls.n++;
+          return new Response(JSON.stringify({ schedule: [], dropped: [], objective: { total: 0, components: { lateness: 0, fit: 0, churn: 0, daily_cap: 0, streak_cap: 0, drop: 0 } }, diagnostics: { pass1_wall_seconds: 0, pass2_wall_seconds: 0, status: "OPTIMAL" } }), { status: 200, headers: { "content-type": "application/json" } });
+        },
+      }) as unknown as Fetcher;
+    const draggedLegacyChunk = (chunkId: string) => {
+      const event = {
+        id: `legacy-${chunkId}`,
+        summary: "Old block",
+        start: "2026-05-20T01:00:00Z",
+        end: "2026-05-20T02:00:00Z",
+        extendedProperties: { private: { [SCHEDULER_CHUNK_ID_KEY]: chunkId } },
+      };
+      const cal = new MockCalendarProvider({ deploymentId: "https://scheduler.example.com", events: [event] });
+      cal.fetchIncrementalChanges = async () => ({
+        changes: [{ kind: "upsert", event }],
+        nextSyncToken: "tok-after-drag",
+        syncTokenInvalidated: false,
+      });
+      return cal;
+    };
+
+    it("unproven (no tasks row) → replans its week: not no_changes, exactly one solver call", async () => {
+      const calls = { n: 0 };
+      const result = await runWebhookReplan({
+        env: { ...env, SOLVER: countingEmptySolver(calls), OAUTH_ISSUER: "https://scheduler.example.com" },
+        calendar: draggedLegacyChunk("gone-task#0"),
+        notify: new MockNotificationProvider(),
+        accountEmail: "primary",
+        oauthIssuer: "https://scheduler.example.com",
+      });
+      expect(result.kind).not.toBe("no_changes");
+      expect(calls.n).toBe(1);
+    });
+
+    it("proven (its task is a tasks row here) → still our own chunk: no_changes, no solver call", async () => {
+      const calls = { n: 0 };
+      const result = await runWebhookReplan({
+        env: { ...env, SOLVER: countingEmptySolver(calls), OAUTH_ISSUER: "https://scheduler.example.com" },
+        calendar: draggedLegacyChunk("t1#0"),
+        notify: new MockNotificationProvider(),
+        accountEmail: "primary",
+        oauthIssuer: "https://scheduler.example.com",
+      });
+      expect(result.kind).toBe("no_changes");
+      expect(calls.n).toBe(0);
+    });
+
+    it("deleting an unproven one is like deleting any event: no time to bucket, so no_changes and no solver call", async () => {
+      const calls = { n: 0 };
+      const cal = draggedLegacyChunk("gone-task#0");
+      cal.fetchIncrementalChanges = async () => ({
+        changes: [{ kind: "delete", eventId: "legacy-gone-task#0" }],
+        nextSyncToken: "tok-after-delete",
+        syncTokenInvalidated: false,
+      });
+      const result = await runWebhookReplan({
+        env: { ...env, SOLVER: countingEmptySolver(calls), OAUTH_ISSUER: "https://scheduler.example.com" },
+        calendar: cal,
+        notify: new MockNotificationProvider(),
+        accountEmail: "primary",
+        oauthIssuer: "https://scheduler.example.com",
+      });
+      expect(result.kind).toBe("no_changes");
+      expect(calls.n).toBe(0);
+    });
   });
 
   it("drop-only replan: a task already dropped in the last accepted plan and still dropped → no_diff, no email", async () => {

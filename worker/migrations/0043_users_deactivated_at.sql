@@ -1,0 +1,12 @@
+-- 0043_users_deactivated_at.sql — hosted-trial decision F (purge window).
+--
+-- deactivateUser (every offboard: operator, self-serve delete, retention
+-- sweep) stamps this column; every reactivation path (sign-in, upsertUser)
+-- clears it back to NULL. When DELETED_ACCOUNT_RETENTION_DAYS (N) is a
+-- positive integer, the daily sweep deletes a still-deactivated users row N
+-- days after this stamp and pseudonymises the subject's audit_log rows.
+--
+-- NULL on every existing row. A row deactivated before this migration is
+-- stamped by the first sweep that runs with N set, so it is purged N days
+-- after that, not at once (see lifecycle/purge-deleted.ts).
+ALTER TABLE users ADD COLUMN deactivated_at TEXT;

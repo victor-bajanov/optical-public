@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
-import { storeIdentityTokens, listSubjects, getSubjectProvider, getAccessToken, ACCESS_PREFIX } from "../src/auth/identity-store";
+import { storeIdentityTokens, listSubjects, getSubjectProvider, getAccessToken, ACCESS_PREFIX, hasStoredGrant } from "../src/auth/identity-store";
 import type { IdentityProvider } from "../src/auth/identity-provider";
 
 beforeEach(async () => {
@@ -47,6 +47,7 @@ function rotatingIdp(seen: string[]): IdentityProvider {
     authorizeUrl: () => { throw new Error("unused"); },
     exchangeCode: () => { throw new Error("unused"); },
     fetchIdentity: () => { throw new Error("unused"); },
+    revokeGrant: async () => {},
     refreshAccessToken: async (refreshToken: string) => {
       seen.push(refreshToken);
       return { accessToken: `at-${seen.length}`, expiresIn: 3600, refreshToken: `rotated-${seen.length}` };
@@ -110,6 +111,7 @@ describe("provider switch (same email signs in via the other IdP)", () => {
       authorizeUrl: () => { throw new Error("unused"); },
       exchangeCode: () => { throw new Error("unused"); },
       fetchIdentity: () => { throw new Error("unused"); },
+      revokeGrant: async () => {},
       refreshAccessToken: async () => {
         // The user switches to Google while this Microsoft refresh is in flight.
         await storeIdentityTokens(env, "race@example.com", { ...tokens, refreshToken: "google-r" }, "google");
@@ -123,5 +125,43 @@ describe("provider switch (same email signs in via the other IdP)", () => {
     const seen: string[] = [];
     await getAccessToken(env, rotatingIdp(seen), "race@example.com", { forceRefresh: true });
     expect(seen).toEqual(["google-r"]);
+  });
+});
+
+describe("hasStoredGrant (Task A: skip revoking an existing member's grant)", () => {
+  const legacy = (email: string) => env.DB.prepare(
+    "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at) VALUES (?,?,?,?)",
+  ).bind(email, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z").run();
+
+  it("no row: false", async () => {
+    expect(await hasStoredGrant(env, "google", "sub-x", "x@example.com")).toBe(false);
+  });
+
+  it("a row under the same provider, matched by email: true", async () => {
+    await storeIdentityTokens(env, "a@example.com", { refreshToken: "r", accessToken: "a", expiresIn: 3600, scope: "s" }, "google", "sub-a");
+    expect(await hasStoredGrant(env, "google", "sub-a", "a@example.com")).toBe(true);
+  });
+
+  it("matched by providerSubject under the ORIGINAL email after a rename: true", async () => {
+    await storeIdentityTokens(env, "old@example.com", { refreshToken: "r", accessToken: "a", expiresIn: 3600, scope: "s" }, "microsoft", "tid:oid");
+    expect(await hasStoredGrant(env, "microsoft", "tid:oid", "new@example.com")).toBe(true);
+  });
+
+  it("a row for the same email under the OTHER provider: false", async () => {
+    await storeIdentityTokens(env, "b@example.com", { refreshToken: "r", accessToken: "a", expiresIn: 3600, scope: "s" }, "microsoft", "tid:b");
+    expect(await hasStoredGrant(env, "google", "sub-b", "b@example.com")).toBe(false);
+  });
+
+  it("same provider and email but a DIFFERENT stored provider_subject (another upstream account): false, so its partial grant is revoked", async () => {
+    // Revoking that other account's grant cannot touch the stored one, and
+    // with REFUSE_PROVIDER_REBIND it is about to be refused anyway.
+    await storeIdentityTokens(env, "c@example.com", { refreshToken: "r", accessToken: "a", expiresIn: 3600, scope: "s" }, "google", "sub-owner");
+    expect(await hasStoredGrant(env, "google", "sub-other", "c@example.com")).toBe(false);
+  });
+
+  it("a legacy row with no provider counts as google", async () => {
+    await legacy("legacy@example.com");
+    expect(await hasStoredGrant(env, "google", "sub-l", "legacy@example.com")).toBe(true);
+    expect(await hasStoredGrant(env, "microsoft", "tid:l", "legacy@example.com")).toBe(false);
   });
 });

@@ -7,6 +7,7 @@ import { loadPinnedTaskIds } from "../db/tasks";
 import { selectBusyEvents, buildBusyIcs } from "./build-busy-ics";
 import { guardOutput, OutputLeakError } from "./output-guard";
 import { compileRevealRegexes } from "./reveal-rules";
+import { isActiveMember } from "../auth/membership";
 
 const HORIZON_MS = 8 * 7 * 24 * 60 * 60 * 1000; // 8 weeks
 
@@ -25,6 +26,9 @@ export function mountCalendarFeedRoute(app: Hono<{ Bindings: Env; Variables: App
     const resolved = await resolveFeedToken(c.env.DB, c.env, c.req.param("token"));
     if (!resolved) return notFound(); // unknown / revoked → opaque 404
     const owner = resolved.ownerSubject;
+    // Card C: every fetch reads the owner's calendar with their grant, so a
+    // delisted owner's feed is the same opaque 404 (token kept, not revoked).
+    if (!(await isActiveMember(c.env, owner, "calendar_feed"))) return notFound();
 
     const now = new Date();
     const start = now.toISOString();

@@ -14,7 +14,8 @@ export interface UserRow {
 // Insert-or-keep. On first sight, seed the row with the given role (default
 // 'member'). On re-upsert WITHOUT a role, leave the existing role untouched so a
 // later plain auth never downgrades an admin. Reactivates a previously
-// offboarded subject (is_active -> 1).
+// offboarded subject (is_active -> 1) and clears deactivated_at, so the purge
+// window (DELETED_ACCOUNT_RETENTION_DAYS) never fires on the old offboard.
 export async function upsertUser(
   db: D1Database,
   subject: string,
@@ -25,7 +26,7 @@ export async function upsertUser(
     await db
       .prepare(
         `INSERT INTO users (subject, role, is_active, created_at) VALUES (?, ?, 1, ?)
-         ON CONFLICT(subject) DO UPDATE SET role = excluded.role, is_active = 1`,
+         ON CONFLICT(subject) DO UPDATE SET role = excluded.role, is_active = 1, deactivated_at = NULL`,
       )
       .bind(subject, role, now)
       .run();
@@ -34,14 +35,17 @@ export async function upsertUser(
   await db
     .prepare(
       `INSERT INTO users (subject, role, is_active, created_at) VALUES (?, 'member', 1, ?)
-       ON CONFLICT(subject) DO UPDATE SET is_active = 1`,
+       ON CONFLICT(subject) DO UPDATE SET is_active = 1, deactivated_at = NULL`,
     )
     .bind(subject, now)
     .run();
 }
 
-// Record activity. Creates the row (member, active) if missing; otherwise sets
-// last_seen and reactivates. Never changes role.
+// Record a sign-in. Creates the row (member, active) if missing; otherwise sets
+// last_seen, clears any retention warning stamp (O10b: activity cancels the
+// pending deletion) and reactivates (clearing deactivated_at). Never changes role. Only the OAuth login callback
+// calls this (a sign-in is what admits a subject); ordinary use goes through
+// bumpLastSeenStmt, which never inserts or reactivates.
 export async function touchLastSeen(
   db: D1Database,
   subject: string,
@@ -50,10 +54,75 @@ export async function touchLastSeen(
   await db
     .prepare(
       `INSERT INTO users (subject, role, is_active, last_seen, created_at) VALUES (?, 'member', 1, ?, ?)
-       ON CONFLICT(subject) DO UPDATE SET last_seen = excluded.last_seen, is_active = 1`,
+       ON CONFLICT(subject) DO UPDATE SET last_seen = excluded.last_seen, retention_warned_at = NULL, is_active = 1, deactivated_at = NULL`,
     )
     .bind(subject, now, now)
     .run();
+}
+
+/** Minimum gap between two activity bumps of one user's last_seen. Retention
+ *  (RETENTION_DAYS) works in whole days, so ~one write per user per day is
+ *  enough; 20 h (not 24) so a once-a-day routine at a drifting time of day
+ *  still bumps every day. */
+export const LAST_SEEN_BUMP_THROTTLE_MS = 20 * 60 * 60 * 1000;
+
+function bumpCutoff(now: Date): string {
+  return new Date(now.getTime() - LAST_SEEN_BUMP_THROTTLE_MS).toISOString();
+}
+
+/** True when a bump of `lastSeen` at `now` would write: NULL, or strictly
+ *  older than now - LAST_SEEN_BUMP_THROTTLE_MS. Same predicate as
+ *  bumpLastSeenStmt's WHERE (ISO-8601 UTC strings compare lexically, the
+ *  format touchLastSeen writes and sweep-inactive compares). Lets a caller
+ *  that already read last_seen skip the UPDATE round trip entirely. */
+export function isLastSeenStale(lastSeen: string | null, now: Date = new Date()): boolean {
+  return lastSeen === null || lastSeen < bumpCutoff(now);
+}
+
+/** True when an activity bump would write (bumpLastSeenStmt's WHERE, minus
+ *  the active check): last_seen is stale, OR the user carries a retention
+ *  warning stamp (O10b). The second arm bypasses the throttle so a warned
+ *  user's very next use clears the stamp, even within 20 h of the warning. */
+export function isActivityBumpDue(
+  lastSeen: string | null,
+  retentionWarnedAt: string | null,
+  now: Date = new Date(),
+): boolean {
+  return retentionWarnedAt !== null || isLastSeenStale(lastSeen, now);
+}
+
+/** Bound (not yet run) activity bump (hosted-trial O10a): stamp last_seen =
+ *  now on real use, and clear retention_warned_at (O10b). UPDATE-only and
+ *  active-only, unlike touchLastSeen: it never creates a users row (that would
+ *  grant membership) and never reactivates an offboarded subject. Throttled in
+ *  SQL, so it is a no-op (0 changes) when last_seen is within
+ *  LAST_SEEN_BUMP_THROTTLE_MS and no retention warning is stamped, which also
+ *  makes concurrent requests race-safe (the first write clears the stamp, so
+ *  the rest fall back under the throttle). */
+export function bumpLastSeenStmt(db: D1Database, subject: string, now: Date = new Date()): D1PreparedStatement {
+  return db
+    .prepare(
+      `UPDATE users SET last_seen = ?, retention_warned_at = NULL
+        WHERE subject = ? AND is_active = 1
+          AND (last_seen IS NULL OR last_seen < ? OR retention_warned_at IS NOT NULL)`,
+    )
+    .bind(now.toISOString(), subject, bumpCutoff(now));
+}
+
+/** Run the activity bump, swallowing any failure: a missed bump only delays
+ *  last_seen by one request, so it must never fail the request that triggered
+ *  it. A failure is logged as `last_seen_bump_failed`. */
+export async function bumpLastSeenBestEffort(
+  db: D1Database,
+  subject: string,
+  via: "bearer" | "accept_link",
+  now: Date = new Date(),
+): Promise<void> {
+  try {
+    await bumpLastSeenStmt(db, subject, now).run();
+  } catch (e) {
+    console.error("last_seen_bump_failed", { subject, via, error: String(e) });
+  }
 }
 
 export async function listActiveSubjects(db: D1Database): Promise<string[]> {
@@ -63,8 +132,26 @@ export async function listActiveSubjects(db: D1Database): Promise<string[]> {
   return r.results.map((x) => x.subject);
 }
 
-export async function deactivateUser(db: D1Database, subject: string): Promise<void> {
-  await db.prepare(`UPDATE users SET is_active = 0 WHERE subject = ?`).bind(subject).run();
+/** Deactivate the kept users row on offboard. It keeps only the subject (the
+ *  email address), role and timestamps: the user's own settings (home_tz,
+ *  done_color_id) are cleared, so a later sign-in starts from defaults and a
+ *  Microsoft login re-seeds its done marker via seedDoneColorIdIfUnset.
+ *  Stamps deactivated_at (decision F: the purge window counts from it). A
+ *  repeat offboard of an already-inactive row keeps the first stamp; an active
+ *  row always gets a fresh one (SET reads the pre-update is_active). */
+export async function deactivateUser(
+  db: D1Database,
+  subject: string,
+  now: string = new Date().toISOString(),
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE users SET is_active = 0, home_tz = NULL, done_color_id = NULL,
+              deactivated_at = CASE WHEN is_active = 0 THEN COALESCE(deactivated_at, ?) ELSE ? END
+        WHERE subject = ?`,
+    )
+    .bind(now, now, subject)
+    .run();
 }
 
 export async function getUser(db: D1Database, subject: string): Promise<UserRow | null> {

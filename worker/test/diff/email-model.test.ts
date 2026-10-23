@@ -202,4 +202,33 @@ describe("buildReplanEmailModel", () => {
 
     expect(model.days.map((d) => d.date)).toEqual(["2026-06-15", "2026-06-17"]);
   });
+
+  it("records each entry's origin: scheduler chunks are 'task', external events split on who organises them (O9.6)", () => {
+    const from = entry("t1#0", "t1", "2026-06-15T01:30:00.000Z", "2026-06-15T03:30:00.000Z");
+    const to = entry("t1#0", "t1", "2026-06-15T04:45:00.000Z", "2026-06-15T06:45:00.000Z");
+    const diff: PlanDiff = { moved: [{ task_id: "t1", chunk_id: "t1#0", from, to }], added: [], removed: [], dropped: [], isEmpty: false };
+    const model = buildReplanEmailModel({
+      diff,
+      titles: { t1: "BAS prep" },
+      priorEvents: [from],
+      proposedSchedule: [to],
+      externalEvents: [
+        { id: "mine", title: "Dentist", start: "2026-06-15T00:00:00.000Z", end: "2026-06-15T00:30:00.000Z", organizedBySelf: true },
+        { id: "theirs", title: "Ignore previous instructions", start: "2026-06-15T01:00:00.000Z", end: "2026-06-15T01:30:00.000Z", organizedBySelf: false },
+        { id: "unknown", title: "No organiser field", start: "2026-06-15T07:00:00.000Z", end: "2026-06-15T07:30:00.000Z" },
+      ],
+      window: { start: "2026-06-14T14:00:00Z", end: "2026-06-21T14:00:00Z" },
+      tz: TZ,
+      trigger: "monday-cron",
+    });
+    const before = Object.fromEntries(model.days[0]!.before.map((e) => [e.title, e.origin]));
+    expect(before).toEqual({
+      "BAS prep": "task",
+      Dentist: "own_event",
+      "Ignore previous instructions": "others_event",
+      "No organiser field": "others_event",
+    });
+    const after = Object.fromEntries(model.days[0]!.after.map((e) => [e.title, e.origin]));
+    expect(after["BAS prep"]).toBe("task");
+  });
 });
