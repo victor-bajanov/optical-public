@@ -14,6 +14,7 @@ import { signCapabilityWithEnv } from "../auth/capability";
 import { identityAnchorTag } from "../auth/identity-rebind";
 import { ACCEPT_TTL_SECONDS } from "../planning/accept-ttl";
 import { localWeekWindow } from "../planning/datetime";
+import { eventBucketInstant } from "../planning/busy-blocks";
 import { getDoneColorId, getHomeTz } from "../db/users";
 import { getDoneTaskIds } from "../db/tasks";
 import { loadCompletionsByTask } from "../db/chunk-completions";
@@ -364,7 +365,9 @@ export async function runWebhookReplan(args: ReplanArgs): Promise<ReplanResult> 
   const tz = await getHomeTz(env.DB, accountEmail, env.SCHEDULER_TZ);
   const weeks = new Map<string, AffectedWeek>();
   for (const e of changedEvents) {
-    const window = localWeekWindow(e.start, tz);
+    // An all-day event buckets by its floating date, not its UTC-midnight
+    // instant (which is the previous local day west of UTC).
+    const window = localWeekWindow(eventBucketInstant(e, tz), tz);
     const existing = weeks.get(window.start);
     if (existing) {
       existing.triggerEventIds.push(e.id);

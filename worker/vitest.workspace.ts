@@ -21,6 +21,14 @@ export default [
             d1Databases: ["DB"],
             kvNamespaces: ["GOOGLE_TOKEN_CACHE"],
             r2Buckets: ["SOLVER_CAPTURE"],
+            // The public read limiters (public-read/rate-limit.ts). The pool's
+            // bundled wrangler 3 does not map wrangler.toml's [[ratelimits]],
+            // so they are declared here at the top-level (prod) values;
+            // test/public-read/wiring.test.ts fails if the two drift.
+            ratelimits: {
+              PUBLIC_READ_IP_LIMITER: { simple: { limit: 30, period: 60 } },
+              PUBLIC_READ_TARGET_LIMITER: { simple: { limit: 120, period: 60 } },
+            },
             serviceBindings: {
               SOLVER: () =>
                 new Response(JSON.stringify({ error: "solver_stub_unimplemented" }), {
@@ -57,6 +65,13 @@ export default [
               // of the suite exercises.
               SOLVER_ENGINE: "container",
               SOLVER_ENGINE_FANOUT: "false",
+              // The public read cache (public-read/events-cache.ts) is OFF
+              // for the suite: the Cache API outlives a test, and the booking
+              // and poll suites rewrite a mock calendar between requests for
+              // one owner and expect the next read to see it. The cache's own
+              // tests (test/public-read/, test/*/public-read.test.ts) set a
+              // TTL explicitly. Deployments leave it unset (60 s).
+              PUBLIC_READ_CACHE_TTL_SECONDS: "0",
             },
           },
         },

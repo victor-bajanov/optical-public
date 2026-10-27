@@ -196,6 +196,23 @@ export async function supersedeOtherPendingPlansForWeek(
   return res.meta?.changes ?? 0;
 }
 
+/** Re-spell the subject's plans' window_tz from `oldTz` to `newTz`, both
+ *  spellings of the SAME zone (a legacy "Asia/Calcutta" re-saved as
+ *  "Asia/Kolkata"), so the week lookups, which match window_tz as a string,
+ *  keep finding them. A NULL window_tz reads as `schedulerTz`, as everywhere.
+ *  Bound, not run: the /v1/timezone handler batches it with the home_tz write. */
+export function renamePlansWindowTzStmt(
+  db: D1Database,
+  subject: string,
+  oldTz: string,
+  newTz: string,
+  schedulerTz: string,
+): D1PreparedStatement {
+  return db
+    .prepare("UPDATE proposed_plans SET window_tz = ? WHERE subject = ? AND COALESCE(window_tz, ?) = ?")
+    .bind(newTz, subject, schedulerTz, oldTz);
+}
+
 /** Delete every pending (uncommitted) plan for the subject, whatever its week.
  *  Used when the subject's effective timezone changes: those plans were solved
  *  against the old business hours and bucketed by the old week, so accepting
@@ -226,38 +243,79 @@ export const SCRUB_THIRD_PARTY_SET_SQL = `render_snapshot = NULL,
        body = CASE WHEN json_type(body, '$.warnings') IS NULL THEN body
                    ELSE json_remove(body, '$.warnings') END`;
 
-const MARK_COMMITTED_SQL =
-  `UPDATE proposed_plans SET committed_at = ?, ${SCRUB_THIRD_PARTY_SET_SQL} WHERE plan_hash = ? AND subject = ?`;
-
-// Owner-scoped for the same reason: the commit path may only flip a plan the
-// caller owns. Returns true iff an owned row was updated. Scrubs the plan's
-// third-party text in the same UPDATE (SCRUB_THIRD_PARTY_SET_SQL).
+/** Fixture helper: claim and mark an owned, uncommitted plan in one go.
+ *  Production commits go through commitPlan (planning/commit.ts), which holds
+ *  the claim across its calendar writes. Same claim rules, so it refuses a
+ *  plan another commit holds a live claim on. Returns true iff an owned row
+ *  was marked. Scrubs the plan's third-party text (SCRUB_THIRD_PARTY_SET_SQL). */
 export async function markProposedPlanCommitted(
   db: D1Database,
   planHash: string,
   committedAt: string,
   ownerSubject: string,
 ): Promise<boolean> {
-  const res = await db
-    .prepare(MARK_COMMITTED_SQL)
-    .bind(committedAt, planHash, ownerSubject)
-    .run();
+  const claim = await claimPlanCommit(db, planHash, ownerSubject);
+  if (!claim) return false;
+  const res = await markProposedPlanCommittedStmt(db, planHash, committedAt, ownerSubject, claim).run();
   return (res.meta?.changes ?? 0) > 0;
 }
 
+/** How long a commit claim (claimPlanCommit) holds a plan. Far above any
+ *  observed commit; a worker killed mid-commit blocks re-clicks this long. */
+export const COMMIT_CLAIM_LEASE_MS = 120_000;
+
+/** Take the commit claim on an owned, uncommitted plan: a fresh random claim
+ *  id, or null when another commit holds a live claim (or the plan is gone,
+ *  foreign or already committed). A claim older than COMMIT_CLAIM_LEASE_MS is
+ *  taken over. commitPlan claims before its first calendar read, so two
+ *  concurrent commits of one plan can't both write the calendar (T3). */
+export async function claimPlanCommit(
+  db: D1Database,
+  planHash: string,
+  ownerSubject: string,
+  now: Date = new Date(),
+): Promise<string | null> {
+  const claim = crypto.randomUUID();
+  const staleBefore = new Date(now.getTime() - COMMIT_CLAIM_LEASE_MS).toISOString();
+  const res = await db
+    .prepare(
+      `UPDATE proposed_plans SET commit_claim = ?, commit_claimed_at = ?
+        WHERE plan_hash = ? AND subject = ? AND committed_at IS NULL
+          AND (commit_claim IS NULL OR commit_claimed_at < ?)`,
+    )
+    .bind(claim, now.toISOString(), planHash, ownerSubject, staleBefore)
+    .run();
+  return (res.meta?.changes ?? 0) > 0 ? claim : null;
+}
+
+/** Drop this attempt's claim (a commit that failed or marked nothing), so a
+ *  retry needn't wait out the lease. Never touches another holder's claim. */
+export async function releasePlanCommitClaim(db: D1Database, planHash: string, claim: string): Promise<void> {
+  await db
+    .prepare("UPDATE proposed_plans SET commit_claim = NULL, commit_claimed_at = NULL WHERE plan_hash = ? AND commit_claim = ?")
+    .bind(planHash, claim)
+    .run();
+}
+
+const MARK_CLAIMED_COMMITTED_SQL =
+  `UPDATE proposed_plans SET committed_at = ?, commit_claim = NULL, commit_claimed_at = NULL, ${SCRUB_THIRD_PARTY_SET_SQL}
+    WHERE plan_hash = ? AND subject = ? AND committed_at IS NULL AND commit_claim = ?`;
+
 /** Bound (but not yet run) commit-mark UPDATE, so commitPlan can land committed_at
- *  in the SAME atomic db.batch as the task commit/drop UPDATEs (X3). Identical
- *  predicate to markProposedPlanCommitted; inspect the batch result's meta.changes
- *  for the 0-row (foreign / already-marked) case. */
+ *  in the SAME atomic db.batch as the task commit/drop UPDATEs (X3). Marks only
+ *  an uncommitted plan still held by `claim` (claimPlanCommit) and clears the
+ *  claim; inspect the batch result's meta.changes for the 0-row case (gone,
+ *  foreign, already marked, or the claim was taken over after its lease). */
 export function markProposedPlanCommittedStmt(
   db: D1Database,
   planHash: string,
   committedAt: string,
   ownerSubject: string,
+  claim: string,
 ): D1PreparedStatement {
   return db
-    .prepare(MARK_COMMITTED_SQL)
-    .bind(committedAt, planHash, ownerSubject);
+    .prepare(MARK_CLAIMED_COMMITTED_SQL)
+    .bind(committedAt, planHash, ownerSubject, claim);
 }
 
 /** @deprecated Global, cross-tenant. Do NOT use for owned reads — use

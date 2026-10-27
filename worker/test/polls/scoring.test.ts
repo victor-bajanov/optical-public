@@ -4,6 +4,7 @@ import {
   fitScoreForChunk,
   organiserFit,
   inviteeCoverage,
+  alignCellsToGrid,
   scoreSlot,
   rankCandidates,
   fitCurveFromContextConfig,
@@ -123,12 +124,12 @@ describe("inviteeCoverage", () => {
       ["2026-08-03T00:00:00.000Z", "free" as const],
       ["2026-08-03T00:30:00.000Z", "free" as const],
     ]);
-    expect(inviteeCoverage(cells, "2026-08-03T00:00:00.000Z", 60)).toBe("free");
+    expect(inviteeCoverage(cells, "2026-08-03T00:00:00.000Z", 60, "UTC")).toBe("free");
   });
 
   it("'none' when any covering cell is unpainted", () => {
     const cells = new Map([["2026-08-03T00:00:00.000Z", "free" as const]]);
-    expect(inviteeCoverage(cells, "2026-08-03T00:00:00.000Z", 60)).toBe("none");
+    expect(inviteeCoverage(cells, "2026-08-03T00:00:00.000Z", 60, "UTC")).toBe("none");
   });
 
   it("'if_needed' when any covering cell is if_needed, even if others are free", () => {
@@ -136,7 +137,7 @@ describe("inviteeCoverage", () => {
       ["2026-08-03T00:00:00.000Z", "free" as const],
       ["2026-08-03T00:30:00.000Z", "if_needed" as const],
     ]);
-    expect(inviteeCoverage(cells, "2026-08-03T00:00:00.000Z", 60)).toBe("if_needed");
+    expect(inviteeCoverage(cells, "2026-08-03T00:00:00.000Z", 60, "UTC")).toBe("if_needed");
   });
 
   it("a 45-min slot spans a partial third cell — that cell must still be painted", () => {
@@ -145,10 +146,10 @@ describe("inviteeCoverage", () => {
       ["2026-08-03T00:00:00.000Z", "free" as const],
       ["2026-08-03T00:30:00.000Z", "free" as const],
     ]);
-    expect(inviteeCoverage(covered, "2026-08-03T00:00:00.000Z", 45)).toBe("free");
+    expect(inviteeCoverage(covered, "2026-08-03T00:00:00.000Z", 45, "UTC")).toBe("free");
 
     const missingTail = new Map([["2026-08-03T00:00:00.000Z", "free" as const]]);
-    expect(inviteeCoverage(missingTail, "2026-08-03T00:00:00.000Z", 45)).toBe("none");
+    expect(inviteeCoverage(missingTail, "2026-08-03T00:00:00.000Z", 45, "UTC")).toBe("none");
   });
 
   it("a slot not aligned to a cell boundary still requires its overlapping cells", () => {
@@ -157,7 +158,65 @@ describe("inviteeCoverage", () => {
       ["2026-08-03T00:00:00.000Z", "free" as const],
       ["2026-08-03T00:30:00.000Z", "free" as const],
     ]);
-    expect(inviteeCoverage(cells, "2026-08-03T00:15:00.000Z", 30)).toBe("free");
+    expect(inviteeCoverage(cells, "2026-08-03T00:15:00.000Z", 30, "UTC")).toBe("free");
+  });
+});
+
+describe("inviteeCoverage on the organiser's local cell grid", () => {
+  it("Kathmandu (+5:45): a 10:00-11:00 local slot is covered by the 10:00 and 10:30 local cells", () => {
+    // 10:00 NPT = 04:15Z. Cells are local half-hours, so their UTC keys sit at
+    // :15/:45, never on the epoch's :00/:30.
+    const cells = new Map([
+      ["2026-08-03T04:15:00.000Z", "free" as const],
+      ["2026-08-03T04:45:00.000Z", "free" as const],
+    ]);
+    expect(inviteeCoverage(cells, "2026-08-03T04:15:00.000Z", 60, "Asia/Kathmandu")).toBe("free");
+  });
+});
+
+// Saved cells are keyed by their exact UTC start, on the organiser's grid AT
+// SAVE TIME. Sydney's and Kolkata's half-hours sit on the UTC :00/:30
+// lattice, Kathmandu's (+5:45) on :15/:45, so after the organiser moves
+// between them no key matches. A current cell keeps a state only where the
+// saved cells cover it with no gap: if_needed if any of them is, else free.
+describe("alignCellsToGrid", () => {
+  const sydneyCells = () =>
+    new Map<string, "free" | "if_needed">([
+      ["2026-07-14T00:00:00.000Z", "free"],
+      ["2026-07-14T00:30:00.000Z", "free"],
+      ["2026-07-14T01:00:00.000Z", "if_needed"],
+      ["2026-07-14T01:30:00.000Z", "free"],
+    ]);
+
+  it("Sydney-grid cells aligned to Kathmandu: covered cells take the worst state, half-covered edges drop", () => {
+    const r = alignCellsToGrid(sydneyCells(), "Asia/Kathmandu");
+    expect(r.misaligned).toBe(true);
+    expect([...r.cells.entries()]).toEqual([
+      ["2026-07-14T00:15:00.000Z", "free"],
+      ["2026-07-14T00:45:00.000Z", "if_needed"],
+      ["2026-07-14T01:15:00.000Z", "if_needed"],
+    ]);
+  });
+
+  it.each(["Australia/Sydney", "Asia/Kolkata"])("cells already on the %s grid come back identical, as a new map", (tz) => {
+    const saved = sydneyCells();
+    const r = alignCellsToGrid(saved, tz);
+    expect(r.misaligned).toBe(false);
+    expect(r.cells).not.toBe(saved);
+    expect([...r.cells.entries()]).toEqual([...saved.entries()]);
+  });
+
+  it("rankCandidates reads responses on the current grid: a Kathmandu candidate qualifies on Sydney-grid cells", () => {
+    const ranked = rankCandidates(
+      ["2026-07-14T00:15:00.000Z"],
+      [{ inviteeId: "i1", cells: sydneyCells() }],
+      ["i1"],
+      CURVE_A,
+      30,
+      "Asia/Kathmandu",
+    );
+    expect(ranked).toHaveLength(1);
+    expect(ranked[0]!.weights).toEqual([{ inviteeId: "i1", weight: 1 }]);
   });
 });
 

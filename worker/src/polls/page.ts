@@ -46,6 +46,7 @@ body{font:14px/1.45 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;c
 .head{padding:16px 20px;border-bottom:1px solid #eceff2}
 h1{font-size:16px;margin:0}
 .muted{color:var(--muted);font-size:12px;margin:2px 0 0}
+.notice{color:#8f6b00;font-size:12.5px;font-weight:600;margin:6px 0 0}
 .tools{padding:11px 20px;border-bottom:1px solid #eceff2;display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:12px}
 .tools button{border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:12px;background:#fff;cursor:pointer}
 .tools button[aria-pressed="true"]{background:var(--fg);border-color:var(--fg);color:#fff;font-weight:600}
@@ -131,7 +132,11 @@ export function renderPollPage(o: PollPageOptions): string {
     `<div class="pane" id="app" data-poll-id="${escAttr(o.pollId)}" ` +
     `data-token="${escAttr(o.token)}" data-cell-minutes="${escAttr(String(o.cellMinutes))}">` +
     `<div class="head"><h1>Mark your availability</h1>` +
-    `<p class="muted" id="status" aria-live="polite">Loading&hellip;</p></div>` +
+    `<p class="muted" id="status" aria-live="polite">Loading&hellip;</p>` +
+    // Shown by poll.client.js (showRealignedNotice) when the organiser's tz
+    // moved across half-hour grids since this invitee saved. Separate from
+    // #status, which renderStatus rewrites on every paint.
+    `<p class="notice" id="regrid" hidden>The organiser's timezone changed, so the grid has moved. Please check your availability and save again.</p></div>` +
     `<div class="tools">` +
     `<button type="button" data-tool="free" aria-pressed="true">Free</button>` +
     `<button type="button" data-tool="if_needed" aria-pressed="false">If needed</button>` +

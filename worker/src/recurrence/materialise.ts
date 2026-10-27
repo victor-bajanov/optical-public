@@ -1,5 +1,5 @@
 import { expandRRule } from "./rrule";
-import { fromLocalNaive } from "../planning/datetime";
+import { fromLocalNaiveCompatible, localNaiveMs } from "../planning/datetime";
 import type { LocalNaive } from "../planning/solver-contract";
 import { TaskCreate } from "../schema/task";
 
@@ -61,7 +61,17 @@ export function materialiseTemplate(
   const activeUntil = tplBody.active_until ?? null;
   const pinTz = tplBody.pinned_tz ?? homeTz;
 
-  const occurrences = expandRRule(tplBody.rrule, tplBody.active_from, windowStart, windowEnd);
+  // An unpinned occurrence is a date in the user's window. A pinned one is a
+  // date in pinTz, and belongs to the window holding its pin: pinTz can be up
+  // to a day off the user's zone either way, so expand a day of margin each
+  // side and keep only pins inside [windowStart, windowEnd).
+  const pinned = Boolean(tplBody.pinned_time);
+  const { fromDate, toDate } = pinned
+    ? localDateRange(windowStart, windowEnd, pinTz, 1)
+    : localDateRange(windowStart, windowEnd, homeTz, 0);
+  const occurrences = expandRRule(tplBody.rrule, tplBody.active_from, fromDate, toDate);
+  const windowStartMs = Date.parse(windowStart);
+  const windowEndMs = Date.parse(windowEnd);
 
   const out: NewTaskInsert[] = [];
   for (const occ of occurrences) {
@@ -72,9 +82,15 @@ export function materialiseTemplate(
     const pinnedLocal = tplBody.pinned_time
       ? (`${occ}T${normaliseTime(tplBody.pinned_time)}:00` as LocalNaive)
       : null;
-    const pinnedAt = pinnedLocal ? fromLocalNaive(pinnedLocal, pinTz) : null;
+    // A time inside a DST gap (a pin at 02:30 on spring-forward day, or a
+    // local midnight that doesn't exist) moves forward by the gap.
+    const pinnedAt = pinnedLocal ? fromLocalNaiveCompatible(pinnedLocal, pinTz) : null;
+    if (pinnedAt !== null) {
+      const pinMs = Date.parse(pinnedAt);
+      if (pinMs < windowStartMs || pinMs >= windowEndMs) continue;
+    }
     const earliestStart = pinnedAt
-      ?? fromLocalNaive(`${occ}T00:00:00` as LocalNaive, homeTz);
+      ?? fromLocalNaiveCompatible(`${occ}T00:00:00` as LocalNaive, homeTz);
 
     const reservedStripped = { ...(tplBody.task_body ?? {}) };
     for (const k of RESERVED_TASK_BODY_KEYS) delete reservedStripped[k];
@@ -126,6 +142,28 @@ export function materialiseTemplate(
     });
   }
   return out;
+}
+
+/** The window's local calendar dates in `tz`, widened by `padDays` each
+ *  side: the date of windowStart (inclusive) to the day after the date of
+ *  windowEnd − 1ms (exclusive), so a partial last day counts. For the
+ *  resolve's local week [Mon 00:00, next Mon 00:00) with no pad that is
+ *  exactly Mon..Sun in every zone. */
+function localDateRange(
+  windowStart: string,
+  windowEnd: string,
+  tz: string,
+  padDays: number,
+): { fromDate: string; toDate: string } {
+  const localDateMs = (ms: number) => {
+    if (Number.isNaN(ms)) throw new Error(`invalid ISO datetime in window ${windowStart}..${windowEnd}`);
+    const naive = localNaiveMs(ms, tz);
+    return naive - (((naive % 86_400_000) + 86_400_000) % 86_400_000);
+  };
+  const date = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  const from = localDateMs(Date.parse(windowStart)) - padDays * 86_400_000;
+  const to = localDateMs(Date.parse(windowEnd) - 1) + (1 + padDays) * 86_400_000;
+  return { fromDate: date(from), toDate: date(to) };
 }
 
 /** Normalises a "HH:MM" or "H:MM" string to "HH:MM". */

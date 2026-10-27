@@ -164,6 +164,29 @@ describe("projectPreferredWindows: foreign tz", () => {
   });
 });
 
+// On a fall-back day a naive slot in the repeated hour lands on the EARLIER
+// instant (parseSolution), so each bound maps to the first naive time whose
+// earlier instant is at or after it. The repeated hour's second instance is
+// unreachable for any window.
+describe("projectPreferredWindows: fall-back overlap", () => {
+  it("an end in the repeated hour's second instance keeps the whole first instance (UTC Sat 14–16 → Sydney Sun 01:00–03:00)", () => {
+    // Sydney falls back Sun 5 Apr 03:00 AEDT → 02:00 AEST (16:00Z). 14:00Z–16:00Z
+    // is 01:00–03:00 AEDT; naive 02:xx lands on 15:xxZ, inside the window.
+    const SYD_APR = { start: "2026-03-29T13:00:00.000Z", end: "2026-04-05T14:00:00.000Z" };
+    const out = project([{ days: ["sat"], start: "14:00", end: "16:00", hard: false, tz: "UTC" }], SYD, SYD_APR);
+    expect(out.preferred_windows).toEqual([{ days: ["sun"], start: "01:00", end: "03:00", hard: false }]);
+  });
+
+  it("a start in the repeated hour's second instance skips that hour (LA Sat 14–16 → Beirut Sun 00:00–01:00)", () => {
+    // Beirut falls back Sun 25 Oct 00:00 EEST → Sat 23:00 EET (21:00Z). LA Sat
+    // 14:00 PDT = 21:00Z is the SECOND 23:00; naive 23:xx would land on 20:xxZ,
+    // before the window, so it must not be allowed.
+    const BEY_OCT = { start: "2026-10-18T21:00:00.000Z", end: "2026-10-25T22:00:00.000Z" };
+    const out = project([{ days: ["sat"], start: "14:00", end: "16:00", hard: false, tz: LA }], "Asia/Beirut", BEY_OCT);
+    expect(out.preferred_windows).toEqual([{ days: ["sun"], start: "00:00", end: "01:00", hard: false }]);
+  });
+});
+
 describe("projectPreferredWindows: odd stored times", () => {
   afterEach(() => vi.restoreAllMocks());
 

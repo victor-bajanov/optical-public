@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { fromLocalNaive } from "./datetime";
+import { fromLocalNaiveCompatible } from "./datetime";
 import type {
   LocalNaive,
   ObjectiveComponents,
@@ -82,7 +82,9 @@ export function parseSolution(
 ): ParsedSolution {
   const parsed = SolverResponseSchema.parse(body);
   const schedule = parsed.schedule.map((e) => {
-    const startISO = fromLocalNaive(e.start as LocalNaive, tz);
+    // The solver's slots are naive wall clock; a placement inside a DST gap
+    // (only reachable with no business hours) lands forward by the gap.
+    const startISO = fromLocalNaiveCompatible(e.start as LocalNaive, tz);
     // The solver schedules in 15-min blocks, so e.duration_minutes is the
     // rounded-up reservation. Render the event end from the task's REAL
     // (unrounded) duration when known; fall back to the solver value otherwise.

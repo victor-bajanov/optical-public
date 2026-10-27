@@ -86,6 +86,29 @@ entrypoint = "EngineRpc"
 binding = "SOLVER_CAPTURE"
 bucket_name = "optical-solver-capture"
 
+# Rate limits for the PUBLIC availability reads (GET /book/{slug}/slots,
+# GET /poll/{id}/grid, PUT /poll/{id}/response; public-read/rate-limit.ts):
+# 30 requests / 60 s per client IP (IPv6 by /64; every request), and
+# 120 / 60 s per booking slug or poll id (cache misses only: each one is a
+# calendar read). Over either: 429 {"error":"rate_limited"} + Retry-After: 60, no calendar
+# read. Workers Rate Limiting bindings. They do NOT inherit: every [env.*]
+# block repeats these with its OWN namespace_ids (an id is an account-wide
+# counter space; sharing one would pool counters across deployments). Nothing
+# to create before deploy — the ids are just numbers. Counts are per
+# Cloudflare location. The vitest pool's bundled wrangler 3 does not read
+# [[ratelimits]], so vitest.workspace.ts declares the same two limiters for
+# the suite. Runbook §K "Public read cache and limits";
+# test/public-read/wiring.test.ts pins every block and the vitest copy.
+[[ratelimits]]
+name = "PUBLIC_READ_IP_LIMITER"
+namespace_id = "1001"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "PUBLIC_READ_TARGET_LIMITER"
+namespace_id = "1002"
+simple = { limit = 120, period = 60 }
+
 [vars]
 ACCESS_TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
 ACCESS_POLICY_AUD = "REPLACE_WITH_YOUR_ACCESS_AUD"
@@ -301,6 +324,17 @@ entrypoint = "EngineRpc"
 [[env.dev.r2_buckets]]
 binding = "SOLVER_CAPTURE"
 bucket_name = "optical-solver-capture"
+
+# Public read limiters: see the top-level block. Dev's own namespace_ids.
+[[env.dev.ratelimits]]
+name = "PUBLIC_READ_IP_LIMITER"
+namespace_id = "2001"
+simple = { limit = 30, period = 60 }
+
+[[env.dev.ratelimits]]
+name = "PUBLIC_READ_TARGET_LIMITER"
+namespace_id = "2002"
+simple = { limit = 120, period = 60 }
 
 [env.dev.vars]
 ACCESS_TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"

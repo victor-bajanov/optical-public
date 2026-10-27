@@ -8,7 +8,7 @@ import type { Env } from "../env";
 import type { AppVariables } from "../index-providers";
 import { mountOwnerGate } from "../middleware/owner-gate";
 import { canonicalIanaZone, getUser, setHomeTzStmt } from "../db/users";
-import { deletePendingPlansForSubjectStmt } from "../planning/proposed-plans";
+import { deletePendingPlansForSubjectStmt, renamePlansWindowTzStmt } from "../planning/proposed-plans";
 import { stampPreferredWindowTzStmt } from "../db/tasks";
 import { IanaZone } from "../schema/common";
 import { D } from "../schema/descriptions";
@@ -71,8 +71,12 @@ type WriteOutcome = TimezoneState | "no_user_row";
 /** Write home_tz (canonical zone, or null to reset). When the effective zone
  *  (home_tz ?? SCHEDULER_TZ, compared canonically) changes, the write, the
  *  pending-plan delete and the task-window tz stamp run as one D1 batch, so a failure leaves none applied
- *  and a retry sees the old zone and deletes again. A subject with no users
- *  row gets "no_user_row": a config write never creates one. */
+ *  and a retry sees the old zone and deletes again. The same zone under a new
+ *  spelling (a legacy "Asia/Calcutta" re-saved as "Asia/Kolkata") is a rename:
+ *  the same batch re-spells the plans' window_tz, which the week lookups and
+ *  commit match as a string, so nothing is discarded and no window is
+ *  stamped. A subject with no users row gets "no_user_row": a config write
+ *  never creates one. */
 async function writeTimezone(
   db: D1Database,
   owner: string,
@@ -96,6 +100,11 @@ async function writeTimezone(
     if (stamped) {
       console.log(JSON.stringify({ msg: "timezone_windows_stamped", tz: oldEffective, tasks: stamped.meta?.changes ?? 0 }));
     }
+  } else if ((user.home_tz ?? schedulerTz) !== (newHomeTz ?? schedulerTz)) {
+    await db.batch([
+      write,
+      renamePlansWindowTzStmt(db, owner, user.home_tz ?? schedulerTz, newHomeTz ?? schedulerTz, schedulerTz),
+    ]);
   } else {
     await write.run();
   }

@@ -19,6 +19,12 @@ The `@cloudflare/vitest-pool-workers` pool can't collect the whole suite in one
 process, so the full run is batched per `test/` subdir — run `test:ci`, not a
 bare `vitest run`.
 
+**Timezones.** Tz-sensitive code is covered by the permanent 30-zone matrix in
+`worker/test/tz-matrix/` (every whole-hour offset, the off-grid ones, and the
+zones whose DST starts at local midnight; expectations come from a brute-force
+Intl oracle in `zones.ts`). It stays in `npm run test:ci` for good, and a new
+tz behaviour adds its matrix case.
+
 
 # Deploy
 
@@ -42,7 +48,12 @@ Always apply migrations BEFORE the deploy, in every env. Migration **0041**
 (`users.retention_warned_at`) is load-bearing: `requireBearer` reads the
 column, so deploying ahead of it fails every bearer call. Migration **0046**
 (`identity_tokens.login_email`) is load-bearing too: every sign-in writes it
-and every owner email reads it.
+and every owner email reads it. So is migration **0047**
+(`proposed_plans.commit_claim`/`commit_claimed_at`): every commit and accept
+claims the plan before touching the calendar, so deploying first fails every
+commit. A second concurrent commit of the same plan answers
+`409 commit_in_progress`, normally having written nothing (120 s lease; the
+commit runs under `waitUntil`; runbook §E "Accept-exact-hash behaviour").
 
 Dev is fully isolated from prod: own D1 (`scheduler-dev`), KV, Durable Objects,
 and the `scheduler-dev.example.com` custom domain.
@@ -260,6 +271,29 @@ far they may press the strip's "Later →" cell. Pages past the reach are
 against the page holding the requested start only (`pageForStart`), so a
 far-out booking costs one read, not a year of calendar. See runbook §M
 "Paging"; smoke step B10 in `bin/booking-smoke.py`.
+
+## Public read cache and limits
+
+**No flag, no migration.** The three availability reads anyone with a link
+can drive (`GET /book/{slug}/slots`, `GET /poll/{id}/grid`,
+`PUT /poll/{id}/response`), after the flag/slug/token/membership checks,
+pass a per-IP limit on every request (`PUBLIC_READ_IP_LIMITER`, 30/min per
+`CF-Connecting-IP`, IPv6 keyed on its /64), then read the owner's calendar
+through a per-colo Cache API copy (`PUBLIC_READ_CACHE_TTL_SECONDS`, default
+60, "0" = off; titles and addresses are never stored). Only a cache miss
+spends the per-page budget (`PUBLIC_READ_TARGET_LIMITER`, 120 calendar
+reads/min per slug or poll). Over either limit is `429 rate_limited` +
+`Retry-After: 60`, with no calendar read. Both limiters are `[[ratelimits]]`
+bindings in every env block, mirrored in `vitest.workspace.ts`. D1 inputs
+stay fresh, so a new booking blocks at once, and the key carries an own-write
+generation (task count + newest `tasks.updated_at`), so a commit shows at
+once; a calendar change made outside Optical can take up to the TTL to show.
+The booking claim, poll booking, the status page and every authenticated path
+read live (`worker/src/public-read/`, pinned by
+`test/public-read/wiring.test.ts`). The cache is not available on
+`*.workers.dev` or behind Access; check it per env with `DEBUG_LOG`
+(`dbg_public_read_cache {hit}`). The suite pins the TTL to "0". See runbook
+§K "Public read cache and limits".
 
 ## Booking-page owner notice
 

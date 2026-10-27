@@ -15,7 +15,12 @@
 // own zone that can overlap the horizon, [start, end) converted to instants
 // (a nonexistent local time moves forward to the transition; an ambiguous one
 // takes the earlier instant, as fromLocalNaive does), then to problem-local
-// naive wall-clock (the solver's slot model is naive local time).
+// naive wall-clock (the solver's slot model is naive local time). A naive slot
+// in a problem-local fall-back overlap lands on the earlier instant, so each
+// bound maps to the first naive time landing at or after it
+// (firstNaiveAtOrAfter): the window allows a repeated-hour slot exactly when
+// that slot's instant is inside it, and the hour's second instance, which no
+// naive slot reaches, is never placeable.
 //
 // - SOFT windows become per-shape {days, start, end} windows, split at
 //   problem-local midnight (a piece ending at midnight ends "23:59": the
@@ -106,6 +111,20 @@ function instantOf(naiveMs: number, tz: string): number {
   throw new Error(`no existing local time after ${naiveString(naiveMs)} in ${tz}`);
 }
 
+/** The first problem-local naive time whose slot lands at or after instant
+ *  `ms`. A naive slot in a fall-back overlap lands on the EARLIER instant
+ *  (parseSolution), so an instant in the repeated hour's second instance maps
+ *  past the overlap: no naive slot reaches it. Elsewhere it is just the
+ *  instant's own wall clock. */
+function firstNaiveAtOrAfter(ms: number, tz: string): number {
+  const naive = localNaiveMs(ms, tz);
+  if (instantOf(naive, tz) >= ms) return naive;
+  // Second instance: the overlap ends on a quarter hour, within a few steps.
+  let n = Math.ceil(naive / QUARTER) * QUARTER;
+  for (let i = 0; i < 16 && instantOf(n, tz) < ms; i++) n += QUARTER;
+  return n;
+}
+
 /** Problem-local naive intervals of a foreign window over the source dates that
  *  can touch [h0, h1) (instants), unclipped. */
 function naiveIntervals(
@@ -128,11 +147,9 @@ function naiveIntervals(
     const s = instantOf(d + startMin * MIN, srcTz);
     const e = instantOf(d + endMin * MIN, srcTz);
     if (e <= s || e <= h0 || s >= h1) continue;
-    const ns = localNaiveMs(s, problemTz);
-    let ne = localNaiveMs(e, problemTz);
-    // Inside a fall-back overlap naive time can run backwards: keep the real length.
-    if (ne <= ns) ne = ns + (e - s);
-    out.push({ s: ns, e: ne });
+    const ns = firstNaiveAtOrAfter(s, problemTz);
+    const ne = firstNaiveAtOrAfter(e, problemTz);
+    if (ne > ns) out.push({ s: ns, e: ne });
   }
   return out;
 }

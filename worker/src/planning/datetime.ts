@@ -84,8 +84,8 @@ export function localWeekWindow(iso: string, tz: string): { start: string; end: 
     return `${dt.getUTCFullYear()}-${mm}-${dd}T00:00:00` as LocalNaive;
   };
   return {
-    start: fromLocalNaive(naiveMidnight(mondayMs), tz),
-    end: fromLocalNaive(naiveMidnight(mondayMs + 7 * 86_400_000), tz),
+    start: fromLocalNaiveCompatible(naiveMidnight(mondayMs), tz),
+    end: fromLocalNaiveCompatible(naiveMidnight(mondayMs + 7 * 86_400_000), tz),
   };
 }
 
@@ -105,6 +105,40 @@ export function upcomingLocalWeekWindow(iso: string, tz: string): { start: strin
     throw new Error(`invalid ISO datetime: ${iso}`);
   }
   return localWeekWindow(new Date(instant + 3.5 * 86_400_000).toISOString(), tz);
+}
+
+/** The zone's offset at `ms`, in ms (local wall clock minus UTC). */
+function offsetMsAt(ms: number, tz: string): number {
+  // localNaiveMs works at whole-second precision; compare like with like.
+  const wholeSecond = ms - (((ms % 1000) + 1000) % 1000);
+  return localNaiveMs(wholeSecond, tz) - wholeSecond;
+}
+
+const mod = (x: number, m: number): number => ((x % m) + m) % m;
+
+/** The first instant at or after `ms` whose wall clock in `tz` is on the
+ *  `stepMinutes` grid counted from local midnight (10:00, 10:30, … for 30).
+ *  Booking slots and poll cells use this rather than the UTC epoch grid,
+ *  which in a zone off the half-hour (Kathmandu +5:45) only ever offers :15
+ *  and :45 local. A whole-hour or half-hour zone gets the same answer as
+ *  the epoch grid. */
+export function ceilToLocalGrid(ms: number, stepMinutes: number, tz: string): number {
+  const stepMs = stepMinutes * 60_000;
+  let t = ms;
+  // Re-check after a move: an offset change between ms and t (DST) can move
+  // the wall clock off the grid. Offsets change at most once per step.
+  for (let i = 0; i < 3; i++) {
+    const r = mod(t + offsetMsAt(t, tz), stepMs);
+    if (r === 0) return t;
+    t += stepMs - r;
+  }
+  return t;
+}
+
+/** The last instant at or before `ms` on the local `stepMinutes` grid in
+ *  `tz`; the floor twin of {@link ceilToLocalGrid}. */
+export function floorToLocalGrid(ms: number, stepMinutes: number, tz: string): number {
+  return ms - mod(ms + offsetMsAt(ms, tz), stepMinutes * 60_000);
 }
 
 const QUARTER_MS = 15 * 60_000;
@@ -168,6 +202,36 @@ export function isWeekFullyPast(windowEndISO: string, nowISO: string): boolean {
 }
 
 export function fromLocalNaive(local: LocalNaive, tz: string): string {
+  const ms = resolveLocalNaive(local, tz);
+  if (ms === null) {
+    // Neither offset produced the requested local time → DST gap.
+    throw new Error(
+      `local time ${local} does not exist in ${tz} (DST gap)`,
+    );
+  }
+  return new Date(ms).toISOString();
+}
+
+/** fromLocalNaive with Temporal's "compatible" disambiguation: a local time
+ *  inside a spring-forward gap converts with the pre-transition offset, which
+ *  lands it forward by the gap's length (Santiago's nonexistent 2026-09-06
+ *  00:30 → 01:30 local; a nonexistent 00:00 → the day's first instant). An
+ *  existing time is exact, and an overlap takes the earlier instant, as in
+ *  fromLocalNaive. Used wherever a day bound, recurrence time or solver
+ *  placement must not throw on a DST gap; fromLocalNaive stays strict. */
+export function fromLocalNaiveCompatible(local: LocalNaive, tz: string): string {
+  const ms = resolveLocalNaive(local, tz);
+  if (ms !== null) return new Date(ms).toISOString();
+  const pretendUtcMillis = Date.parse(local + "Z");
+  // Every real offset is within ±14 h, so 15 h before the pretend-UTC instant
+  // is before the transition: that instant's offset is the pre-gap one.
+  const before = getOffsetMinutes(pretendUtcMillis - 15 * 3_600_000, tz);
+  return new Date(pretendUtcMillis - before * 60_000).toISOString();
+}
+
+/** The UTC ms of `local` in `tz` (the earlier one in an overlap), or null when
+ *  the local time falls in a DST gap. */
+function resolveLocalNaive(local: LocalNaive, tz: string): number | null {
   // Strategy: treat local as if it were UTC to get a starting instant,
   // then use the zone's offset at that instant to find the UTC candidate.
   // Verify each candidate by re-formatting in the zone.
@@ -190,7 +254,7 @@ export function fromLocalNaive(local: LocalNaive, tz: string): string {
   // Probe additional offsets by sampling around candidate1 (±DST step = 60 min).
   // This handles:
   //   - Spring-forward gap: candidate1 lands post-gap; candidate from probing
-  //     the pre-gap region also won't verify → neither valid → DST gap error.
+  //     the pre-gap region also won't verify → neither valid → DST gap.
   //   - Fall-back overlap: candidate1 lands post-transition; probing 60 min
   //     earlier finds the pre-transition candidate → both valid → pick earlier.
   const DST_STEP_MS = 60 * 60_000;
@@ -203,14 +267,8 @@ export function fromLocalNaive(local: LocalNaive, tz: string): string {
   if (verify1 === local) valid.push(candidate1);
   if (verify2 === local && candidate2 !== candidate1) valid.push(candidate2);
 
-  if (valid.length === 0) {
-    // Neither offset produced the requested local time → DST gap.
-    throw new Error(
-      `local time ${local} does not exist in ${tz} (DST gap)`,
-    );
-  }
+  if (valid.length === 0) return null;
 
   // If two valid candidates, prefer the earlier UTC instant (pre-transition).
-  const earlier = valid.reduce((a, b) => (a < b ? a : b));
-  return new Date(earlier).toISOString();
+  return valid.reduce((a, b) => (a < b ? a : b));
 }

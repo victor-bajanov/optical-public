@@ -7,8 +7,10 @@
 // existing capability POST /v1/plans/{h}/accept: the user's click on that
 // email's page. That keeps ONE human-confirmed path to a commit, with the
 // guards it already has (Authorization and foreign Sec-Fetch-Site refused,
-// delisted owners refused, exact-hash commit with its committed_at CAS, 409
-// plan_superseded with the week's newer plan, the stale-timezone refusal).
+// delisted owners refused, exact-hash commit under its commit claim (a
+// concurrent second commit of the plan writes nothing and answers 409
+// commit_in_progress), 409 plan_superseded with the week's newer plan, the
+// stale-timezone refusal).
 // A generic /confirm/{id} replay of commitPlan would have been a second path
 // to keep in step with all of that, and a second page showing the same diff.
 //

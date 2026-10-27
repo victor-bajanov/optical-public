@@ -145,6 +145,13 @@ describe.each([googleFixture, microsoftFixture])("provider contract: $name", (fi
     expect(allDay.isAllDay).toBe(true);
   });
 
+  it("carries an all-day event's floating dates as UTC-midnight start/end (busy-blocks reads the date off them)", async () => {
+    const r = await fetchWindow();
+    const allDay = r.events.find((e) => e.id === "evt-allday")!;
+    expect(allDay.start).toMatch(/^2026-07-08T00:00:00(\.000)?Z$/);
+    expect(allDay.end).toMatch(/^2026-07-09T00:00:00(\.000)?Z$/);
+  });
+
   it("returns a non-empty nextSyncToken", async () => {
     const r = await fetchWindow();
     expect(r.nextSyncToken).toBeTruthy();

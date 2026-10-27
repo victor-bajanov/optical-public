@@ -17,6 +17,19 @@ export interface Env {
   // deployment without the [[services]] block must degrade to the in-process
   // sequential path, never fail a resolve (see fanoutEligible()).
   ENGINE_RPC?: import("./engine/fanout").EngineRpcBinding;
+  // Workers Rate Limiting bindings for the public availability reads
+  // (public-read/rate-limit.ts). Not vars: the limit and period are the
+  // `simple = { limit, period }` of each env block's [[ratelimits]] entries
+  // in wrangler.toml (bindings do not inherit; each env has its own
+  // namespace_id; vitest.workspace.ts mirrors the top-level values). Tune
+  // them there and redeploy. Defaults: IP 30 / 60 s per client IP (IPv6 by
+  // /64), every request, shared by the booking and poll reads; TARGET
+  // 120 / 60 s per booking slug or poll id, spent only when a cache miss reads
+  // the calendar. Optional only so an off-platform run fails open with a
+  // `public_read_limiter_unbound` warning; every env block declares both.
+  // Runbook §K "Public read cache and limits".
+  PUBLIC_READ_IP_LIMITER?: import("./public-read/rate-limit").RateLimitBinding;
+  PUBLIC_READ_TARGET_LIMITER?: import("./public-read/rate-limit").RateLimitBinding;
 
   // Vars
   ACCESS_TEAM_DOMAIN: string;
@@ -239,6 +252,13 @@ export interface Env {
   // Days after offboard before the deactivated users row is deleted and the
   // audit_log subject pseudonymised. "0" (or unset) = keep indefinitely.
   DELETED_ACCOUNT_RETENTION_DAYS?: string;
+  // Public availability reads (GET /book/{slug}/slots, GET /poll/{id}/grid,
+  // PUT /poll/{id}/response): seconds one owner's calendar read may be reused
+  // from the per-colo Cache API (public-read/events-cache.ts). Unset, empty,
+  // unparseable or negative ⇒ 60; "0" turns the cache off (every read live);
+  // capped at 300. The booking claim and the poll booking engine always read
+  // live, whatever this says. Runbook §K "Public read cache and limits".
+  PUBLIC_READ_CACHE_TTL_SECONDS?: string;
 
   // Secrets
   GOOGLE_OAUTH_CLIENT_ID: string;

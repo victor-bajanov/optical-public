@@ -276,6 +276,86 @@ describe("POST /v1/plans/:hash/accept", () => {
     expect(await res.text()).toContain("expired and can no longer be accepted");
   });
 
+  // T3: a POST landing while another commit of the same plan holds its claim
+  // (a double-click, or an agent's commit racing this link) writes nothing.
+  describe("a plan another commit is applying (live commit claim)", () => {
+    beforeEach(async () => {
+      await env.DB.prepare("UPDATE proposed_plans SET commit_claim = 'other', commit_claimed_at = ? WHERE plan_hash = 'h1'")
+        .bind(new Date().toISOString()).run();
+    });
+
+    it("capability POST (HTML) renders a 'being applied' notice with status 409 and writes nothing", async () => {
+      const t = await signCapability({ planHash: "h1", subject: "operator@example.com", purpose: "accept", ttlSeconds: 300 }, env.TOKEN_HASH_PEPPER);
+      const cal = new MockCalendarProvider();
+      const res = await makeApp(cal).request(
+        "/v1/plans/h1/accept",
+        { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: `t=${encodeURIComponent(t)}` },
+        { ...env, OAUTH_ISSUER: "https://scheduler.example.com" },
+      );
+      expect(res.status).toBe(409);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const html = await res.text();
+      expect(html).toContain("being applied");
+      expect(html).not.toContain("<form");
+      expect(cal.getCreated()).toHaveLength(0);
+    });
+
+    it("capability POST asking for JSON answers 409 commit_in_progress", async () => {
+      const t = await signCapability({ planHash: "h1", subject: "operator@example.com", purpose: "accept", ttlSeconds: 300 }, env.TOKEN_HASH_PEPPER);
+      const res = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/h1/accept",
+        { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: `t=${encodeURIComponent(t)}` },
+        { ...env, OAUTH_ISSUER: "https://scheduler.example.com" },
+      );
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: "commit_in_progress" });
+    });
+
+    it("bearer POST answers JSON 409 commit_in_progress", async () => {
+      await seedBearer("tok-claim", "operator@example.com");
+      const res = await makeApp(new MockCalendarProvider()).request(
+        "/v1/plans/h1/accept",
+        { method: "POST", headers: { Authorization: "Bearer tok-claim" } },
+        { ...env, OAUTH_ISSUER: "https://scheduler.example.com" },
+      );
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: "commit_in_progress" });
+    });
+  });
+
+  // T3/F3: see the same block in commit.test.ts. The capability POST hands
+  // its commit to waitUntil, so a disconnect can't strand the commit claim.
+  it("capability POST registers the in-flight commit with waitUntil before it writes the calendar", async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((r) => { open = r; });
+    class Gated extends MockCalendarProvider {
+      override async fetchEventsInWindow(start: string, end: string, opts?: { syncToken?: boolean }) {
+        await gate;
+        return super.fetchEventsInWindow(start, end, opts);
+      }
+    }
+    const cal = new Gated();
+    const tasks: Promise<unknown>[] = [];
+    const ctx = { waitUntil: (p: Promise<unknown>) => { tasks.push(p); }, passThroughOnException() {}, props: {} } as unknown as ExecutionContext;
+    const t = await signCapability({ planHash: "h1", subject: "operator@example.com", purpose: "accept", ttlSeconds: 300 }, env.TOKEN_HASH_PEPPER);
+    const resP = Promise.resolve(makeApp(cal).request(
+      "/v1/plans/h1/accept",
+      { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: `t=${encodeURIComponent(t)}` },
+      { ...env, OAUTH_ISSUER: "https://scheduler.example.com" },
+      ctx,
+    ));
+    try {
+      await vi.waitFor(() => expect(tasks.length).toBeGreaterThan(0));
+      expect(cal.getCreated()).toHaveLength(0);
+    } finally {
+      open();
+      await resP.catch(() => undefined); // drain, so a red run doesn't outlive the test
+    }
+    await Promise.all(tasks);
+    expect((await resP).status).toBe(200);
+    expect(cal.getCreated()).toHaveLength(1);
+  });
+
   it("accepted page offers the other pending week", async () => {
     await seedPlan("h2", W2, "2026-05-19T00:00:00Z");
     await attachRenderSnapshot(env.DB, "h2", snapshotFor(W2, "Week two work"));

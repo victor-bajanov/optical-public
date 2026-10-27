@@ -29,14 +29,46 @@ export const Uuid = z.string().uuid().describe(D.common.uuid);
 //    America/Phoenix — fixed offsets a US-Eastern user doesn't mean), unless
 //    it is a UTC alias ("UTC", "GMT", "Zulu").
 // Etc/GMT±N and backward links with an Area ("US/Eastern") stay valid.
+// ICU resolves to CLDR's canonical ids, which for a handful of zones are the
+// IANA backward links ("Asia/Kolkata" → "Asia/Calcutta" in workerd), so those
+// are mapped on to the IANA primary id. Rows stored before this mapping keep
+// their legacy spelling: Intl and Python's ZoneInfo both load it, and it is
+// the same zone.
 export function canonicalZoneName(tz: string): string {
-  const canonical = new Intl.DateTimeFormat("en-US", { timeZone: tz }).resolvedOptions().timeZone;
-  if (/^[+-]/.test(canonical)) throw new RangeError(`UTC offset is not an IANA timezone: ${tz}`);
+  const icu = new Intl.DateTimeFormat("en-US", { timeZone: tz }).resolvedOptions().timeZone;
+  if (/^[+-]/.test(icu)) throw new RangeError(`UTC offset is not an IANA timezone: ${tz}`);
+  const canonical = ICU_LEGACY_ZONES[icu] ?? icu;
   if (!tz.includes("/") && canonical !== "UTC") {
     throw new RangeError(`bare zone name is ambiguous, use Area/Location (e.g. ${canonical}): ${tz}`);
   }
   return canonical;
 }
+
+/** CLDR/ICU canonical id → IANA primary id, for every zone where the two
+ *  differ (the set TC39's canonical-tz proposal lists). Keys are what Intl
+ *  returns in workerd; test/schema/iana-zone.test.ts pins that each key is an
+ *  ICU id and each value resolves back to it. */
+export const ICU_LEGACY_ZONES: Readonly<Record<string, string>> = {
+  "Africa/Asmera": "Africa/Asmara",
+  "America/Buenos_Aires": "America/Argentina/Buenos_Aires",
+  "America/Catamarca": "America/Argentina/Catamarca",
+  "America/Coral_Harbour": "America/Atikokan",
+  "America/Cordoba": "America/Argentina/Cordoba",
+  "America/Godthab": "America/Nuuk",
+  "America/Indianapolis": "America/Indiana/Indianapolis",
+  "America/Jujuy": "America/Argentina/Jujuy",
+  "America/Louisville": "America/Kentucky/Louisville",
+  "America/Mendoza": "America/Argentina/Mendoza",
+  "Asia/Calcutta": "Asia/Kolkata",
+  "Asia/Katmandu": "Asia/Kathmandu",
+  "Asia/Rangoon": "Asia/Yangon",
+  "Asia/Saigon": "Asia/Ho_Chi_Minh",
+  "Atlantic/Faeroe": "Atlantic/Faroe",
+  "Europe/Kiev": "Europe/Kyiv",
+  "Pacific/Enderbury": "Pacific/Kanton",
+  "Pacific/Ponape": "Pacific/Pohnpei",
+  "Pacific/Truk": "Pacific/Chuuk",
+};
 
 // IANA zone validator (see canonicalZoneName); parses to the canonical
 // spelling, so every write path stores one form. Shared by template pinned_tz,

@@ -1,7 +1,7 @@
 import { SCHEDULER_CHUNK_ID_KEY } from "../providers/types";
 import type { CalendarEvent } from "../providers/types";
 import type { LocalNaive } from "./solver-contract";
-import { fromLocalNaive, floorToQuarter, ceilToQuarter } from "./datetime";
+import { fromLocalNaiveCompatible, floorToQuarter, ceilToQuarter } from "./datetime";
 
 export interface BusyBlock {
   id: string;
@@ -19,9 +19,38 @@ export interface DeriveBusyOptions {
   excludeEventIds: Set<string>;
 }
 
+const FLOATING_ALL_DAY = /^(\d{4}-\d{2}-\d{2})T00:00:00(\.000)?Z$/;
+
+/** The floating calendar date an all-day event's start/end string carries, or
+ *  null. Both providers hand an all-day date over as UTC midnight of that date
+ *  (Google `${date}T00:00:00Z`; Graph's floating midnight read under
+ *  outlook.timezone="UTC"). That instant is NOT the user's local midnight: the
+ *  date is the meaning, so it is read back off the string. Anything else (a
+ *  provider that sent a converted instant) is not a floating date. */
+export function allDayFloatingDate(iso: string): string | null {
+  return FLOATING_ALL_DAY.exec(iso)?.[1] ?? null;
+}
+
+/** First instant of local calendar date `date` (YYYY-MM-DD) in `tz`. A local
+ *  midnight inside a DST gap (Santiago, Beirut, Cairo) moves forward to the
+ *  day's first real instant. */
+function localDateStartUtc(date: string, tz: string): string {
+  return fromLocalNaiveCompatible(`${date}T00:00:00` as LocalNaive, tz);
+}
+
+/** The instant whose local week an event belongs to, for week bucketing. A
+ *  floating all-day event belongs to the week of its DATE, so it buckets at
+ *  local noon of that date (noon always exists, so no DST dependency); any
+ *  other event at its start. */
+export function eventBucketInstant(e: CalendarEvent, tz: string): string {
+  const date = e.isAllDay === true ? allDayFloatingDate(e.start) : null;
+  return date === null ? e.start : fromLocalNaiveCompatible(`${date}T12:00:00` as LocalNaive, tz);
+}
+
 /** UTC instant of local midnight that STARTS the local day containing `iso`.
- *  Used to widen an all-day / out-of-office event's start to the local day's
- *  beginning (decision C). The event's local calendar date is taken in `tz`. */
+ *  Used to widen an out-of-office event's start (and a converted, non-floating
+ *  all-day instant) to the local day's beginning (decision C). The event's
+ *  local calendar date is taken in `tz`. */
 function localDayStartUtc(iso: string, tz: string): string {
   const ms = Date.parse(iso);
   if (Number.isNaN(ms)) throw new Error(`invalid ISO datetime: ${iso}`);
@@ -31,22 +60,15 @@ function localDayStartUtc(iso: string, tz: string): string {
     month: "2-digit",
     day: "2-digit",
   }).format(new Date(ms)); // "YYYY-MM-DD"
-  return fromLocalNaive(`${localDate}T00:00:00` as LocalNaive, tz);
+  return localDateStartUtc(localDate, tz);
 }
 
 /** UTC instant of local midnight that ENDS the local day containing `iso - 1ms`.
- *  Google's all-day end.date is exclusive (one-day event ends on D+1 00:00), so
- *  for an all-day event we want local-midnight of that exclusive end date — i.e.
- *  the local date of `iso` itself. We step back 1ms before taking the local date
- *  so that an end exactly on local midnight is attributed to the day it CLOSES,
- *  not the next one; then return the start of the following local day.
- *
- *  NOTE: this function is correct for timed OOO events whose `end` is a real UTC
- *  instant. It MUST NOT be called with all-day event ends — those UTC-midnight
- *  values are not local midnights in positive-UTC-offset zones, so the -1ms
- *  step-back lands on the previous UTC day but still the same local day, causing
- *  the result to advance one extra local day. Use localDayStartUtc(end, tz) for
- *  all-day event ends instead (see the endUtcRaw calculation below). */
+ *  We step back 1ms before taking the local date so that an end exactly on
+ *  local midnight is attributed to the day it CLOSES, not the next one; then
+ *  return the start of the following local day. Used for timed OOO events,
+ *  whose `end` is a real UTC instant. All-day ends are exclusive dates and go
+ *  through localDateStartUtc instead. */
 function localDayEndUtc(iso: string, tz: string): string {
   const ms = Date.parse(iso);
   if (Number.isNaN(ms)) throw new Error(`invalid ISO datetime: ${iso}`);
@@ -61,7 +83,7 @@ function localDayEndUtc(iso: string, tz: string): string {
   const nextDayMs = Date.UTC(y!, mo! - 1, d!) + 86_400_000;
   const nd = new Date(nextDayMs);
   const nextLocalDate = `${nd.getUTCFullYear()}-${String(nd.getUTCMonth() + 1).padStart(2, "0")}-${String(nd.getUTCDate()).padStart(2, "0")}`;
-  return fromLocalNaive(`${nextLocalDate}T00:00:00` as LocalNaive, tz);
+  return localDateStartUtc(nextLocalDate, tz);
 }
 
 /** The authoritative busy derivation, shared by the planner and the booking
@@ -80,19 +102,19 @@ function localDayEndUtc(iso: string, tz: string): string {
  *       omits cancelled events).
  *    D. status "tentative" blocks only when tentativeIsBusy is true.
  *    C. an all-day BUSY event, or any outOfOffice event, blocks its WHOLE local
- *       day(s); the UTC instants are re-derived from the event's local calendar
- *       dates so the block aligns to local midnight, not to the coerced UTC
- *       midnight (which is mid-morning in +10 zones).
+ *       day(s), from the first instant of the first local day to the first
+ *       instant of the day after the last.
  *
- *  All-day events: the provider coerced Google's exclusive end.date to a
- *  UTC-midnight instant (e.g. "2026-05-20T00:00:00Z" for a May-19 event). In a
- *  positive-UTC-offset timezone (+10) that UTC midnight is 10am local, so its
- *  LOCAL date is still May 20 — calling localDayEndUtc (which advances to the
- *  NEXT local day) would yield May 21, a two-day block. Instead we use
- *  localDayStartUtc(end): the UTC-midnight end's local date is the exclusive
- *  end date, and localDayStartUtc returns midnight of that date — the correct
- *  local-day boundary. Timed OOO events keep localDayEndUtc, whose advance is
- *  correct. Verified by build-problem.test.ts "expands an all-day busy event". */
+ *  All-day events are floating dates (allDayFloatingDate): the provider string
+ *  "2026-05-19T00:00:00Z" means local May 19 wherever the user is, so the
+ *  block runs from local midnight of the start date to local midnight of the
+ *  exclusive end date, both built from the date strings in `tz`. Taking the
+ *  UTC-midnight instant's local date instead would block May 18 everywhere
+ *  west of UTC. An all-day event whose start/end is NOT UTC midnight (a
+ *  converted instant) falls back to the local day containing that instant.
+ *  Timed OOO events widen to the local days their instants touch
+ *  (localDayStartUtc / localDayEndUtc). A local midnight inside a DST gap is
+ *  the day's first real instant. */
 export function deriveBusyBlocks(events: CalendarEvent[], opts: DeriveBusyOptions): BusyBlock[] {
   const { tz } = opts;
   const rounded = events
@@ -102,9 +124,9 @@ export function deriveBusyBlocks(events: CalendarEvent[], opts: DeriveBusyOption
     .filter((e) => e.status !== "tentative" || opts.tentativeIsBusy === true)
     .map((e) => {
       const blocksWholeDay = e.isAllDay === true || e.eventType === "outOfOffice";
-      const startUtcRaw = blocksWholeDay ? localDayStartUtc(e.start, tz) : e.start;
+      const startUtcRaw = blocksWholeDay ? allDayBound(e, "start", tz) ?? localDayStartUtc(e.start, tz) : e.start;
       const endUtcRaw = blocksWholeDay
-        ? (e.isAllDay === true ? localDayStartUtc(e.end, tz) : localDayEndUtc(e.end, tz))
+        ? (e.isAllDay === true ? allDayBound(e, "end", tz) ?? localDayStartUtc(e.end, tz) : localDayEndUtc(e.end, tz))
         : e.end;
       return {
         id: e.id,
@@ -125,4 +147,13 @@ export function deriveBusyBlocks(events: CalendarEvent[], opts: DeriveBusyOption
     }
   }
   return merged;
+}
+
+/** Local midnight of an all-day event's floating start or (exclusive) end
+ *  date, or null when the event is not all-day or the bound is not a floating
+ *  date. */
+function allDayBound(e: CalendarEvent, which: "start" | "end", tz: string): string | null {
+  if (e.isAllDay !== true) return null;
+  const date = allDayFloatingDate(e[which]);
+  return date === null ? null : localDateStartUtc(date, tz);
 }

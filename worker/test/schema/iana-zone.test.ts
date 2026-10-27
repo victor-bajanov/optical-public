@@ -4,7 +4,7 @@
 // rejects bare legacy names ("EST" → America/Panama, no DST) unless they are
 // UTC aliases, and every accepted zone is stored in its canonical spelling.
 import { describe, it, expect } from "vitest";
-import { IanaZone } from "../../src/schema/common";
+import { IanaZone, ICU_LEGACY_ZONES } from "../../src/schema/common";
 import { TaskCreate } from "../../src/schema/task";
 import { TemplateCreate, TemplatePatch } from "../../src/schema/template";
 import { canonicalIanaZone } from "../../src/db/users";
@@ -69,6 +69,32 @@ describe("IanaZone stores the canonical spelling", () => {
   ])("%s → %s", (input, canonical) => {
     const r = IanaZone.safeParse(input);
     expect(r.success && r.data).toBe(canonical);
+  });
+
+  // workerd's ICU resolves to CLDR's legacy ids; the stored spelling is the
+  // IANA primary id instead.
+  it.each([
+    ["Asia/Kolkata", "Asia/Kolkata"],
+    ["Asia/Calcutta", "Asia/Kolkata"],
+    ["Asia/Kathmandu", "Asia/Kathmandu"],
+    ["Asia/Katmandu", "Asia/Kathmandu"],
+    ["Asia/Ho_Chi_Minh", "Asia/Ho_Chi_Minh"],
+    ["Europe/Kyiv", "Europe/Kyiv"],
+    ["Europe/Uzhgorod", "Europe/Kyiv"],
+    ["America/Argentina/Buenos_Aires", "America/Argentina/Buenos_Aires"],
+    ["America/Fort_Wayne", "America/Indiana/Indianapolis"],
+    ["Pacific/Kanton", "Pacific/Kanton"],
+  ])("ICU legacy id: %s → %s", (input, canonical) => {
+    const r = IanaZone.safeParse(input);
+    expect(r.success && r.data).toBe(canonical);
+  });
+
+  it("every legacy-map entry is an id ICU itself returns, and its target is the same ICU zone", () => {
+    const icu = (z: string) => new Intl.DateTimeFormat("en-US", { timeZone: z }).resolvedOptions().timeZone;
+    for (const [legacy, iana] of Object.entries(ICU_LEGACY_ZONES)) {
+      expect(icu(legacy), legacy).toBe(legacy);
+      expect(icu(iana), iana).toBe(legacy);
+    }
   });
 
   it("canonicalises a task window tz and a template pinned_tz", () => {

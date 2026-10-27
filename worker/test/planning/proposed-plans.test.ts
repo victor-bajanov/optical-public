@@ -270,6 +270,16 @@ describe("owner-scoped proposed_plans accessors", () => {
     expect((await getProposedPlan(env.DB, "a-plan"))?.committed_at).toBe("2026-05-18T12:34:56Z");
   });
 
+  it("markProposedPlanCommitted refuses a plan another commit holds a live claim on", async () => {
+    await env.DB.prepare(
+      "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, commit_claim, commit_claimed_at) VALUES ('a-plan', ?, '2026-05-18T12:00:00Z', '2099-01-01T00:00:00Z', NULL, 'a@org', 'other', ?)",
+    ).bind(JSON.stringify(body), new Date().toISOString()).run();
+    expect(await markProposedPlanCommitted(env.DB, "a-plan", "2026-05-18T12:34:56Z", "a@org")).toBe(false);
+    const row = await env.DB.prepare("SELECT committed_at, commit_claim FROM proposed_plans WHERE plan_hash = 'a-plan'")
+      .first<{ committed_at: string | null; commit_claim: string | null }>();
+    expect(row).toEqual({ committed_at: null, commit_claim: "other" });
+  });
+
   it("getLatestCommittedPlanForSubject ignores other tenants' committed plans", async () => {
     await env.DB.prepare(
       "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject) VALUES ('mine', ?, '2026-05-18T00:00:00Z', '2099-01-01T00:00:00Z', '2026-05-18T01:00:00Z', 'a@org')",
