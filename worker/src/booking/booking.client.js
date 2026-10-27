@@ -244,37 +244,38 @@ function parseIcsDate(value) {
 }
 
 /** Given a wall-time {y,mo,d,h,mi,s} in the named IANA timezone, return the
- *  corresponding UTC instant in ms. Uses the formatToParts idiom: compute the
- *  TZ offset at a guessed UTC instant, then iterate to refine. */
+ *  corresponding UTC instant in ms, with the server's rule
+ *  (planning/datetime.ts fromLocalNaiveCompatible): an ambiguous wall time
+ *  (fall-back overlap) takes the earlier instant, and one inside a DST gap
+ *  converts with the pre-transition offset, landing forward by the gap (a
+ *  skipped midnight becomes the day's first instant). */
 function wallTimeInTzToUtc(y, mo, d, h, mi, s, tz) {
-  // Initial guess: treat the wall time as UTC.
+  // The wall time read as if it were UTC.
   const guess = Date.UTC(y, mo - 1, d, h, mi, s);
-  // Measure how `tz` would label that instant. `tz` is already resolved by the
-  // caller, so the formatter cannot throw here.
+  // `tz` is already resolved by the caller, so the formatter cannot throw here.
   const fmt = tzFormatter(tz, "wall", WALL_PARTS_OPTS);
-  function tzParts(instant) {
+  function wallMs(instant) {
     const parts = {};
     for (const p of fmt.formatToParts(new Date(instant))) {
       if (p.type !== "literal") parts[p.type] = p.value;
     }
-    return {
-      y: parseInt(parts.year, 10),
-      mo: parseInt(parts.month, 10),
-      d: parseInt(parts.day, 10),
-      h: parseInt(parts.hour === "24" ? "0" : parts.hour, 10),
-      mi: parseInt(parts.minute, 10),
-      s: parseInt(parts.second, 10),
-    };
+    const h24 = parts.hour === "24" ? "0" : parts.hour;
+    return Date.UTC(
+      parseInt(parts.year, 10), parseInt(parts.month, 10) - 1, parseInt(parts.day, 10),
+      parseInt(h24, 10), parseInt(parts.minute, 10), parseInt(parts.second, 10),
+    );
   }
-  // Iterate twice — once is enough except for DST edge cases.
-  let instant = guess;
-  for (let i = 0; i < 2; i += 1) {
-    const tp = tzParts(instant);
-    const tpUtc = Date.UTC(tp.y, tp.mo - 1, tp.d, tp.h, tp.mi, tp.s);
-    const offset = tpUtc - instant; // how many ms UTC is behind tz
-    instant = guess - offset;
+  // Every real offset is within ±14 h, so 15 h either side of the guess is
+  // before / after any transition near it.
+  const HOURS_15 = 15 * 3600 * 1000;
+  const before = wallMs(guess - HOURS_15) - (guess - HOURS_15);
+  const after = wallMs(guess + HOURS_15) - (guess + HOURS_15);
+  // The larger offset gives the earlier instant; try it first.
+  for (const offset of before >= after ? [before, after] : [after, before]) {
+    const candidate = guess - offset;
+    if (wallMs(candidate) === guess) return candidate;
   }
-  return instant;
+  return guess - before;
 }
 
 /** Inverse of wallTimeInTzToUtc: given a UTC instant in ms, return the
@@ -971,6 +972,15 @@ export function resetTurnstile(w, widgetId) {
   }
 }
 
+/** The #tzline text for a `/slots` response that is not ok. A 429 is the
+ *  public read limiter (per IP and per page, counted per minute, Retry-After
+ *  60), which a wait fixes; anything else reads as availability being down. */
+export function slotsErrorMessage(status) {
+  return status === 429
+    ? "Too many requests right now. Please wait a minute and try again."
+    : "Availability is unavailable right now.";
+}
+
 /** Decide what the submit handler should do with a claim attempt's outcome.
  *
  *  `outcome` is either `{ status, body }` from a completed response, or
@@ -1153,7 +1163,7 @@ export function mount(root = document.getElementById("app")) {
         `/book/${encodeURIComponent(slug)}/slots?duration=${duration}&page=${page}`,
       );
       if (!res.ok) {
-        $("tzline").textContent = "Availability is unavailable right now.";
+        $("tzline").textContent = slotsErrorMessage(res.status);
         return null;
       }
       const body = await res.json();

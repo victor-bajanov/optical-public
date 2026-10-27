@@ -4,7 +4,7 @@ import { env } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
 import { v1 as app } from "../../src/v1";
 import { seedTwoUsers, type SeededUser } from "../fixtures/owners";
-import { insertProposedPlan, markProposedPlanCommitted } from "../../src/planning/proposed-plans";
+import { getCommittedPlanForWeek, insertProposedPlan, markProposedPlanCommitted } from "../../src/planning/proposed-plans";
 import { upsertUser, getUser } from "../../src/db/users";
 
 interface TzResponse {
@@ -67,6 +67,10 @@ async function seedPlans() {
   await insertProposedPlan(env.DB, "a-committed", planBody("a2"), "2026-05-18T12:00:00Z", "2099-01-01T00:00:00Z", a.subject);
   await markProposedPlanCommitted(env.DB, "a-committed", "2026-05-18T13:00:00Z", a.subject);
   await insertProposedPlan(env.DB, "b-pending", planBody("b1"), "2026-05-18T12:00:00Z", "2099-01-01T00:00:00Z", b.subject);
+}
+async function windowTzs(): Promise<Array<[string, string | null]>> {
+  const rs = await env.DB.prepare("SELECT plan_hash, window_tz FROM proposed_plans ORDER BY plan_hash").all<{ plan_hash: string; window_tz: string | null }>();
+  return rs.results.map((r) => [r.plan_hash, r.window_tz]);
 }
 async function planHashes(): Promise<string[]> {
   const rs = await env.DB.prepare("SELECT plan_hash FROM proposed_plans ORDER BY plan_hash").all<{ plan_hash: string }>();
@@ -190,13 +194,43 @@ describe("PATCH /v1/timezone", () => {
     expect(await planHashes()).toEqual(["a-committed", "a-pending", "b-pending"]);
   });
 
-  it("compares canonical forms: a legacy non-canonical home_tz equal to the new zone is no change", async () => {
+  it("compares canonical forms: re-spelling the same zone is a rename, and keeps every plan", async () => {
     await env.DB.prepare("UPDATE users SET home_tz = 'europe/london' WHERE subject = ?").bind(a.subject).run();
     await seedPlans();
     const body = (await (await patch(a, { tz: "Europe/London" })).json()) as TzResponse;
     expect(body).toEqual({ tz: "Europe/London", source: "user", superseded_plans: 0 });
     expect(await homeTz(a.subject)).toBe("Europe/London");
     expect(await planHashes()).toEqual(["a-committed", "a-pending", "b-pending"]);
+  });
+
+  it("an ICU legacy home_tz (Asia/Calcutta) re-saved as Asia/Kolkata re-spells window_tz in place", async () => {
+    await env.DB.prepare("UPDATE users SET home_tz = 'Asia/Calcutta' WHERE subject = ?").bind(a.subject).run();
+    await insertProposedPlan(env.DB, "a-pending", planBody("a1"), "2026-05-18T12:00:00Z", "2099-01-01T00:00:00Z", a.subject, "Asia/Calcutta");
+    await insertProposedPlan(env.DB, "a-committed", planBody("a2"), "2026-05-18T12:00:00Z", "2099-01-01T00:00:00Z", a.subject, "Asia/Calcutta");
+    await markProposedPlanCommitted(env.DB, "a-committed", "2026-05-18T13:00:00Z", a.subject);
+    const tbody = { title: "t", context: "deep", priority: 50, duration_minutes: 60, preferred_windows: [{ days: ["tue"], start: "14:00", end: "16:00", hard: true }] };
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, body, template_id, project_id, status, created_at, updated_at, owner_subject) VALUES (?,?,?,?,?,?,?,?)",
+    ).bind("t-legacy", JSON.stringify(tbody), null, null, "pending", "2026-05-01T00:00:00Z", "2026-05-01T00:00:00Z", a.subject).run();
+    const body = (await (await patch(a, { tz: "Asia/Kolkata" })).json()) as TzResponse;
+    expect(body).toEqual({ tz: "Asia/Kolkata", source: "user", superseded_plans: 0 });
+    expect(await homeTz(a.subject)).toBe("Asia/Kolkata");
+    expect(await windowTzs()).toEqual([["a-committed", "Asia/Kolkata"], ["a-pending", "Asia/Kolkata"]]);
+    // The week baselines still find the committed plan under the new spelling.
+    const committed = await getCommittedPlanForWeek(env.DB, a.subject, "2026-05-18T00:00:00Z", "Asia/Kolkata", DEFAULT_TZ);
+    expect(committed?.plan_hash).toBe("a-committed");
+    // Same zone, so the task's windows are not frozen in it.
+    const row = await env.DB.prepare("SELECT body FROM tasks WHERE id = 't-legacy'").first<{ body: string }>();
+    expect(JSON.parse(row!.body).preferred_windows).toEqual(tbody.preferred_windows);
+    await env.DB.prepare("DELETE FROM tasks").run();
+  });
+
+  it("a legacy SCHEDULER_TZ spelling renames NULL-window_tz plans to the explicit new spelling", async () => {
+    const e = { ...env, SCHEDULER_TZ: "Asia/Calcutta" } as typeof env;
+    await insertProposedPlan(env.DB, "a-pending", planBody("a1"), "2026-05-18T12:00:00Z", "2099-01-01T00:00:00Z", a.subject);
+    const res = await app.request("/timezone", { method: "PATCH", headers: a.headers, body: JSON.stringify({ tz: "Asia/Kolkata" }) }, e);
+    expect(await res.json()).toEqual({ tz: "Asia/Kolkata", source: "user", superseded_plans: 0 });
+    expect(await windowTzs()).toEqual([["a-pending", "Asia/Kolkata"]]);
   });
 
   it("treats an uncanonicalisable legacy home_tz as different, superseding pending plans", async () => {

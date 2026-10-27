@@ -2,6 +2,9 @@ import { describe, it, expect } from "vitest";
 import {
   toLocalNaive,
   fromLocalNaive,
+  fromLocalNaiveCompatible,
+  ceilToLocalGrid,
+  floorToLocalGrid,
   localWeekWindow,
   upcomingLocalWeekWindow,
   ceilToQuarter,
@@ -222,5 +225,70 @@ describe("upcomingLocalWeekWindow", () => {
 
   it("throws on an unparseable instant, like localWeekWindow", () => {
     expect(() => upcomingLocalWeekWindow("not-a-date", SYD)).toThrow(/invalid ISO datetime/);
+  });
+});
+
+describe("fromLocalNaiveCompatible", () => {
+  it("moves a time inside a midnight gap forward by the gap (Santiago 00:30 -> 01:30 local)", () => {
+    // 2026-09-06: Santiago jumps 00:00 -04 -> 01:00 -03. 00:30 converts with the
+    // pre-transition offset: 04:30Z, which reads 01:30 local.
+    expect(fromLocalNaiveCompatible("2026-09-06T00:30:00" as LocalNaive, "America/Santiago")).toBe(
+      "2026-09-06T04:30:00.000Z",
+    );
+    expect(toLocalNaive("2026-09-06T04:30:00.000Z", "America/Santiago")).toBe("2026-09-06T01:30:00");
+  });
+
+  it("maps a nonexistent local midnight to the day's first instant", () => {
+    expect(fromLocalNaiveCompatible("2026-09-06T00:00:00" as LocalNaive, "America/Santiago")).toBe(
+      "2026-09-06T04:00:00.000Z",
+    );
+  });
+
+  it("moves Sydney's spring-forward 02:30 to 03:30 AEDT", () => {
+    expect(fromLocalNaiveCompatible("2026-10-04T02:30:00" as LocalNaive, SYD)).toBe("2026-10-03T16:30:00.000Z");
+  });
+
+  it("leaves an existing time unchanged", () => {
+    expect(fromLocalNaiveCompatible("2026-06-21T10:00:00" as LocalNaive, SYD)).toBe(
+      fromLocalNaive("2026-06-21T10:00:00" as LocalNaive, SYD),
+    );
+  });
+
+  it("takes the earlier instant in a fall-back overlap, as fromLocalNaive does", () => {
+    // 2026-04-05 02:30 Sydney exists at +11 (15:30Z) and +10 (16:30Z).
+    expect(fromLocalNaiveCompatible("2026-04-05T02:30:00" as LocalNaive, SYD)).toBe("2026-04-04T15:30:00.000Z");
+  });
+
+  it("still rejects an unparseable local datetime", () => {
+    expect(() => fromLocalNaiveCompatible("nope" as LocalNaive, SYD)).toThrow(/invalid local datetime/);
+  });
+});
+
+describe("ceilToLocalGrid / floorToLocalGrid", () => {
+  const KTM = "Asia/Kathmandu"; // +5:45: the epoch half-hour grid is :15/:45 local
+  const ms = (iso: string) => Date.parse(iso);
+
+  it("ceils to the next local half-hour, not the next UTC half-hour", () => {
+    // 04:16Z = 10:01 NPT -> 10:30 NPT = 04:45Z.
+    expect(ceilToLocalGrid(ms("2026-08-03T04:16:00.000Z"), 30, KTM)).toBe(ms("2026-08-03T04:45:00.000Z"));
+    // Sub-second instants ceil too.
+    expect(ceilToLocalGrid(ms("2026-08-03T04:15:00.001Z"), 30, KTM)).toBe(ms("2026-08-03T04:45:00.000Z"));
+  });
+
+  it("leaves an instant already on the local grid unchanged", () => {
+    expect(ceilToLocalGrid(ms("2026-08-03T04:15:00.000Z"), 30, KTM)).toBe(ms("2026-08-03T04:15:00.000Z"));
+    expect(floorToLocalGrid(ms("2026-08-03T04:15:00.000Z"), 30, KTM)).toBe(ms("2026-08-03T04:15:00.000Z"));
+  });
+
+  it("floors to the local half-hour", () => {
+    // 04:20Z = 10:05 NPT -> 10:00 NPT = 04:15Z.
+    expect(floorToLocalGrid(ms("2026-08-03T04:20:00.000Z"), 30, KTM)).toBe(ms("2026-08-03T04:15:00.000Z"));
+  });
+
+  it("matches the epoch grid in a whole-hour zone, across a DST transition", () => {
+    // Sydney 2026-10-04: 02:00 AEST -> 03:00 AEDT at 16:00Z on 10-03.
+    for (const iso of ["2026-08-03T04:16:00.000Z", "2026-10-03T15:50:00.000Z", "2026-10-03T16:05:00.000Z"]) {
+      expect(ceilToLocalGrid(ms(iso), 30, SYD)).toBe(Math.ceil(ms(iso) / 1_800_000) * 1_800_000);
+    }
   });
 });

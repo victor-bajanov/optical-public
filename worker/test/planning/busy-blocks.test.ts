@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { deriveBusyBlocks } from "../../src/planning/busy-blocks";
+import { allDayFloatingDate, deriveBusyBlocks, eventBucketInstant } from "../../src/planning/busy-blocks";
 import { SCHEDULER_CHUNK_ID_KEY } from "../../src/providers/types";
 import type { CalendarEvent } from "../../src/providers/types";
 
@@ -61,5 +61,55 @@ describe("deriveBusyBlocks", () => {
     );
     expect(blocks).toHaveLength(1);
     expect(blocks[0]!.endUtc).toBe("2026-08-04T03:00:00.000Z");
+  });
+  it("blocks a floating all-day date as that LOCAL day west of UTC, not the day before", () => {
+    // UTC midnight of 2026-08-04 is the evening of 08-03 in Los Angeles; the
+    // provider string carries the floating date, so the block is local 08-04.
+    const blocks = deriveBusyBlocks(
+      [ev({ id: "leave", isAllDay: true, start: "2026-08-04T00:00:00Z", end: "2026-08-05T00:00:00Z" })],
+      { tz: "America/Los_Angeles", tentativeIsBusy: false, excludeEventIds: new Set() },
+    );
+    expect(blocks.map((b) => [b.startUtc, b.endUtc])).toEqual([
+      ["2026-08-04T07:00:00.000Z", "2026-08-05T07:00:00.000Z"],
+    ]);
+  });
+
+  it("keeps localising an all-day event whose start is a converted instant, not UTC midnight", () => {
+    // A provider that sent the all-day start already converted to an instant
+    // (2026-05-19 00:00 Sydney = 2026-05-18T14:00Z) still blocks local 05-19.
+    const blocks = deriveBusyBlocks(
+      [ev({ id: "leave", isAllDay: true, start: "2026-05-18T14:00:00.000Z", end: "2026-05-19T14:00:00.000Z" })],
+      { tz: TZ, tentativeIsBusy: false, excludeEventIds: new Set() },
+    );
+    expect(blocks.map((b) => [b.startUtc, b.endUtc])).toEqual([
+      ["2026-05-18T14:00:00.000Z", "2026-05-19T14:00:00.000Z"],
+    ]);
+  });
+});
+
+describe("allDayFloatingDate", () => {
+  it("reads the floating date off a UTC-midnight string, with or without millis", () => {
+    expect(allDayFloatingDate("2026-08-04T00:00:00Z")).toBe("2026-08-04");
+    expect(allDayFloatingDate("2026-08-04T00:00:00.000Z")).toBe("2026-08-04");
+  });
+
+  it("returns null for anything that is not UTC midnight", () => {
+    expect(allDayFloatingDate("2026-05-18T14:00:00.000Z")).toBeNull();
+    expect(allDayFloatingDate("2026-08-04T00:00:00+10:00")).toBeNull();
+    expect(allDayFloatingDate("2026-08-04")).toBeNull();
+  });
+});
+
+describe("eventBucketInstant", () => {
+  it("buckets a floating all-day event at local noon of its date", () => {
+    const e = ev({ id: "a", isAllDay: true, start: "2026-07-13T00:00:00Z", end: "2026-07-14T00:00:00Z" });
+    expect(eventBucketInstant(e, "America/Los_Angeles")).toBe("2026-07-13T19:00:00.000Z");
+    expect(eventBucketInstant(e, TZ)).toBe("2026-07-13T02:00:00.000Z");
+  });
+
+  it("leaves a timed event, and an all-day event with a converted start, at its start", () => {
+    expect(eventBucketInstant(ev({ id: "t" }), TZ)).toBe("2026-08-04T00:00:00Z");
+    const conv = ev({ id: "c", isAllDay: true, start: "2026-05-18T14:00:00.000Z", end: "2026-05-19T14:00:00.000Z" });
+    expect(eventBucketInstant(conv, TZ)).toBe("2026-05-18T14:00:00.000Z");
   });
 });

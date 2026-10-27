@@ -5,6 +5,7 @@ import { Hono } from "hono";
 // reasoning route.test.ts and db.test.ts already document for 0032/0033.
 import guestRateLimitSql from "../../migrations/0033_poll_guest_rate_limit.sql?raw";
 import { mountPollRoutes } from "../../src/polls/route";
+import { renderPollStatusPage } from "../../src/web/poll-status-page";
 import { MockCalendarProvider } from "../../src/providers/mock-calendar-provider";
 import { saveBookingPage } from "../../src/db/booking-page";
 import {
@@ -132,6 +133,15 @@ beforeEach(async () => {
   });
   await seedBearer("fake", OWNER);
 });
+
+
+/** A saved cell as a real save stores it: a half-hour start on the
+ *  organiser's grid (Sydney, the test env's SCHEDULER_TZ, sits on UTC :00/:30),
+ *  `days` days from now. */
+function halfHourCell(days: number): string {
+  const ms = Date.now() + days * 86_400_000;
+  return new Date(Math.floor(ms / 1_800_000) * 1_800_000).toISOString();
+}
 
 describe("GET /poll/:id/status feature flag", () => {
   it("404s when MEETING_POLL_ENABLED is not exactly 'true'", async () => {
@@ -329,7 +339,7 @@ describe("GET /poll/:id/status content", () => {
     await env.DB.prepare(
       "INSERT INTO poll_responses (invitee_id, cell_start_utc, state) VALUES (?, ?, ?)",
     )
-      .bind(invitee.id, new Date(Date.now() + 2 * 86_400_000).toISOString(), "free")
+      .bind(invitee.id, halfHourCell(2), "free")
       .run();
     const app = appWith();
     const res = await app.request(`/poll/${poll.id}/status`, { headers: AUTH }, ON);
@@ -343,7 +353,7 @@ describe("GET /poll/:id/status aggregate table — availability icons (Card A)",
   it("renders a free cell as an icon span with class, title, and aria-label — never the literal word 'Free' (assertions scoped to the table itself, not satisfiable by the legend alone)", async () => {
     const poll = await seedPoll();
     const invitee = await seedInvitee(poll, "free@x.com", { name: "Freda" });
-    const cell = new Date(Date.now() + 2 * 86_400_000).toISOString();
+    const cell = halfHourCell(2);
     await env.DB.prepare(
       "INSERT INTO poll_responses (invitee_id, cell_start_utc, state) VALUES (?, ?, ?)",
     )
@@ -371,7 +381,7 @@ describe("GET /poll/:id/status aggregate table — availability icons (Card A)",
   it("renders an if_needed cell with a distinct icon/class from free, pinned inside the aggregate table itself", async () => {
     const poll = await seedPoll();
     const invitee = await seedInvitee(poll, "maybe@x.com", { name: "Maybe" });
-    const cell = new Date(Date.now() + 2 * 86_400_000).toISOString();
+    const cell = halfHourCell(2);
     await env.DB.prepare(
       "INSERT INTO poll_responses (invitee_id, cell_start_utc, state) VALUES (?, ?, ?)",
     )
@@ -390,8 +400,8 @@ describe("GET /poll/:id/status aggregate table — availability icons (Card A)",
   it("leaves an unpainted cell empty (no icon) while a sibling cell for the same invitee is painted", async () => {
     const poll = await seedPoll();
     const invitee = await seedInvitee(poll, "partial@x.com", { name: "Partial" });
-    const paintedCell = new Date(Date.now() + 2 * 86_400_000).toISOString();
-    const otherInviteeOnlyCell = new Date(Date.now() + 3 * 86_400_000).toISOString();
+    const paintedCell = halfHourCell(2);
+    const otherInviteeOnlyCell = halfHourCell(3);
     const other = await seedInvitee(poll, "other@x.com", { name: "Other" });
     await env.DB.prepare(
       "INSERT INTO poll_responses (invitee_id, cell_start_utc, state) VALUES (?, ?, ?)",
@@ -418,7 +428,7 @@ describe("GET /poll/:id/status aggregate table — availability icons (Card A)",
   it("shows a legend beneath the aggregate table explaining the icons", async () => {
     const poll = await seedPoll();
     const invitee = await seedInvitee(poll, "a@x.com", { name: "Ann" });
-    const cell = new Date(Date.now() + 2 * 86_400_000).toISOString();
+    const cell = halfHourCell(2);
     await env.DB.prepare(
       "INSERT INTO poll_responses (invitee_id, cell_start_utc, state) VALUES (?, ?, ?)",
     )
@@ -507,7 +517,7 @@ describe("GET /poll/:id/status aggregate table — availability icons (Card A)",
   it("table icon spans carry role=\"img\" so their aria-label is actually honoured", async () => {
     const poll = await seedPoll();
     const invitee = await seedInvitee(poll, "a@x.com", { name: "Ann" });
-    const cell = new Date(Date.now() + 2 * 86_400_000).toISOString();
+    const cell = halfHourCell(2);
     await env.DB.prepare(
       "INSERT INTO poll_responses (invitee_id, cell_start_utc, state) VALUES (?, ?, ?)",
     )
@@ -524,7 +534,7 @@ describe("GET /poll/:id/status aggregate table — availability icons (Card A)",
   it("legend icons are decorative (aria-hidden, no aria-label) so they don't double-announce alongside the table's labelled icons", async () => {
     const poll = await seedPoll();
     const invitee = await seedInvitee(poll, "a@x.com", { name: "Ann" });
-    const cell = new Date(Date.now() + 2 * 86_400_000).toISOString();
+    const cell = halfHourCell(2);
     await env.DB.prepare(
       "INSERT INTO poll_responses (invitee_id, cell_start_utc, state) VALUES (?, ?, ?)",
     )
@@ -538,5 +548,30 @@ describe("GET /poll/:id/status aggregate table — availability icons (Card A)",
     const ariaHiddenCount = (legendHtml.match(/aria-hidden="true"/g) ?? []).length;
     expect(ariaHiddenCount).toBe(2); // one free icon, one if-needed icon
     expect(legendHtml).not.toContain("aria-label");
+  });
+});
+
+describe("renderPollStatusPage realigned note", () => {
+  const base = {
+    poll: {
+      id: "p_1", title: "Sync", status: "open" as const, durationMin: 30, rangeStart: "2026-07-14",
+      rangeEnd: "2026-07-15", deadlineUtc: "2026-07-20T00:00:00.000Z", bookedSlotUtc: null,
+    },
+    ownerTz: "Asia/Kathmandu",
+    roster: [],
+    cells: [],
+    aggregate: [],
+    candidates: [],
+  };
+
+  it("names the invitees whose saved cells moved grid", () => {
+    const html = renderPollStatusPage({ ...base, realigned: ["Ann"] });
+    expect(html).toContain(
+      "Your timezone changed after Ann responded, so the grid moved. Their saved times carry over only where they fully cover a new slot. Nudge them to check.",
+    );
+  });
+
+  it("says nothing when no response moved", () => {
+    expect(renderPollStatusPage({ ...base, realigned: [] })).not.toContain("Your timezone changed");
   });
 });

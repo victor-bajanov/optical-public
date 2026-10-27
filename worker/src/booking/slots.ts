@@ -1,6 +1,7 @@
 import type { BusinessHours } from "../planning/solver-contract";
 import { subtract, intersect, mergeIntervals, type Interval } from "../planning/intervals";
 import { businessHoursIntervals } from "../planning/business-hours-intervals";
+import { ceilToLocalGrid } from "../planning/datetime";
 
 export class DurationError extends Error {}
 export class HoursError extends Error {}
@@ -183,11 +184,12 @@ export function computeBookableSlots(p: BookableSlotParams): string[] {
   const durMs = p.durationMinutes * 60_000;
   const out: string[] = [];
   for (const iv of free) {
-    // First grid point at or after the interval start.
-    let t = Math.ceil(iv.s / stepMs) * stepMs;
+    // First grid point at or after the interval start, on the owner's LOCAL
+    // wall-clock grid (10:00, 10:30 …), not the UTC epoch's.
+    let t = ceilToLocalGrid(iv.s, p.slotStepMinutes, p.tz);
     while (t + durMs <= iv.e) {
       out.push(new Date(t).toISOString());
-      t += stepMs;
+      t = ceilToLocalGrid(t + stepMs, p.slotStepMinutes, p.tz);
     }
   }
   return out;

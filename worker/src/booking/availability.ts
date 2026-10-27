@@ -1,5 +1,5 @@
 import type { Env } from "../env";
-import type { CalendarProvider } from "../providers/calendar-provider";
+import type { EventsReader } from "../public-read/events-cache";
 import type { CalendarEvent } from "../providers/types";
 import { deriveBusyBlocks } from "../planning/busy-blocks";
 import { taskIdOfEvent } from "../calendar-feed/build-busy-ics";
@@ -68,12 +68,16 @@ function pinnedChunkBlocks(events: CalendarEvent[], pinnedTaskIds: Set<string>) 
  *  an owner offer a year without the public endpoint reading a year of
  *  calendar per request: a booker who wants day 300 pays for the page holding
  *  it, and only when they ask. Page 0 with no reach set is exactly the single
- *  window this served before paging existed. */
+ *  window this served before paging existed.
+ *
+ *  `cal` decides where that read comes from: the public slots GET passes the
+ *  short-TTL cached reader (public-read/events-cache.ts), the claim passes
+ *  the live provider. Everything read from D1 here is always fresh. */
 export async function computeAvailability(
   db: D1Database,
   env: Env,
   owner: string,
-  cal: CalendarProvider,
+  cal: EventsReader,
   durationMinutes: number,
   now: Date,
   page = 0,

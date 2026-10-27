@@ -7,7 +7,14 @@ import { legacyStampPatch } from "../providers/deployment-scope";
 import { SCHEDULER_HORIZON_MS, deletableChunks } from "./scheduler-chunks";
 import { requireOwner } from "../middleware/owner-gate";
 import { defaultCalendarProvider } from "../index-providers";
-import { getProposedPlan, markProposedPlanCommittedStmt, planProducedInTz, type ProposedPlanRow } from "./proposed-plans";
+import {
+  claimPlanCommit,
+  getProposedPlan,
+  markProposedPlanCommittedStmt,
+  planProducedInTz,
+  releasePlanCommitClaim,
+  type ProposedPlanRow,
+} from "./proposed-plans";
 import { syncBookingTime } from "../db/bookings";
 import { D } from "../schema/descriptions";
 import { getHomeTz } from "../db/users";
@@ -26,6 +33,19 @@ const CommitResponseSchema = z.union([
     already_committed: z.literal(true).describe(D.response.already_committed),
   }),
 ]);
+
+const CommitInProgressSchema = z.object({
+  error: z.literal("commit_in_progress").describe(
+    "Another commit of this plan (a double-click on the accept page, or a commit racing the user's emailed accept link) is applying it right now, and normally this request wrote nothing. The exception: a commit that outlived its own 120-second claim, or whose plan was replaced mid-commit, may already have written calendar events and task updates before answering this; a retry reconciles them. Retry after a short wait: it then answers 200 already_committed, or commits if the other attempt failed.",
+  ),
+});
+
+/** The commit_in_progress sentence of commit's and acceptPlan's 409. */
+export const COMMIT_IN_PROGRESS_409 =
+  "commit_in_progress: another commit of this plan holds its 120-second commit claim and is writing the calendar now. Normally this request wrote nothing; a commit that outlived its own claim, or whose plan was replaced mid-commit, may already have written calendar events and task updates, which a retry reconciles. Retry shortly (200 already_committed once it lands).";
+
+const COMMIT_CLAIM_SENTENCE =
+  "Two concurrent commits of one plan (a double-click on the accept page, or this call racing the user's emailed accept link) never both apply it: the first claims the plan for up to 120 seconds before reading the calendar, and the other answers 409 commit_in_progress, normally having written nothing (a commit that outlived its own claim, or whose plan was replaced mid-commit, may already have written calendar events and task updates; a retry reconciles them); once the first finishes, a retry answers 200 already_committed (or commits, if the first failed).";
 
 interface ScheduleEntry {
   task_id: string;
@@ -98,8 +118,8 @@ export async function checkPlanCommittable(
   if (!plan) return { ok: false, result: { status: 404, body: { error: "not_found" } } };
   // OS1: owner-scope BEFORE any calendar/DB side effect. A foreign or legacy
   // NULL-subject plan_hash must mutate nothing and is indistinguishable from
-  // "not found" (no existence leak). markProposedPlanCommitted's owner predicate
-  // in commitPlan stays as defense-in-depth.
+  // "not found" (no existence leak). markProposedPlanCommittedStmt's owner +
+  // claim predicate in commitPlan stays as defense-in-depth.
   if (plan.subject !== ownerSubject) return { ok: false, result: { status: 404, body: { error: "not_found" } } };
   if (plan.committed_at) {
     return { ok: false, result: { status: 200, body: { plan_hash: planHash, already_committed: true } } };
@@ -122,8 +142,64 @@ export async function commitPlan(
 ): Promise<CommitResult> {
   const check = await checkPlanCommittable(db, planHash, ownerSubject, opts);
   if (!check.ok) return check.result;
-  const plan = check.plan;
+  // T3: claim the plan before the first calendar read. Of two concurrent
+  // commits (a double-click, an agent racing the user's emailed link) only the
+  // claimer writes the calendar; the other is answered without touching it.
+  const claim = await claimPlanCommit(db, planHash, ownerSubject);
+  if (!claim) return claimRefusal(db, planHash, ownerSubject);
+  let marked = false;
+  try {
+    const result = await applyClaimedPlan(db, cal, check.plan, ownerSubject, opts, claim);
+    if (!result) return await claimRefusal(db, planHash, ownerSubject);
+    marked = true;
+    return result;
+  } finally {
+    // A failed or unmarked commit drops its claim so a retry needn't wait out
+    // the lease (X3 convergence). Never masks the commit's own error.
+    if (!marked) {
+      await releasePlanCommitClaim(db, planHash, claim).catch((err) =>
+        console.warn("commit_claim_release_failed", { error: String(err) }),
+      );
+    }
+  }
+}
 
+/** Hand an in-flight commit to waitUntil, so a client disconnect (which can
+ *  cancel the request) doesn't stop it mid-calendar-write with its claim held:
+ *  it runs on for up to 30 s after the disconnect. Past that it is cancelled
+ *  like a killed worker and the claim lapses after its 120 s lease. The
+ *  registered copy swallows the error; the caller still awaits (and sees) it. */
+export function keepCommitAlive(c: { executionCtx: ExecutionContext }, commit: Promise<CommitResult>): Promise<CommitResult> {
+  try {
+    c.executionCtx.waitUntil(commit.catch(() => undefined));
+  } catch {
+    // No ExecutionContext (`app.request()` without one in tests), as booking/route.ts.
+  }
+  return commit;
+}
+
+/** Why a commit that couldn't claim (or couldn't mark) the plan stops:
+ *  re-read it. Gone or foreign 404 (as before the claim existed), committed
+ *  meanwhile 200 already_committed, else another commit holds it: 409. */
+async function claimRefusal(db: D1Database, planHash: string, ownerSubject: string): Promise<CommitResult> {
+  const now = await getProposedPlan(db, planHash);
+  if (!now || now.subject !== ownerSubject) return { status: 404, body: { error: "not_found" } };
+  if (now.committed_at) return { status: 200, body: { plan_hash: planHash, already_committed: true } };
+  return { status: 409, body: { error: "commit_in_progress" } };
+}
+
+/** The calendar reconcile and the D1 batch of a plan this attempt holds the
+ *  claim on. null when the final mark updated nothing (the plan vanished, or
+ *  the claim was taken over after its lease expired). */
+async function applyClaimedPlan(
+  db: D1Database,
+  cal: CalendarProvider,
+  plan: ProposedPlanRow,
+  ownerSubject: string,
+  opts: CommitOptions,
+  claim: string,
+): Promise<CommitResult | null> {
+  const planHash = plan.plan_hash;
   const schedule = plan.body.schedule as ScheduleEntry[];
 
   const windowStart = (plan.body.window as { start: string; end: string }).start;
@@ -351,12 +427,13 @@ export async function commitPlan(
 
   // The commit-mark joins the SAME batch (LAST) so committed_at lands atomically with
   // the task updates: a mid-sequence failure leaves no half-committed rows and the
-  // plan uncommitted, so a re-click converges (X3). Owner-scoped; a foreign or
-  // already-gone plan updates 0 rows → 404 (same as a missing plan).
-  writes.push(markProposedPlanCommittedStmt(db, planHash, now, ownerSubject));
+  // plan uncommitted, so a re-click converges (X3). Owner-scoped and claim-gated:
+  // a gone plan, or one whose claim was taken over, updates 0 rows (commitPlan
+  // re-reads it to answer).
+  writes.push(markProposedPlanCommittedStmt(db, planHash, now, ownerSubject, claim));
   const results = await db.batch(writes);
   const markChanges = results[results.length - 1]!.meta.changes;
-  if (markChanges === 0) return { status: 404, body: { error: "not_found" } };
+  if (markChanges === 0) return null;
 
   const committedTaskCount = scheduleTaskIds.filter((tid) => {
     const info = taskInfo.get(tid);
@@ -373,7 +450,7 @@ export function mountCommitRoute(
     path: "/commit",
     operationId: "commit",
     summary: "Apply a proposed plan to the user's calendar, notifying attendees of any moved meeting.",
-    description: "Apply a proposed plan (by plan_hash) to the user's calendar (Google or Outlook). For an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) nothing is applied: after the same 404/410/already-committed checks below, the user is emailed the plan's accept email (the diff with an Accept button) and the call answers 202 awaiting_confirmation (action_id = plan_hash); the plan is committed only if the user accepts it on that email's page, which re-checks it then (a plan superseded or produced under an older timezone by then commits nothing). A gated commit of a plan with no reviewable changes (an empty diff, or resolved by a non-gated client) is 409 plan_not_reviewable; if the email can't be sent it is 503 confirmation_unavailable. Every other client's commit is applied at once, with no confirmation step: any pending plan_hash the caller owns is applied, including one emailed to the user for review that they have not clicked. It creates, moves and deletes the user's own task-chunk events (no attendees). When owned movable meetings are enabled, it also moves each owned meeting the plan relocates to its new time and NOTIFIES THAT MEETING'S ATTENDEES (Google sendUpdates=all; Microsoft Graph always notifies), and the move typically resets their RSVPs; a moved meeting that is a booking-page booking also has its booking time updated. Irreversible from the API's perspective: attendee notifications cannot be recalled. Tasks listed as dropped in the plan are reset to status 'pending' with their placement stamp cleared, so they re-enter the backlog for future resolves. Schedule entries whose task is no longer live at commit time (deleted, done, or cancelled between resolve and commit) are skipped: no event is created and any existing event for that chunk is removed, releasing its slot. The 'committed' count reflects only the live tasks committed. A pending plan produced under a timezone other than the caller's current effective timezone (a resolve that raced a timezone change) is answered 404 not_found, exactly as if it had vanished; re-resolve to get a plan for the new timezone.",
+    description: "Apply a proposed plan (by plan_hash) to the user's calendar (Google or Outlook). For an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) nothing is applied: after the same 404/410/already-committed checks below, the user is emailed the plan's accept email (the diff with an Accept button) and the call answers 202 awaiting_confirmation (action_id = plan_hash); the plan is committed only if the user accepts it on that email's page, which re-checks it then (a plan superseded or produced under an older timezone by then commits nothing). A gated commit of a plan with no reviewable changes (an empty diff, or resolved by a non-gated client) is 409 plan_not_reviewable; if the email can't be sent it is 503 confirmation_unavailable. Every other client's commit is applied at once, with no confirmation step: any pending plan_hash the caller owns is applied, including one emailed to the user for review that they have not clicked. It creates, moves and deletes the user's own task-chunk events (no attendees). When owned movable meetings are enabled, it also moves each owned meeting the plan relocates to its new time and NOTIFIES THAT MEETING'S ATTENDEES (Google sendUpdates=all; Microsoft Graph always notifies), and the move typically resets their RSVPs; a moved meeting that is a booking-page booking also has its booking time updated. Irreversible from the API's perspective: attendee notifications cannot be recalled. Tasks listed as dropped in the plan are reset to status 'pending' with their placement stamp cleared, so they re-enter the backlog for future resolves. Schedule entries whose task is no longer live at commit time (deleted, done, or cancelled between resolve and commit) are skipped: no event is created and any existing event for that chunk is removed, releasing its slot. The 'committed' count reflects only the live tasks committed. A pending plan produced under a timezone other than the caller's current effective timezone (a resolve that raced a timezone change) is answered 404 not_found, exactly as if it had vanished; re-resolve to get a plan for the new timezone. " + COMMIT_CLAIM_SENTENCE,
     security: [{ BearerAuth: [] }],
     request: {
       body: { content: { "application/json": { schema: CommitBodySchema } }, required: true },
@@ -399,7 +476,14 @@ export function mountCommitRoute(
         content: { "application/json": { schema: z.object({ error: z.string() }) } },
         description: "Token carries no subject (no_subject)",
       },
-      409: planNotReviewableResponse,
+      409: {
+        content: {
+          "application/json": {
+            schema: z.union([planNotReviewableResponse.content["application/json"].schema, CommitInProgressSchema]),
+          },
+        },
+        description: `${COMMIT_IN_PROGRESS_409} Or ${planNotReviewableResponse.description}`,
+      },
       ...planConfirmResponses,
     },
   });
@@ -419,10 +503,10 @@ export function mountCommitRoute(
       return deferPlanCommit(c, check.plan, owner, "commit") as any;
     }
     const cal = c.var.calendarProvider ?? await defaultCalendarProvider(c.env, owner);
-    const result = await commitPlan(c.env.DB, cal, parsed.plan_hash, owner, {
+    const result = await keepCommitAlive(c, commitPlan(c.env.DB, cal, parsed.plan_hash, owner, {
       createColorId: c.env.CREATE_COLOR_ID,
       currentTz,
-    });
-    return c.json(result.body as Record<string, unknown>, result.status as 200 | 400 | 404 | 410);
+    }));
+    return c.json(result.body as Record<string, unknown>, result.status as 200 | 400 | 404 | 409 | 410);
   });
 }

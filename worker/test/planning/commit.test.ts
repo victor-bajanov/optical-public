@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { Hono } from "hono";
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -104,6 +104,60 @@ describe("POST /v1/commit", () => {
     expect(created).toHaveLength(1);
     expect(created[0]!.summary).toBe("Deep work");
     expect(created[0]!.extendedProperties.private?.scheduler_chunk_id).toBe("task-deep-1#0");
+  });
+
+  // T3/F3: a client disconnect can cancel the request mid-commit, and then
+  // commitPlan's finally never releases its claim. The route hands the commit
+  // to waitUntil, so it runs on (up to 30 s) after a disconnect. workerd in
+  // tests doesn't cancel on disconnect, so these pin the registration.
+  describe("the commit runs under waitUntil", () => {
+    function fakeCtx() {
+      const tasks: Promise<unknown>[] = [];
+      const ctx = { waitUntil: (p: Promise<unknown>) => { tasks.push(p); }, passThroughOnException() {}, props: {} };
+      return { tasks, ctx: ctx as unknown as ExecutionContext };
+    }
+    const commitReq = {
+      method: "POST",
+      headers: { "content-type": "application/json", Authorization: "Bearer fake" },
+      body: JSON.stringify({ plan_hash: "h1" }),
+    };
+
+    it("registers the in-flight commit before it writes the calendar", async () => {
+      let open!: () => void;
+      const gate = new Promise<void>((r) => { open = r; });
+      class Gated extends MockCalendarProvider {
+        override async fetchEventsInWindow(start: string, end: string, opts?: { syncToken?: boolean }) {
+          await gate;
+          return super.fetchEventsInWindow(start, end, opts);
+        }
+      }
+      const cal = new Gated();
+      const { tasks, ctx } = fakeCtx();
+      const resP = Promise.resolve(makeApp(cal).request("/v1/commit", commitReq, env, ctx));
+      try {
+        await vi.waitFor(() => expect(tasks.length).toBeGreaterThan(0));
+        expect(cal.getCreated()).toHaveLength(0);
+      } finally {
+        open();
+        await resP.catch(() => undefined); // drain, so a red run doesn't outlive the test
+      }
+      await Promise.all(tasks);
+      expect((await resP).status).toBe(200);
+      expect(cal.getCreated()).toHaveLength(1);
+    });
+
+    it("a failing commit still answers its error, and the registered task resolves", async () => {
+      class Failing extends MockCalendarProvider {
+        override async createEvent(): Promise<{ eventId: string }> {
+          throw new Error("google 500");
+        }
+      }
+      const { tasks, ctx } = fakeCtx();
+      const res = await makeApp(new Failing()).request("/v1/commit", commitReq, env, ctx);
+      expect(res.status).toBe(500);
+      expect(tasks).toHaveLength(1);
+      expect((await Promise.allSettled(tasks)).map((r) => r.status)).toEqual(["fulfilled"]);
+    });
   });
 
   it("paints a freshly created chunk the scheduler create colour", async () => {

@@ -11,11 +11,13 @@
 // seeing different busy time for the same calendar.
 import { describe, it, expect } from "vitest";
 import {
+  toUtcMs as bookingToUtcMs,
   parseIcsBusy as bookingParseIcsBusy,
   warnings as bookingWarnings,
   stats as bookingStats,
 } from "../../src/booking/booking.client.js";
 import {
+  toUtcMs as pollToUtcMs,
   parseIcsBusy as pollParseIcsBusy,
   warnings as pollWarnings,
   stats as pollStats,
@@ -139,5 +141,30 @@ describe("poll.client.js parseIcsBusy parity with booking.client.js", () => {
     const pollResult = pollParseIcsBusy(ics, W);
     const wrong = [{ s: pollResult[0]!.s, e: pollResult[0]!.e + 1 }];
     expect(pollResult).not.toEqual(wrong);
+  });
+});
+
+// Both copies resolve a wall time with the server's rule (planning/datetime.ts
+// fromLocalNaiveCompatible): a time inside a DST gap moves forward by the gap,
+// an ambiguous one takes the earlier instant.
+describe.each([
+  ["booking", bookingToUtcMs],
+  ["poll", pollToUtcMs],
+])("%s client toUtcMs across DST", (_name, toUtcMs) => {
+  it("an all-day date whose midnight is skipped starts at the day's first instant (Santiago 2026-09-06)", () => {
+    expect(toUtcMs("20260906", null, "America/Santiago")).toEqual({ ms: Date.parse("2026-09-06T04:00:00Z"), allDay: true });
+  });
+
+  it("a TZID time inside the gap moves forward by the gap", () => {
+    expect(toUtcMs("20260906T003000", "America/Santiago", "UTC").ms).toBe(Date.parse("2026-09-06T04:30:00Z"));
+    expect(toUtcMs("20261004T023000", "Australia/Sydney", "UTC").ms).toBe(Date.parse("2026-10-03T16:30:00Z"));
+  });
+
+  it("a TZID time in the fall-back overlap takes the earlier instant", () => {
+    expect(toUtcMs("20260405T023000", "Australia/Sydney", "UTC").ms).toBe(Date.parse("2026-04-04T15:30:00Z"));
+  });
+
+  it("an ordinary time is exact", () => {
+    expect(toUtcMs("20260803T100000", "Australia/Sydney", "UTC").ms).toBe(Date.parse("2026-08-03T00:00:00Z"));
   });
 });

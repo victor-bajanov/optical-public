@@ -80,12 +80,11 @@ describe("candidateStarts — DST-gap range boundaries", () => {
   const GAP_DATE = "2026-09-06";
   const DAY_BEFORE_GAP = "2026-09-05";
   const SANTIAGO = "America/Santiago";
-  // businessHoursIntervals (planning/business-hours-intervals.ts, not this
-  // card's fence) independently converts bh.start/bh.end via fromLocalNaive
-  // for every local day in its window, so hours starting exactly at local
-  // midnight hit the SAME gap for an unrelated reason. Keep this test's hours
-  // clear of 00:00-01:00 so it isolates candidateStarts' own range-boundary
-  // fix instead of tripping that separate, out-of-fence call site.
+  // businessHoursIntervals independently converts bh.start/bh.end for every
+  // local day in its window, so hours starting exactly at local midnight
+  // meet the same gap through a separate call site (covered by
+  // test/tz-matrix). Keep this test's hours clear of 00:00-01:00 so it
+  // isolates candidateStarts' own range-boundary handling.
   const GAP_SAFE_HOURS = { days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], start: "06:00", end: "22:00" } as any;
 
   function localDate(iso: string, tz: string): string {
@@ -133,23 +132,31 @@ describe("candidateStarts — DST-gap range boundaries", () => {
 });
 
 describe("paintableCells", () => {
+  it("floors cells to the LOCAL half-hour grid (Kathmandu +5:45)", () => {
+    // 10:00 NPT = 04:15Z; a 60-min candidate covers the local 10:00 and 10:30 cells.
+    expect(paintableCells(["2026-08-05T04:15:00.000Z"], 60, "Asia/Kathmandu")).toEqual([
+      "2026-08-05T04:15:00.000Z",
+      "2026-08-05T04:45:00.000Z",
+    ]);
+  });
+
   it("returns empty for no candidates", () => {
-    expect(paintableCells([], 60)).toEqual([]);
+    expect(paintableCells([], 60, "UTC")).toEqual([]);
   });
 
   it("marks both cells for a 60-minute candidate with no overhang", () => {
-    const cells = paintableCells(["2026-08-05T00:00:00.000Z"], 60);
+    const cells = paintableCells(["2026-08-05T00:00:00.000Z"], 60, "UTC");
     expect(cells).toEqual(["2026-08-05T00:00:00.000Z", "2026-08-05T00:30:00.000Z"]);
   });
 
   it("marks a partially-covered tail cell for a 45-minute candidate", () => {
     // [00:00, 00:45) fully covers the 00:00-00:30 cell and half-covers 00:30-01:00.
-    const cells = paintableCells(["2026-08-05T00:00:00.000Z"], 45);
+    const cells = paintableCells(["2026-08-05T00:00:00.000Z"], 45, "UTC");
     expect(cells).toEqual(["2026-08-05T00:00:00.000Z", "2026-08-05T00:30:00.000Z"]);
   });
 
   it("marks three cells for a 90-minute candidate", () => {
-    const cells = paintableCells(["2026-08-05T00:00:00.000Z"], 90);
+    const cells = paintableCells(["2026-08-05T00:00:00.000Z"], 90, "UTC");
     expect(cells).toEqual([
       "2026-08-05T00:00:00.000Z",
       "2026-08-05T00:30:00.000Z",
@@ -161,6 +168,7 @@ describe("paintableCells", () => {
     const cells = paintableCells(
       ["2026-08-05T01:00:00.000Z", "2026-08-05T00:00:00.000Z", "2026-08-05T00:30:00.000Z"],
       45,
+      "UTC",
     );
     expect(cells).toEqual([
       "2026-08-05T00:00:00.000Z",

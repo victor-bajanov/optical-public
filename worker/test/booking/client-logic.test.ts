@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  slotsErrorMessage,
   parseIcsBusy,
   filterSlots,
   dotCount,
@@ -922,5 +923,18 @@ describe("monthLabel", () => {
     expect(monthLabel("2026-09", "2026-09", "en-US")).toBe("Sep");
     expect(monthLabel("2026-12", "2026-09", "en-US")).toBe("Dec");
     expect(monthLabel("2027-01", "2026-09", "en-US")).toBe("Jan 2027");
+  });
+});
+
+describe("slotsErrorMessage", () => {
+  it("a 429 from the public read limiter asks the booker to wait, not that availability is down", () => {
+    expect(slotsErrorMessage(429)).toMatch(/wait a minute/i);
+    expect(slotsErrorMessage(429)).not.toMatch(/unavailable/i);
+  });
+
+  it("anything else keeps the generic message", () => {
+    for (const status of [400, 404, 500, 502]) {
+      expect(slotsErrorMessage(status)).toBe("Availability is unavailable right now.");
+    }
   });
 });

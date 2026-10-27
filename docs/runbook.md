@@ -674,6 +674,50 @@ same week, even a newer one. See "Pending plans are per-week (week-scoped
 supersede)" below for what happens when a second replan supersedes that hash
 before the user clicks Accept.
 
+**One commit at a time per plan (commit claim, migration 0047).** Every commit
+of a plan, through `POST /v1/commit` or `POST /v1/plans/{hash}/accept`
+(capability or bearer), first claims it: `commitPlan`
+(`worker/src/planning/commit.ts`) writes a random claim id and the time into
+`proposed_plans.commit_claim` / `commit_claimed_at`, only on an uncommitted plan
+with no live claim, and does so before its first calendar read. Of two
+concurrent commits (a double-click on the accept page, or an agent's `commit`
+racing the user's emailed link), only the claimer reads and writes the
+calendar. The other answers **409 `commit_in_progress`** having written
+nothing: JSON for bearer calls and `Accept: application/json`, and a 409
+"Already being applied" notice page for the browser form. The exception is a
+commit that outlived its own claim (below) or whose plan was replaced
+mid-commit: it may already have written calendar events and task updates
+before answering 409, and a retry reconciles them. The commit-mark requires the
+caller's own claim (`committed_at IS NULL AND commit_claim = ?`) and clears
+both columns in the same batch as the task updates. A commit that throws (a
+calendar API error mid-reconcile) or marks nothing releases its claim, so an
+immediate retry converges as before (X3). Once the first commit lands, a retry
+gets the usual idempotent 200.
+
+The claim is a lease, `COMMIT_CLAIM_LEASE_MS` = 120 s
+(`worker/src/planning/proposed-plans.ts`). A worker killed mid-commit (CPU
+limit, eviction) can't release, so its plan answers 409 to re-clicks for up to
+120 s, after which the next commit takes the claim over. A commit slower than
+the lease can overlap the one that took it over. Both may then write events,
+but only the current holder can mark the plan, and the superseded one answers
+409 having marked nothing. The lease is far above the observed commit time.
+
+Both routes hand the commit to `waitUntil` (`keepCommitAlive`), so a client
+that disconnects mid-commit (a closed tab, a dropped agent connection)
+doesn't cancel it: it runs on for up to 30 s after the disconnect and then
+releases or marks as usual. Past that it is cancelled like a killed worker
+and holds the claim for up to the 120 s lease.
+
+To see a stuck claim:
+
+```sql
+SELECT plan_hash, commit_claim, commit_claimed_at FROM proposed_plans
+ WHERE commit_claim IS NOT NULL AND committed_at IS NULL;
+```
+
+0047 is load-bearing: commit reads and writes both columns, so deploying
+ahead of it fails every commit.
+
 ### Async webhook smoke check
 
 To verify the full async path **including the diff/email render** (Google push →
@@ -1284,6 +1328,36 @@ into concrete task rows by the recurrence sweep, which runs as part of each
 date of the occurrence it represents, and a UNIQUE index guarantees one row per
 (template, occurrence-date). Re-running the sweep is therefore idempotent — it
 never re-creates an occurrence that already exists.
+
+### Occurrence dates are the user's local dates
+
+The sweep expands a template's RRULE on calendar dates, not instants
+(`recurrence/materialise.ts` `localDateRange`, `recurrence/rrule.ts`):
+
+- **Unpinned templates** expand on the window's local dates in the user's
+  effective tz, from the date of the window start to the date of its last
+  instant, so a partial last day counts. The resolve window (the user's local
+  `[Mon 00:00, next Mon 00:00)`) always yields its own Mon..Sun in every zone.
+  An instance's `earliest_start` is local midnight of its date.
+- **Pinned templates** expand on dates in `pinned_tz` (else the user's tz),
+  and each occurrence belongs to the window that holds its pin: `pinned_at`
+  (`pinned_time` on that date in `pinned_tz`) must fall inside
+  `[window start, window end)`. A Sydney-pinned Monday 09:00 is a Sunday
+  evening in Los Angeles, so for a Los Angeles user it is materialised by
+  the week holding that Sunday, never by a week that would shed it as past.
+
+Before this, the window's UTC instants were compared against UTC-midnight
+dates, so west of UTC a week ran Tue..next Mon: this week's Monday was missing
+whenever the previous week hadn't been swept, and next Monday was created a
+week early. Rows already created that way are keyed by the same local date
+(`occurrence_date`), so the fix creates neither duplicates nor gaps: an early
+next-Monday row is simply found as existing when its own week is swept.
+
+**DST gaps.** A pinned time that doesn't exist on its date (a 02:30 pin on
+Sydney's spring-forward Sunday) shifts forward by the gap (to 03:30), as does
+a local midnight that doesn't exist (Santiago, Beirut and Cairo spring forward
+at 00:00, so that day's unpinned instance starts at 01:00). Neither fails the
+sweep any more.
 
 ### Deleting a recurring instance permanently skips that occurrence
 
@@ -2638,8 +2712,9 @@ busy time is the one direction that file must never take — it tells a booker
 they are free when they are not.
 
 **Paging.** `GET /book/<slug>/slots?duration=N&page=k` returns ONE page —
-`horizon_days` of availability — and costs one calendar read plus one
-`bookings` read, both sized to that page's window, never to the whole reach.
+`horizon_days` of availability — and costs at most one calendar read (shared
+for 60 s, see "Public read cache and limits" below) plus one `bookings` read,
+both sized to that page's window, never to the whole reach.
 Page k is `[now + k·horizon_days, now + (k+1)·horizon_days)` in
 **milliseconds off the server's `now`**, not local midnight: page 0 is
 byte-for-byte the single window the page served before paging existed, and a
@@ -2653,8 +2728,9 @@ is not a non-negative integer is `400 invalid_page`, and a page past the reach
 is `400 page_out_of_range` — refused **before** any read, so an
 unauthenticated caller cannot spend a calendar read on a page that cannot
 exist (`computeAvailability` throws `PageOutOfRangeError` first thing).
-Nothing prefetches: each page is a calendar read, so a booker who wants day
-300 pays for the page holding it, and only when they press "Later →".
+Nothing prefetches: each page is a calendar read (or a cache hit), so a
+booker who wants day 300 pays for the page holding it, and only when they
+press "Later →".
 
 The claim path (`POST /book/<slug>`) re-verifies the requested start against a
 fresh recompute of **the page holding it** (`pageForStart`) — one calendar
@@ -2910,7 +2986,7 @@ else is left as-is (`worker/src/handlers/booking-page.ts`,
 |---|---|
 | `slug` | Public URL segment. `null` until set — the page 404s with no slug regardless of `enabled`. |
 | `enabled` | When `false` the page 404s even with a slug set. |
-| `durations_minutes` | Meeting lengths offered. Must be multiples of 15, minimum 15 (Optical's placement grid) — a non-multiple is rejected with `400 invalid_duration`. Offering a 15-minute duration puts slot starts on a 15-minute grid; otherwise they land on the half hour. |
+| `durations_minutes` | Meeting lengths offered. Must be multiples of 15, minimum 15 (Optical's placement grid) — a non-multiple is rejected with `400 invalid_duration`. Offering a 15-minute duration puts slot starts on a 15-minute grid; otherwise they land on the half hour. The grid is the owner's local wall clock (10:00, 10:30 … in their timezone), not the UTC epoch's, so an owner in a zone off the half hour (Kathmandu +5:45, Eucla +8:45, Chatham +12:45) is offered :00/:30 local starts, not :15/:45. The claim recomputes the same slots, so it re-verifies on the same grid. |
 | `hours` | Booking-specific hours (`days`/`start`/`end` in the owner's timezone), or `null` to fall back to the owner's business hours (`config_business_hours`). If that row is missing too, the page falls back to Mon–Fri 09:00–17:00 rather than to no limit at all — offering the whole horizon round the clock is the dangerous direction. **Validated for range, not just shape:** `start`/`end` must be real clock times (`00:00`–`23:59`, `400 validation_failed` otherwise), `days` must be non-empty, and `start` must be strictly before `end` (`400 invalid_hours`). Each used to be a `200` followed by a broken live page, with nothing pointing back at the config: an out-of-range time throws `invalid local datetime` inside `computeAvailability`, so **every `/book/<slug>/slots` call answered `502 calendar_unavailable`** — blaming the calendar for a config the owner had just saved; an empty window merely offered nothing. If you meet a booking page 502ing on every slots call, check `hours` first. |
 | `buffer_minutes.before` / `.after` | Padding reserved around each booking, enforced against *other bookings too* (both sides of the overlap guard are buffer-expanded, so the gap between two bookings is `before + after`; offered slots keep that same sum-gap from ALL busy time — a slot ending exactly at a busy start is no longer offered — see §L "frontier cells"). |
 | `min_notice_minutes` | No slot is offered sooner than this many minutes from now. |
@@ -3092,6 +3168,146 @@ Existing bookings (`reserving` or `confirmed`) are always subtracted from
 availability too, on top of all of the above — regardless of the flag, no
 booker can double-book a slot another booker already claimed.
 
+### Public read cache and limits
+
+`GET /book/<slug>/slots` is anonymous and unchallenged by design (the page has
+to show times before a booker meets Turnstile), and `GET /poll/<id>/grid` and
+`PUT /poll/<id>/response` can be driven by anyone holding an invitee link.
+All three recompute availability from the owner's calendar, so all three sit
+behind a short-TTL calendar cache and two rate limiters
+(`worker/src/public-read/`). Nothing else does.
+
+**Order of checks.** Feature flag, slug/token, page enabled and membership
+(`delisted_skip`) first, exactly as before: a disabled, unknown or delisted
+page is the same 404 (or 401 for a bad poll link) and never touches the
+limiter or the cache, so a warm entry can't outlive a delisting or a flag
+flip. Then the per-IP limit, on every request. Then the cache lookup; only a
+miss spends the page's per-slug/per-poll budget, right before it reads the
+calendar. Everything read
+from D1 — bookings, pinned tasks, movable verdicts, business hours, the page
+config and the owner's tz — is read fresh on every request.
+
+**Cache.** The owner's calendar read is kept in the Cache API
+(`caches.default`) for `PUBLIC_READ_CACHE_TTL_SECONDS` (default **60**;
+`"0"` turns the cache off; capped at 300). The key is a SHA-256 of
+(entry version, deployment = `OAUTH_ISSUER` origin, provider, owner subject,
+own-write generation, window), under the request's origin at
+`/__optical/public-read-cache/v1/<hash>`, so the URL carries no subject and
+dev and prod (two hosts in one zone) never share an entry. The window is
+widened to whole UTC hours before keying: page windows start at the server's
+`now`, so an exact key would be new on every request, and the wider read only
+adds busy time at the edges. Durations share an entry (the calendar does not
+depend on the duration); each page is its own entry. Requests that miss at
+the same instant are not collapsed (the Cache API doesn't, and a promise
+can't safely be shared across Workers requests), so a simultaneous burst can
+cost a few reads before the first entry lands; the per-page limiter bounds
+it. What is
+stored is a projection of each
+event — id, start, end, status, `isAllDay`, `eventType`, the
+`scheduler_chunk_id` and `optical_poll_id` tags, and the `self`/`resource`
+flags of the organiser and attendees — with **no titles, no addresses, no
+response statuses** and no other extended properties. A miss returns the same
+projection, so a hit and a miss compute identical slots. A cache error falls
+back to the live read (`public_read_cache_error {op}`); a provider error is
+never cached.
+
+Why the Cache API and not KV: the cache is free to write and evicts itself,
+where KV bills every write, has a 60 s minimum TTL and global eventual
+consistency, and would persist calendar-derived data in a global store. The
+trade-off is that the Cache API is per data centre, so a burst spread across
+colos costs one read per colo.
+
+**Where the cache actually works.** Cloudflare's Cache API page says cache
+operations are functional for Workers on custom domains, and "not currently
+available" for Workers fronted by Cloudflare Access; `*.workers.dev` is not
+listed as functional. So:
+- a deployment on a custom domain (prod, dev) should cache;
+- a deployment reachable only on `*.workers.dev` reads live on every request;
+- our Access applications cover only `/admin/dev-ui` (`infra/main.tf`, the
+  `scheduler` and `scheduler_dev` applications), and the docs don't say
+  whether a path-scoped Access app turns the cache off for the rest of the
+  host. Treat it as unverified.
+
+Wherever the cache doesn't work, every request is a miss, so both limiters
+count every request (30/min per IP, 120 calendar reads/min per page).
+**Live check** (do this once per env after the first deploy): set
+`DEBUG_LOG = "true"`, load a booking page twice within a minute while
+`npx wrangler tail --env dev --format json | grep dbg_public_read_cache`
+runs; the second load must log `{"hit":true}`. `{"hit":false}` on both means
+the cache is a no-op there.
+
+**Own writes show at once.** Optical's own calendar writes never wait out the
+TTL. A booking-page claim and a poll booking each leave a `bookings` row, read
+fresh on every request, which blocks the same time as the event. Commit (a
+pinned task's chunk, a moved owned meeting) is covered by the key's
+**own-write generation**: the owner's task-row count plus their newest
+`tasks.updated_at` (`ownerWriteGeneration`, no migration). It costs one D1
+query per request on the `tasks_owner` index that reads all the owner's task
+rows, done ones included, so it grows with the owner's task history. Commit writes the calendar first and stamps the plan's task
+rows after, so the generation only moves once the new times are on the
+calendar, and the next public read misses and reads live. Writes that only
+free time (a deleted chunk, a decline-cancelled booking's event) can still
+read busy for up to the TTL, which never over-offers. Any task-row edit also
+moves the generation, so an owner busy editing tasks gets fewer cache hits;
+the per-page limiter still bounds the reads.
+
+**Staleness.** A calendar change made outside Optical can take up to the TTL
+to show on the public page: a freed slot appears up to 60 s late, and a slot
+the owner has just taken stays on offer for up to 60 s. Nothing can be
+double-booked by this, because **the booking claim re-verifies against the
+live calendar**, never the cache: a claim on a stale slot gets
+`409 slot_unavailable` with a fresh list. A booking made through the page is
+in D1, so it blocks its slot on the very next request. On a poll, a save can
+be validated against a region up to 60 s old; the poll booking engine
+(`worker/src/polls/booking.ts`) reads live before it books. Never cached: the
+claim's re-verification and post-claim refresh, poll booking (auto-book,
+deadline, `bookBest`, explicit `book`), the organiser status page, the poll
+API, resolve, commit, the `.ics` feed and every authenticated read.
+`worker/test/public-read/wiring.test.ts` pins the call sites.
+
+**Rate limits.** Two Workers Rate Limiting bindings, declared in every env
+block of `worker/wrangler.toml` (bindings don't inherit, so each env has its
+own `namespace_id`s: prod 1001/1002, dev 2001/2002):
+
+| Binding | Key | Counts | Default |
+|---|---|---|---|
+| `PUBLIC_READ_IP_LIMITER` | `ip:<CF-Connecting-IP>`; an IPv6 address is keyed on its /64 (`ip:2001:db8:0:1::/64`). Shared by the booking and poll reads | every request | 30 / 60 s |
+| `PUBLIC_READ_TARGET_LIMITER` | `book:<slug>` or `poll:<id>` | cache misses only (each one is a calendar read) | 120 / 60 s |
+
+The per-IP check runs first, on every request; a request with no
+`CF-Connecting-IP` (not through Cloudflare's edge) skips it. The per-page
+budget bounds calendar reads, not page views: a cache hit costs no calendar
+read, so it spends nothing, and a burst of visitors on a warm page can't lock
+anyone out of it. IPv6 is keyed on the /64 because one subscriber is
+routinely handed a whole /64. Over either limit:
+**`429 {"error":"rate_limited"}` with `Retry-After: 60`**, and no calendar
+read. A poll save turned away per-IP is refused before its body is read; one
+refused on its miss is refused before any write. Either way nothing is
+saved.
+The booking page shows "Too many requests right now. Please wait a minute and
+try again." on the availability line; the poll page shows the same on its
+status line and keeps the invitee's painted selection. The binding counts per
+Cloudflare location and is eventually consistent, so these are abuse
+ceilings, not exact quotas. A missing or failing binding fails open with a
+`public_read_limiter_unbound` / `public_read_limiter_error` warning (the cache
+still bounds provider reads).
+
+**Tuning.** The limits are not vars: change `simple = { limit, period }` on
+the env block's `[[ratelimits]]` entry (period is 10 or 60) and redeploy,
+then update `worker/test/public-read/wiring.test.ts`, which pins every block
+at the defaults. A change to the top-level (prod) values must also go into
+the `ratelimits` option in `worker/vitest.workspace.ts`: the vitest pool's
+bundled wrangler 3 doesn't read `[[ratelimits]]`, so the suite declares the
+two limiters itself, and the wiring test fails if the copies drift. The TTL
+is the `PUBLIC_READ_CACHE_TTL_SECONDS` var (unset in every env = 60). The vitest suite pins it to `"0"` (vitest.workspace.ts) because the
+Cache API outlives a test; the cache's own tests set it explicitly.
+
+**Deploying.** Nothing to create first: a rate-limit `namespace_id` is just a
+number, and the Cache API needs no binding. The `[[ratelimits]]` key needs
+the repo-pinned wrangler 4 (`wrangler deploy --dry-run` lists both as
+`Rate Limit` bindings). Smoke steps B3/B9/B10 make a handful of reads, far
+under the limits.
+
 ### What happens on a booking
 
 `POST /book/<slug>` runs, in order: a request-body size cap
@@ -3255,17 +3471,14 @@ the owner sees and approves the move before the booker is notified.
     --command "DELETE FROM bookings WHERE google_event_id = '<event-id>'"
   ```
 
-- **`GET /book/<slug>/slots` is unauthenticated, unchallenged and
-  unthrottled — and every call triggers a live Google Calendar fetch.**
-  Unlike `POST /book/<slug>`, the slots handler never calls `verifyTurnstile`
-  or either rate-limit counter (`worker/src/booking/route.ts`); it goes
-  straight from the `duration` check to `computeAvailability`, which calls
-  `cal.fetchEventsInWindow`. Anyone who has (or guesses) a valid slug can drive
-  unbounded Google Calendar API calls and worker CPU against that owner's
-  account. This is forced by the design — the page has to show slots *before*
-  a booker is challenged — so it is an accepted exposure in this iteration, not
-  a bug to fix here. Mitigating it would need a cache in front of
-  `computeAvailability` or a read-path rate limiter; neither exists yet.
+- **`GET /book/<slug>/slots` is still unauthenticated and unchallenged**
+  (the page has to show slots before a booker meets Turnstile). It is now
+  throttled per IP (every request) and per slug (calendar reads only), and
+  its calendar read is cached for 60 s ("Public read cache and limits"
+  above), so a script costs at most one provider read per owner, page window
+  and colo per TTL, and at most 120 calendar reads a minute per slug per
+  colo. Both are per data centre, so a client spread
+  across many colos still gets more than one colo's worth.
 
 - **A confirm-path failure can strand a `bookings` row in `reserving`
   indefinitely.** As described above, when the calendar write succeeds but
@@ -3424,6 +3637,20 @@ mailbox and counts against `OUTBOUND_MAIL_DAILY_CAP` (§S "Outbound mail cap"):
 deadline-extended re-link skip capped invitees without rotating their links; cancellation
 always succeeds and logs the capped sends. `bin/poll-smoke.py` stops with a clear message
 when it gets a 202, so it can't run against a gated env.
+
+**Invitee reads are cached and rate limited.** `GET /poll/<id>/grid` and
+`PUT /poll/<id>/response` recompute the organiser's paintable region from
+their calendar, so after the invitee token check they go through the same
+per-IP limit (`ip:<addr>`, IPv6 by /64, 30/min, every request, shared with
+the booking page), the same 60 s calendar cache, and a per-poll budget
+(`poll:<id>`, 120/min) spent only when a cache miss reads the calendar; see
+§K "Public read cache and limits". Over a limit is
+`429 {"error":"rate_limited"}` with `Retry-After: 60` and no calendar read. A
+save turned away per-IP is refused before its body is read, and one refused on
+its miss before any write, so nothing is saved; the page keeps the painted
+selection and says to wait a minute. A save is
+validated against a region up to 60 s old; booking (auto-book, deadline,
+`book`, `bookBest`) and the organiser status page read the calendar live.
 
 Migrations 0033 and 0034 (guest-join rate limiting; see "Guest joins" below)
 must land before deploy, same as any other migration — they auto-apply in
@@ -4088,6 +4315,35 @@ ever could).
   set the way the booking page does — so a poll can offer a subset of the
   starts the booking page would for the same owner. Under-offering, never
   over-offering; accepted for v1.
+- **Saved cells across a grid move are read by overlap.** Candidates and
+  paintable cells sit on the organiser's local half-hour grid
+  (`ceilToLocalGrid`/`floorToLocalGrid`, `planning/datetime.ts`), and a
+  saved cell is keyed by its exact UTC start on the grid at save time. Every
+  whole- and half-hour zone's grid is the UTC :00/:30 lattice; Kathmandu
+  (+5:45), Chatham (+12:45) and Eucla (+8:45) sit on :15/:45. Responses saved
+  before the local-grid deploy by such an organiser, and responses saved
+  before an organiser's mid-poll tz change between the two groups, are on
+  the other grid, so `alignCellsToGrid` (`polls/scoring.ts`) reads them on
+  the current one: a current cell keeps a state only if the saved cells
+  overlapping it cover it with no gap, if_needed if any of them is, else
+  free. A partly covered cell rounds down to unpainted, so a painted run
+  loses its two half-covered edge cells. Paint already on the current grid
+  reads exactly as saved. `rankCandidates` aligns every response once, so
+  auto-book, the deadline, `bookBest`, near misses and the organiser's
+  ranking all use it; the invitee grid payload and the organiser status page
+  build their cells and counts from the aligned cells too.
+  - **Invitee notice:** the grid payload's `you.realigned` is true when the
+    viewer's own cells were realigned, and the page shows "The organiser's
+    timezone changed, so the grid has moved. Please check your availability
+    and save again." (`#regrid`).
+  - **Organiser note:** the status page names the invitees affected ("Your
+    timezone changed after … responded, so the grid moved. Their saved times
+    carry over only where they fully cover a new slot. Nudge them to
+    check."). No email or API schema changes.
+  - The next save stores current-grid keys, which clears both. A verbatim
+    resubmit of the realigned `you.cells` is accepted even where a realigned
+    cell has since left the paintable region (it's dropped like any other
+    stale saved cell).
 - **`fitScoreForChunk` ignores a DST shift inside a chunk**
   (`worker/src/polls/scoring.ts:134`) — this mirrors the Python solver's
   caller-obligation contract exactly, trading the edge case for guaranteed
@@ -4479,6 +4735,12 @@ mode doesn't have to wait out a realistic window; prod stays on the default
   overlap guard (`claimSlot`) keeps blocking that slot until the sweep
   either cancels or clears it. A booker who declines and immediately tries
   to re-claim the *same* slot has to wait out the grace period first.
+- **After the cancel, the public page can take up to a minute to re-offer
+  the slot.** The row flips to `'cancelled'` at once (D1 is read fresh), but
+  the deleted event may still sit in the public read cache for up to
+  `PUBLIC_READ_CACHE_TTL_SECONDS` (60 s; §K "Public read cache and limits"),
+since only writes that add busy time move the cache generation.
+  A claim on it in that window re-verifies live and succeeds.
 - **Cancelled rows still count toward the IP/day rate limits**
   (`countRecentByIp`/`countTodayByOwner` count every row with
   `status != 'failed'`). Accepted as anti-abuse behaviour, unchanged from the
@@ -5215,6 +5477,21 @@ already linked", §S "Provider rebind refusal"), and nothing is reset.
 
 ### Calendar semantics
 
+- **All-day events are floating dates.** Both providers hand an all-day
+  event over as UTC midnight of its date (Google `${date}T00:00:00Z`; Graph's
+  floating midnight read under `Prefer: outlook.timezone="UTC"`).
+  `busy-blocks.ts` reads the date back off that string (`allDayFloatingDate`)
+  and blocks the user's local day(s): local midnight of the start date to
+  local midnight of the exclusive end date, in the user's effective tz.
+  Taking the UTC-midnight instant's local date instead blocked the day
+  before everywhere west of UTC (planner, booking page, poll busy checks).
+  Webhook replans bucket an all-day event into the week of its date
+  (`eventBucketInstant`, local noon of the date). An all-day start/end that
+  is NOT UTC midnight (a provider that sent a converted instant) falls back
+  to the local day containing that instant. The Graph shape was never checked
+  live: create an all-day Outlook event with a Microsoft test account and read it via
+  `/me/calendarView` with that Prefer header; a `T00:00:00.0000000` start
+  confirms the floating shape.
 - **`createEvent` maps attendees and Teams.** `event.attendees` becomes
   Graph `attendees[{emailAddress:{address}, type: "required"|"optional"}]`;
   `opts.addMeet` becomes `isOnlineMeeting: true, onlineMeetingProvider:
@@ -6352,7 +6629,7 @@ internal design notes.
 | Op | Route | Effect |
 |---|---|---|
 | `getTimezone` | `GET /v1/timezone` | `{tz, source, superseded_plans: 0}`. `source` is `"user"` when `home_tz` is set, else `"default"`. |
-| `setTimezone` | `PATCH /v1/timezone` `{tz}` | Validates an IANA zone (`400` otherwise, including a UTC offset like `"+10:00"`, which current Intl accepts but has no DST rules, and a bare legacy name like `"EST"`, which tzdata maps to fixed-offset `America/Panama`; UTC aliases such as `"GMT"` are fine) and stores its canonical spelling (`"europe/london"` → `"Europe/London"`). |
+| `setTimezone` | `PATCH /v1/timezone` `{tz}` | Validates an IANA zone (`400` otherwise, including a UTC offset like `"+10:00"`, which current Intl accepts but has no DST rules, and a bare legacy name like `"EST"`, which tzdata maps to fixed-offset `America/Panama`; UTC aliases such as `"GMT"` are fine) and stores its canonical spelling (`"europe/london"` → `"Europe/London"`). That is the IANA primary id: workerd's ICU answers CLDR's legacy ids for a handful of zones (`"Asia/Kolkata"` → `"Asia/Calcutta"`, `"Asia/Kathmandu"` → `"Asia/Katmandu"`, `"Europe/Kyiv"` → `"Europe/Kiev"`), which `canonicalZoneName` maps back (`ICU_LEGACY_ZONES`, `schema/common.ts`). The same applies to task window `tz` and template `pinned_tz`. |
 | `resetTimezone` | `DELETE /v1/timezone` | Sets `home_tz` NULL, so the user inherits `SCHEDULER_TZ` again. |
 
 A subject with no `users` row gets `404 no_user_row` from PATCH and DELETE,
@@ -6368,7 +6645,16 @@ per user, with no "home" vs "current" split: a traveller just sets it.
 - **Pending plans are discarded.** When the *effective* tz actually changes
   (a PATCH to the same zone, or a DELETE that lands on the value already in
   force, is a no-op), every uncommitted proposed plan for the user is deleted
-  and counted in `superseded_plans`. They were solved against the old business
+  and counted in `superseded_plans`. Re-saving the same zone under a new
+  spelling is a **rename**: rows stored before canonicalisation was fixed
+  keep their legacy id (`Asia/Calcutta`; Intl and Python's ZoneInfo both load
+  it, and nothing rewrites it unprompted). A PATCH of `Asia/Kolkata` over it
+  stores the new spelling and, in the same batch, re-spells every one of the
+  user's plans' `window_tz` from the old spelling to the new one
+  (`renamePlansWindowTzStmt`; a NULL `window_tz` that read as a legacy
+  `SCHEDULER_TZ` spelling becomes explicit). Nothing is discarded
+  (`superseded_plans: 0`), no window is stamped, the churn and drop baselines
+  carry over, and there is no "Transition" churn. They were solved against the old business
   hours, so an old email's Accept link now hits the vanished-hash path (409 or the
   HTML equivalent) rather than committing old-tz placements. Committed plans are untouched.
 - **Nothing is replanned by the change itself.** The next resolve from any
@@ -6453,11 +6739,12 @@ So after a change:
   race where a PATCH lands while a resolve is in flight, after it read the
   old tz but before it stored its plan.
 
-**Recurrence after a move west.** Instances are unique per UTC date. After
-moving to a zone behind the old one, a Monday instance of a template without
-`pinned_tz` is only created once a resolve runs for that week. Run
-`replan-now?force=true` after a change, as the `setTimezone` description
-advises.
+**Recurrence after a move.** Instances are unique per local date
+(`occurrence_date`), and the sweep expands the local dates of the window it
+resolves ("Recurring tasks"). Instances already materialised keep their
+instants; a date not yet materialised is created in the new tz when its week
+is next resolved. Run `replan-now?force=true` after a change, as the
+`setTimezone` description advises.
 
 **Client-supplied windows** (`POST /v1/resolve`) are bucketed by their start
 in the caller's effective tz. Send the local Mon 00:00 of that tz (see
@@ -6514,6 +6801,22 @@ any stray values (`UPDATE users SET home_tz = NULL …`) first, or accept that.
 - The window stamp is a whole-body task update. A task PATCH or webhook
   manual move that reads the row before the tz-change batch and writes after
   it drops the stamp, and those windows then follow the new zone.
+- **A local time inside a DST gap moves forward by the gap, everywhere**
+  (`fromLocalNaiveCompatible`, `planning/datetime.ts`): all-day and
+  out-of-office day bounds, recurrence pins and midnights, business-hours
+  bounds, booking and poll ranges, and solver placements. Zones that spring
+  forward at 00:00 (Santiago, Beirut, Cairo) used to fail the whole resolve,
+  booking page or poll on that week. A chunk the solver places in a gap's
+  naive slots (possible only when business hours don't mask the gap) lands
+  one gap later, on the same instant as a chunk placed at that later naive
+  slot (Santiago 2026-09-06: naive 00:30 and 01:30 both start at 04:30Z), so
+  the two can overlap, not just touch.
+- **The second instance of a fall-back hour is unplaceable.** The solver's
+  slots are naive wall clock, and a repeated-hour slot lands on the EARLIER
+  instant. A foreign-tz window projected across that hour
+  (`window-projection.ts` `firstNaiveAtOrAfter`) allows a repeated-hour slot
+  exactly when that slot's earlier instant is inside it; the real instants of
+  the second instance can't be reached by any slot.
 
 
 ## S. Agentic safety and account hardening
@@ -6845,7 +7148,10 @@ product decision). The next sign-in also resets sync once more (§O, the anchori
 becomes zero-length, in the same CAS-guarded batch, so a 409 changes nothing). The account
 is idle until the next sign-in: no Monday resolve, webhook replan, poll nudge or deadline
 booking (polls stay open), booking-page slots and the poll invitee grid and save answer
-`502 calendar_unavailable`, and
+`502 calendar_unavailable` (once a warm public read cache entry has expired: for up to
+`PUBLIC_READ_CACHE_TTL_SECONDS`, 60 s, a warm entry can still serve the previous
+calendar's slot times, §K "Public read cache and limits"; the claim's live re-check
+still refuses), and
 `/v1/resolve` and `/v1/replan-now` answer `409 identity_credential_missing`. Each skipped
 job logs one `credential_missing_skip {path, reason}` line, never an address. An offboard
 of an idle account still completes, skipping its calendar cleanup and upstream revoke. A

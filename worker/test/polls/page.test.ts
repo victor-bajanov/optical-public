@@ -24,6 +24,13 @@ function directives(csp: string): Map<string, string[]> {
 describe("renderPollPage", () => {
   const opts = { pollId: "p_abc123", token: "tok.sig", cellMinutes: 30 };
 
+  it("carries a hidden #regrid notice, separate from #status, for an organiser tz move across grids", () => {
+    const html = renderPollPage(opts);
+    expect(html).toContain(
+      '<p class="notice" id="regrid" hidden>The organiser\'s timezone changed, so the grid has moved. Please check your availability and save again.</p>',
+    );
+  });
+
   it("bootstraps via data-* attributes on #app, not an inline script", () => {
     // Fix 1: script-src 'self' has no 'unsafe-inline' and no nonce, so an
     // inline <script> here would simply never execute in a real browser —

@@ -1,6 +1,6 @@
 import type { BusinessHours } from "./solver-contract";
 import type { LocalNaive } from "./solver-contract";
-import { fromLocalNaive } from "./datetime";
+import { fromLocalNaiveCompatible } from "./datetime";
 import { mergeIntervals, type Interval } from "./intervals";
 
 const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
@@ -47,8 +47,10 @@ export function businessHoursIntervals(
     const weekdayIdx = dt.getUTCDay();
     const dayName = WEEKDAYS[weekdayIdx];
     if (!dayName || !(bh.days as string[]).includes(dayName)) continue;
-    const startIso = fromLocalNaive(`${localDate}T${bh.start}:00` as LocalNaive, tz);
-    const endIso = fromLocalNaive(`${localDate}T${bh.end}:00` as LocalNaive, tz);
+    // A bound inside a DST gap (hours starting 00:00 on Santiago's
+    // spring-forward date) moves forward to the first real instant.
+    const startIso = fromLocalNaiveCompatible(`${localDate}T${bh.start}:00` as LocalNaive, tz);
+    const endIso = fromLocalNaiveCompatible(`${localDate}T${bh.end}:00` as LocalNaive, tz);
     const s = Date.parse(startIso);
     const e = Date.parse(endIso);
     const clippedS = Math.max(s, windowStartMs);

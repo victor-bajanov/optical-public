@@ -20,6 +20,7 @@ import {
   COMMON_TZ_ZONES,
   buildResponsePayload,
   shouldRenderOutcome,
+  showRealignedNotice,
   saveSuccessStatusText,
   bucketSlotsByLocalDate,
   weekOf,
@@ -1623,6 +1624,49 @@ describe("mount() — LOW: PUT 409 poll_closed gets a specific message", () => {
   });
 });
 
+describe("mount() — 429 rate_limited (public read limiter) gets a wait-and-retry message", () => {
+  const RATE = { ok: false, status: 429, json: async () => ({ error: "rate_limited" }) };
+
+  it("a 429 on the grid load says to wait, not that the poll is unavailable", async () => {
+    const shell = buildFakeShell({ pollId: "p_1", token: "tok", cellMinutes: "30" });
+    const fetchMock = vi.fn(async () => RATE);
+    await withFakeDom(shell.app, fetchMock, async () => {
+      mount(shell.app);
+      await flush();
+      expect(shell.status.textContent).toMatch(/wait a minute/i);
+      expect(shell.status.textContent).not.toMatch(/unavailable/i);
+    });
+  });
+
+  it("a 429 on save keeps the selection and the button usable, and says to wait", async () => {
+    const C1 = futureCell(5, 0);
+    const shell = buildFakeShell({ pollId: "p_1", token: "tok", cellMinutes: "30" });
+    const gridPayload = {
+      paintableCells: [C1],
+      durationMin: 30,
+      aggregate: {},
+      respondents: [],
+      you: { cells: [], hideName: false, name: "" },
+    };
+    const fetchMock = vi.fn(async (_url: string, opts?: any) =>
+      opts && opts.method === "PUT" ? RATE : { ok: true, status: 200, json: async () => gridPayload },
+    );
+    await withFakeDom(shell.app, fetchMock, async (doc) => {
+      mount(shell.app);
+      await flush();
+      const c1 = doc.querySelectorAll("[data-cell]").find((el) => el.getAttribute("data-cell") === C1)!;
+      await doc.dispatch("pointerdown", { target: c1, pointerId: 1 });
+      await doc.dispatch("submit", { target: shell.form });
+      await flush();
+      expect(shell.status.textContent).toMatch(/wait a minute/i);
+      expect(shell.status.textContent).not.toMatch(/something went wrong/i);
+      expect(shell.submitBtn.getAttribute("disabled")).toBeNull();
+      const after = doc.querySelectorAll("[data-cell]").find((el) => el.getAttribute("data-cell") === C1)!;
+      expect(after.classList.contains("free")).toBe(true);
+    });
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Save feedback (poll-save-feedback fix): pressing Save gave no visible
 // acknowledgement — the PUT worked, but applyGridPayload's render() ->
@@ -2052,5 +2096,14 @@ describe("mount() — renderOutcome() must update #status, not leave it stuck", 
       expect(shell.status.textContent).not.toMatch(/saved/i);
       expect(shell.submitBtn.getAttribute("disabled")).toBeNull();
     });
+  });
+});
+
+describe("showRealignedNotice", () => {
+  it("is true only when the server realigned this invitee's saved cells", () => {
+    expect(showRealignedNotice({ you: { cells: [], hideName: false, name: "", realigned: true } })).toBe(true);
+    expect(showRealignedNotice({ you: { cells: [], hideName: false, name: "", realigned: false } })).toBe(false);
+    expect(showRealignedNotice({ you: { cells: [], hideName: false, name: "" } })).toBe(false);
+    expect(showRealignedNotice({})).toBe(false);
   });
 });

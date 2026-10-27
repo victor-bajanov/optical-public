@@ -18,6 +18,8 @@ import {
   dropInvitee,
   setPollStatus,
   getPoll,
+  replaceResponses,
+  markResponded,
   type Poll,
 } from "../../src/db/polls";
 import { signCapabilityWithEnv } from "../../src/auth/capability";
@@ -25,6 +27,7 @@ import { identityAnchorTag } from "../../src/auth/identity-rebind";
 import { hashToken } from "../../src/auth/tokens";
 import { hashingKey } from "../../src/auth/crypto-keys";
 import { POLL_CLIENT_HASH } from "../../src/polls/poll-client-source.generated";
+import { upsertUser } from "../../src/db/users";
 import { POLL_PAGE_CSP, POLL_JOIN_PAGE_CSP } from "../../src/polls/page";
 import type { AppVariables } from "../../src/index-providers";
 import type { Env } from "../../src/env";
@@ -310,7 +313,7 @@ describe("GET /poll/:id/grid", () => {
     expect(Array.isArray(body.paintableCells)).toBe(true);
     expect((body.paintableCells as string[]).length).toBeGreaterThan(0);
     expect(body.respondents).toEqual([{ label: "Sam", responded: false }]);
-    expect(body.you).toEqual({ cells: [], hideName: false, name: "Sam" });
+    expect(body.you).toEqual({ cells: [], hideName: false, name: "Sam", realigned: false });
     // Organiser's IANA zone (decision D3 server half / M3 support) — no
     // per-user home_tz row seeded here, so this falls back to
     // env.SCHEDULER_TZ, same as getHomeTz's own fallback everywhere else.
@@ -2119,5 +2122,100 @@ describe("delisted organiser (card C)", () => {
     expect((await app.request(`/poll/${poll.id}/grid?t=${encodeURIComponent(token)}`, {}, LISTED)).status).toBe(200);
     const form = await app.request(`/poll/${poll.id}?g=shared-secret`, {}, LISTED);
     expect(await form.text()).toContain(`action="/poll/${poll.id}/join"`);
+  });
+});
+
+// Saved cells are keyed by exact UTC start on the organiser's grid at save
+// time. When the organiser's tz moves between the UTC :00/:30 lattice (every
+// whole/half-hour zone) and :15/:45 (Kathmandu), the grid payload aligns each
+// response to the current grid and flags the viewer's own; the status page
+// names the invitees affected.
+describe("saved cells after the organiser's grid moved", () => {
+  const Q = 15 * 60_000;
+  const shift = (iso: string, ms: number) => new Date(Date.parse(iso) + ms).toISOString();
+
+  async function setOwnerTz(tz: string | null) {
+    await upsertUser(env.DB, OWNER);
+    await env.DB.prepare("UPDATE users SET home_tz = ? WHERE subject = ?").bind(tz, OWNER).run();
+  }
+  afterEach(async () => {
+    await env.DB.prepare("DELETE FROM users WHERE subject = ?").bind(OWNER).run();
+  });
+
+  async function setup(savedOnOldGrid: boolean) {
+    await setOwnerTz("Asia/Kathmandu");
+    const poll = await seedPoll();
+    const { invitee, token } = await seedInvitee(poll, "a@x.com", { name: "Ash" });
+    const app = appWith(new MockCalendarProvider({ events: [] }));
+    const grid = await app.request(`/poll/${poll.id}/grid?t=${encodeURIComponent(token)}`, {}, ON);
+    const p0 = ((await grid.json()) as { paintableCells: string[] }).paintableCells[10]!;
+    // Old (Sydney) grid: two cells straddling p0, covering [p0-15, p0+45).
+    const cells = savedOnOldGrid
+      ? [{ cellStartUtc: shift(p0, -Q), state: "free" as const }, { cellStartUtc: shift(p0, Q), state: "free" as const }]
+      : [{ cellStartUtc: p0, state: "free" as const }];
+    await replaceResponses(env.DB, invitee.id, cells);
+    await markResponded(env.DB, invitee.id, new Date().toISOString());
+    return { poll, token, app, p0 };
+  }
+
+  it("aligns the viewer's saved cells and the aggregate to the current grid, and flags realigned", async () => {
+    const { poll, token, app, p0 } = await setup(true);
+    const res = await app.request(`/poll/${poll.id}/grid?t=${encodeURIComponent(token)}`, {}, ON);
+    const body = (await res.json()) as { you: Record<string, unknown>; aggregate: Record<string, { free: number; freeWho: string[] }> };
+    expect(body.you.cells).toEqual([{ cell: p0, state: "free" }]);
+    expect(body.you.realigned).toBe(true);
+    expect(Object.keys(body.aggregate)).toEqual([p0]);
+    expect(body.aggregate[p0]).toMatchObject({ free: 1, freeWho: ["Ash"] });
+  });
+
+  it("a resubmit of the remapped cells verbatim is accepted, even one now outside the paintable region", async () => {
+    await setOwnerTz("Asia/Kathmandu");
+    const poll = await seedPoll();
+    const { invitee, token } = await seedInvitee(poll, "a@x.com", { name: "Ash" });
+    const app = appWith(new MockCalendarProvider({ events: [] }));
+    const grid = await app.request(`/poll/${poll.id}/grid?t=${encodeURIComponent(token)}`, {}, ON);
+    const paintable = ((await grid.json()) as { paintableCells: string[] }).paintableCells;
+    const last = paintable[paintable.length - 1]!;
+    // Old-grid cells past the region's end; their remap (last+30) is not paintable now.
+    await replaceResponses(env.DB, invitee.id, [
+      { cellStartUtc: shift(last, Q), state: "free" },
+      { cellStartUtc: shift(last, 3 * Q), state: "free" },
+    ]);
+    await markResponded(env.DB, invitee.id, new Date().toISOString());
+    const g2 = (await (await app.request(`/poll/${poll.id}/grid?t=${encodeURIComponent(token)}`, {}, ON)).json()) as {
+      you: { cells: Array<{ cell: string; state: string }> };
+    };
+    expect(g2.you.cells).toEqual([{ cell: shift(last, 2 * Q), state: "free" }]);
+    const res = await app.request(
+      `/poll/${poll.id}/response?t=${encodeURIComponent(token)}`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cells: g2.you.cells, hideName: false, name: "Ash" }),
+      },
+      ON,
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("cells saved on the current grid are not flagged", async () => {
+    const { poll, token, app, p0 } = await setup(false);
+    const res = await app.request(`/poll/${poll.id}/grid?t=${encodeURIComponent(token)}`, {}, ON);
+    const body = (await res.json()) as { you: Record<string, unknown> };
+    expect(body.you).toEqual({ cells: [{ cell: p0, state: "free" }], hideName: false, name: "Ash", realigned: false });
+  });
+
+  it("the organiser status page notes the remap only when a response sits off the current grid", async () => {
+    for (const moved of [true, false]) {
+      const { poll } = await setup(moved);
+      const statusToken = await signCapabilityWithEnv(
+        { purpose: "poll-status", pollId: poll.id, subject: OWNER, ttlSeconds: 3600, anchor: await identityAnchorTag(env, OWNER) },
+        TEST_ENV,
+      );
+      const app = appWith(new MockCalendarProvider({ events: [] }));
+      const html = await (await app.request(`/poll/${poll.id}/status?t=${encodeURIComponent(statusToken)}`, {}, ON)).text();
+      if (moved) expect(html).toContain("Your timezone changed after Ash responded, so the grid moved.");
+      else expect(html).not.toContain("Your timezone changed");
+    }
   });
 });

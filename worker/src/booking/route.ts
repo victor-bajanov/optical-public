@@ -32,6 +32,13 @@ import { verifyTurnstile, MAX_CLAIMS_PER_IP_24H, MAX_CLAIMS_PER_PAGE_24H } from 
 import { renderBookingPage, BOOKING_PAGE_CSP } from "./page";
 import { BOOKING_CLIENT_JS, BOOKING_CLIENT_HASH } from "./booking-client-source.generated";
 import { ownerNotificationEmail } from "../db/owner-email";
+import { getSubjectProvider } from "../auth/identity-store";
+import { cachedEventsReader } from "../public-read/events-cache";
+import {
+  checkPublicReadIpLimit,
+  PublicReadRateLimitedError,
+  rateLimitedResponse,
+} from "../public-read/rate-limit";
 
 /** Deliberately narrower than RFC 5321: `<>"',;` are the characters that make
  *  an address dangerous *downstream* rather than invalid. The address is
@@ -209,8 +216,17 @@ export function mountBookingRoutes(app: Hono<{ Bindings: Env; Variables: AppVari
   });
 
   app.get("/book/:slug/slots", async (c) => {
+    // Flag, slug, enabled and membership first: a disabled, unknown or
+    // delisted page is the same opaque 404 whatever the limiter or the cache
+    // hold, and never spends either.
     const page = await resolvePage(c, c.req.param("slug"));
     if (!page) return notFound();
+    // Anonymous and unchallenged (the page must show times before Turnstile),
+    // so every request is limited per client IP here. The per-slug budget is
+    // spent inside the cached reader, only when a miss reads the calendar.
+    // Runbook §K "Public read cache and limits".
+    const limited = await checkPublicReadIpLimit(c.env, c.req.header("cf-connecting-ip") ?? "");
+    if (limited) return limited;
 
     const duration = Number(c.req.query("duration"));
     if (!page.config.durations_minutes.includes(duration)) {
@@ -221,7 +237,21 @@ export function mountBookingRoutes(app: Hono<{ Bindings: Env; Variables: AppVari
     const pageIndex = parsePage(c.req.query("page"));
     if (pageIndex === null) return json({ error: "invalid_page" }, 400);
 
-    const cal = c.get("calendarProvider") ?? await defaultCalendarProvider(c.env, page.owner);
+    // The calendar read is shared for PUBLIC_READ_CACHE_TTL_SECONDS (one read
+    // per owner, page window and colo); the claim below re-verifies live.
+    const now = new Date();
+    const provider = await getSubjectProvider(c.env, page.owner);
+    const cal = cachedEventsReader(
+      c.get("calendarProvider") ?? await defaultCalendarProvider(c.env, page.owner, provider),
+      {
+        env: c.env,
+        owner: page.owner,
+        provider,
+        origin: new URL(c.req.url).origin,
+        now,
+        limitTarget: `book:${page.slug}`,
+      },
+    );
     try {
       const availability = await computeAvailability(
         c.env.DB,
@@ -229,7 +259,7 @@ export function mountBookingRoutes(app: Hono<{ Bindings: Env; Variables: AppVari
         page.owner,
         cal,
         duration,
-        new Date(),
+        now,
         pageIndex,
       );
       return json({
@@ -242,6 +272,8 @@ export function mountBookingRoutes(app: Hono<{ Bindings: Env; Variables: AppVari
       // Refused before any read, so it is the caller's error, not the
       // calendar's — and not a 404, which is reserved for "no such page".
       if (err instanceof PageOutOfRangeError) return json({ error: "page_out_of_range" }, 400);
+      // A cache miss with the slug's budget spent: refused before the read.
+      if (err instanceof PublicReadRateLimitedError) return rateLimitedResponse();
       console.error("booking slots computation failed:", String(err));
       return json({ error: "calendar_unavailable" }, 502);
     }
@@ -396,11 +428,12 @@ export function mountBookingRoutes(app: Hono<{ Bindings: Env; Variables: AppVari
     }
 
     // Never trust the client's slot list: the authoritative check is that the
-    // requested start is in a freshly computed set — for the PAGE holding it,
-    // which is one calendar read whatever the distance, rather than every
-    // page from now to there. A start past the reach has no page: refused
-    // here, before the calendar, with no courtesy list (there is no page to
-    // list) — the client reads a missing list as "refetch".
+    // requested start is in a freshly computed set, read from the LIVE
+    // calendar (never the public read cache the slots GET uses) — for the
+    // PAGE holding it, which is one calendar read whatever the distance,
+    // rather than every page from now to there. A start past the reach has no
+    // page: refused here, before the calendar, with no courtesy list (there
+    // is no page to list) — the client reads a missing list as "refetch".
     const startMs = Date.parse(start);
     const requested = Number.isNaN(startMs) ? null : new Date(startMs).toISOString();
     const claimPage = requested === null ? null : pageForStart(now.getTime(), startMs, page.config.horizon_days);

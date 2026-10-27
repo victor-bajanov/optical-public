@@ -170,30 +170,32 @@ function parseIcsDate(value) {
 }
 
 function wallTimeInTzToUtc(y, mo, d, h, mi, s, tz) {
+  // The wall time read as if it were UTC.
   const guess = Date.UTC(y, mo - 1, d, h, mi, s);
+  // `tz` is already resolved by the caller, so the formatter cannot throw here.
   const fmt = tzFormatter(tz, "wall", WALL_PARTS_OPTS);
-  function tzParts(instant) {
+  function wallMs(instant) {
     const parts = {};
     for (const p of fmt.formatToParts(new Date(instant))) {
       if (p.type !== "literal") parts[p.type] = p.value;
     }
-    return {
-      y: parseInt(parts.year, 10),
-      mo: parseInt(parts.month, 10),
-      d: parseInt(parts.day, 10),
-      h: parseInt(parts.hour === "24" ? "0" : parts.hour, 10),
-      mi: parseInt(parts.minute, 10),
-      s: parseInt(parts.second, 10),
-    };
+    const h24 = parts.hour === "24" ? "0" : parts.hour;
+    return Date.UTC(
+      parseInt(parts.year, 10), parseInt(parts.month, 10) - 1, parseInt(parts.day, 10),
+      parseInt(h24, 10), parseInt(parts.minute, 10), parseInt(parts.second, 10),
+    );
   }
-  let instant = guess;
-  for (let i = 0; i < 2; i += 1) {
-    const tp = tzParts(instant);
-    const tpUtc = Date.UTC(tp.y, tp.mo - 1, tp.d, tp.h, tp.mi, tp.s);
-    const offset = tpUtc - instant;
-    instant = guess - offset;
+  // Every real offset is within ±14 h, so 15 h either side of the guess is
+  // before / after any transition near it.
+  const HOURS_15 = 15 * 3600 * 1000;
+  const before = wallMs(guess - HOURS_15) - (guess - HOURS_15);
+  const after = wallMs(guess + HOURS_15) - (guess + HOURS_15);
+  // The larger offset gives the earlier instant; try it first.
+  for (const offset of before >= after ? [before, after] : [after, before]) {
+    const candidate = guess - offset;
+    if (wallMs(candidate) === guess) return candidate;
   }
-  return instant;
+  return guess - before;
 }
 
 function utcToWallParts(ms, tz) {
@@ -821,6 +823,15 @@ export function buildResponsePayload(paintMap, hideName, name) {
   return { cells, hideName: Boolean(hideName), name };
 }
 
+/** Whether to show the #regrid notice: the server read this invitee's saved
+ *  cells on the organiser's new half-hour grid (`you.realigned`, set when the
+ *  organiser's timezone moved between the :00/:30 and :15/:45 grids since
+ *  they saved). A save stores current-grid cells, so it clears on the next
+ *  payload after one. */
+export function showRealignedNotice(gridPayload) {
+  return gridPayload?.you?.realigned === true;
+}
+
 /** Whether the grid payload describes a poll that is no longer open, so the
  *  page must render the read-only outcome view instead of the paint UI. */
 export function shouldRenderOutcome(gridPayload) {
@@ -856,6 +867,10 @@ function esc(s) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
+
+/** Shown for a 429 `rate_limited` from the grid or a save: the server's
+ *  public read limits count per minute (Retry-After: 60). */
+export const RATE_LIMITED_MESSAGE = "Too many requests right now. Please wait a minute and try again.";
 
 /** Wire the server-rendered shell. Kept deliberately thin, the same house
  *  style as booking.client.js's mount(): every decision (pre-paint, stroke
@@ -939,7 +954,9 @@ export function mount(root = document.getElementById("app")) {
     try {
       const res = await fetch(`/poll/${encodeURIComponent(state.pollId)}/grid?t=${encodeURIComponent(state.token)}`);
       if (!res.ok) {
-        if ($("status")) $("status").textContent = "This poll is unavailable right now.";
+        if ($("status")) {
+          $("status").textContent = res.status === 429 ? RATE_LIMITED_MESSAGE : "This poll is unavailable right now.";
+        }
         return "failed";
       }
       const body = await res.json();
@@ -962,6 +979,7 @@ export function mount(root = document.getElementById("app")) {
     state.respondents = Array.isArray(body.respondents) ? body.respondents : [];
     state.totalInvitees = state.respondents.length;
     state.ownerTz = typeof body.ownerTz === "string" ? body.ownerTz : undefined;
+    if ($("regrid")) $("regrid").hidden = !showRealignedNotice(body);
     if (body.you && Array.isArray(body.you.cells)) {
       const paint = new Map();
       for (const c of body.you.cells) {
@@ -1381,6 +1399,12 @@ export function mount(root = document.getElementById("app")) {
             }
             return;
           }
+        }
+        if (res.status === 429) {
+          // The public read limiter turned this save away before reading or
+          // writing anything; the painted selection is still on screen.
+          if ($("status")) $("status").textContent = RATE_LIMITED_MESSAGE;
+          return;
         }
         if ($("status")) $("status").textContent = "Something went wrong. Please try again.";
         return;

@@ -3,6 +3,48 @@
 Curated notes for each public release, newest first. The full commit list for
 a release is in that release's PR on the public repository.
 
+## v1.3.1
+
+Fixes from an external review: timezone correctness across every zone, a
+double-accept race, and limits on the public availability reads.
+
+- **Upgrading:** apply migration **0047**
+  (`proposed_plans.commit_claim`/`commit_claimed_at`) before deploying, in
+  every environment. Without it every commit and accept fails. Each env block
+  in `wrangler.toml` now declares two `[[ratelimits]]` bindings; their
+  `namespace_id`s are account-wide, so pick ids nothing else on your
+  Cloudflare account uses. No new vars or secrets.
+- **Timezones:** a permanent 30-zone test matrix (every whole-hour offset, the
+  off-grid zones and the zones whose DST starts at local midnight), checked
+  against a brute-force `Intl` oracle, is now fully green. Fixes found by it:
+  - All-day events block the user's local day. West of UTC they blocked the
+    day before, and webhook week bucketing had the same error.
+  - A midnight or pinned time that falls in a DST gap shifts forward instead
+    of throwing.
+  - Recurrence expands on local dates; pinned templates expand in their
+    pinned zone, so far-east pinned templates are no longer shed every week.
+  - Booking and poll slots align to the local half hour (owners in :45-offset
+    zones now see :00/:30 local slots). Saved poll cells carry across a grid
+    move by overlap, with a notice to the invitee and a note on the
+    organiser's status page.
+  - Timezone ids are stored canonical; re-saving a legacy spelling renames it
+    in place.
+  - A hard preferred window projected over a fall-back hour could be
+    violated. Fixed.
+- **Commit claim:** two concurrent accepts of one plan could duplicate
+  calendar events. A commit now claims the plan (120 s lease) before touching
+  the calendar; a concurrent one gets `409 commit_in_progress`, shown on the
+  accept page as "Already being applied". The commit runs under `waitUntil`,
+  so a client disconnect no longer cuts it off mid-write.
+- **Public reads:** `GET /book/{slug}/slots`, `GET /poll/{id}/grid` and
+  `PUT /poll/{id}/response` are limited to 30 requests a minute per IP (IPv6
+  per /64) and 120 calendar reads a minute per page, answering
+  `429 rate_limited` with `Retry-After` past either. Calendar reads go through
+  a 60 s per-location cache (`PUBLIC_READ_CACHE_TTL_SECONDS`, "0" = off) that
+  stores no titles or addresses. Bookings and Optical's own commits show at
+  once; a change made outside Optical can take up to the TTL. Booking claims,
+  poll booking and authenticated paths always read live. Runbook §K.
+
 ## v1.3.0
 
 Identity hardening and data minimisation, from preparing the hosted trial

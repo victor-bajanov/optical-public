@@ -7,7 +7,7 @@ import { verifyCapabilityWithEnv } from "../auth/capability";
 import { confirmationRequired, isForeignFetchSite } from "../confirm/gate";
 import { isActiveMember } from "../auth/membership";
 import { acceptLinkAnchorHolds } from "../auth/identity-rebind";
-import { checkPlanCommittable, commitPlan, type CommitResult } from "./commit";
+import { COMMIT_IN_PROGRESS_409, checkPlanCommittable, commitPlan, keepCommitAlive, type CommitResult } from "./commit";
 import { deferPlanCommit, planConfirmResponses } from "./commit-confirm";
 import { getCommittedPlansForSubject, getPendingPlansForSubject, getProposedPlan, planProducedInTz, type ProposedPlanRow } from "./proposed-plans";
 import type { ReplanEmailModel } from "../diff/email-model";
@@ -106,6 +106,7 @@ const COPY = {
   alreadyAccepted: "You've already accepted this plan — your calendar is up to date.",
   caughtUp: "There are no proposed changes waiting.",
   expired: "This plan has expired and can no longer be accepted. You'll get a fresh email the next time your schedule changes.",
+  inProgress: "This plan is already being applied to your calendar. Give it a minute, then check your calendar.",
 };
 
 export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: AppVariables }>) {
@@ -113,12 +114,12 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
     method: "post", path: "/plans/{plan_hash}/accept", tags: ["internal"],
     operationId: "acceptPlan",
     summary: "Accept (commit) the proposed plan identified by {plan_hash}.",
-    description: "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer, never both: a request carrying a capability token AND an Authorization header is refused 403 `authorization_not_allowed` (the emailed link is the user's own confirmation, which an agent may not click for them). If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. A pending plan produced under a timezone other than the subject's current effective timezone (a resolve that raced a timezone change) is treated the same way as a superseded hash. Idempotent on an already-committed hash. Bearer calls from an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) commit nothing: after the same checks (409 plan_superseded, 410, idempotent 200), the user is emailed this plan's accept email and the call answers 202 awaiting_confirmation (action_id = plan_hash); only the user's own accept on that email's page (the capability branch) commits it. A gated call on a plan with no reviewable changes is 409 plan_not_reviewable; if the email can't be sent, 503 confirmation_unavailable.",
+    description: "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer, never both: a request carrying a capability token AND an Authorization header is refused 403 `authorization_not_allowed` (the emailed link is the user's own confirmation, which an agent may not click for them). If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. A pending plan produced under a timezone other than the subject's current effective timezone (a resolve that raced a timezone change) is treated the same way as a superseded hash. Idempotent on an already-committed hash. Bearer calls from an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) commit nothing: after the same checks (409 plan_superseded, 410, idempotent 200), the user is emailed this plan's accept email and the call answers 202 awaiting_confirmation (action_id = plan_hash); only the user's own accept on that email's page (the capability branch) commits it. A gated call on a plan with no reviewable changes is 409 plan_not_reviewable; if the email can't be sent, 503 confirmation_unavailable. A commit landing while another commit of the same plan is applying it (a double-click, or an agent's commit racing the emailed link) answers 409 commit_in_progress (the HTML form gets a 409 notice page saying the plan is already being applied) and normally writes nothing; a commit that outlived its own 120-second claim, or whose plan was replaced mid-commit, may already have written calendar events and task updates before answering 409, and a retry reconciles them. The other commit holds the plan for at most 120 seconds, after which a retry answers 200 (already committed) or commits.",
     responses: {
       200: { content: { "application/json": { schema: z.object({ ok: z.boolean() }) } }, description: "Committed (idempotent on an already-committed plan)" },
       401: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "Unauthenticated: missing/invalid bearer, or an invalid capability token (including one whose subject is no longer on MEMBERSHIP_ALLOWLIST, and one minted before the account was bound to a different sign-in identity: an admin rebind or a provider switch)" },
       403: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "authorization_not_allowed: a capability token (form field or query `t`) sent together with an Authorization header; or cross_site_not_allowed: a capability POST whose Sec-Fetch-Site is present and not same-origin. The capability path is for the accept page's own form only; nothing was committed." },
-      409: { content: { "application/json": { schema: z.object({ error: z.string(), latest_plan_hash: z.string().optional().describe(D.response.latest_plan_hash) }) } }, description: "plan_superseded: the plan no longer exists (or was produced under an older timezone); nothing was committed. Or, for an agent-confirm client's bearer call only, plan_not_reviewable: the plan has no reviewable changes to email; nothing was committed." },
+      409: { content: { "application/json": { schema: z.object({ error: z.enum(["plan_superseded", "commit_in_progress", "plan_not_reviewable"]), latest_plan_hash: z.string().optional().describe(D.response.latest_plan_hash) }) } }, description: `plan_superseded: the plan no longer exists (or was produced under an older timezone); nothing was committed. Or ${COMMIT_IN_PROGRESS_409} Or, for an agent-confirm client's bearer call only, plan_not_reviewable: the plan has no reviewable changes to email; nothing was committed.` },
       410: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "Expired" },
       ...planConfirmResponses,
     },
@@ -196,10 +197,10 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
       // Commit EXACTLY the hash in the path — never pre-resolve "latest". A vanished
       // hash surfaces below as 409, so a stale link can never silently apply a
       // different plan.
-      result = await commitPlan(c.env.DB, cal, pathHash, subject, {
+      result = await keepCommitAlive(c, commitPlan(c.env.DB, cal, pathHash, subject, {
         createColorId: c.env.CREATE_COLOR_ID,
         currentTz,
-      });
+      }));
     }
 
     if (result.status === 200) {
@@ -272,6 +273,17 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
       // status divergence (409 machine / 200 human) is deliberate.
       const weekTabs = cap ? weekTabsFor(windows, cap, tz, undefined) : [];
       return c.html(renderNoticePage({ heading: "You're all caught up", message: COPY.caughtUp, weekTabs }), 200);
+    }
+
+    if (result.status === 409) {
+      // commit_in_progress: another commit of this plan (a double-click, or an
+      // agent's commit racing this link) holds its claim and is writing the
+      // calendar now. Normally this request wrote nothing; one that outlived
+      // its own claim, or whose plan was replaced mid-commit, may already have
+      // written events and task updates, which a retry reconciles.
+      return wantsJson
+        ? c.json(result.body as Record<string, unknown>, 409)
+        : c.html(renderNoticePage({ heading: "Already being applied", message: COPY.inProgress }), 409);
     }
 
     if (result.status === 410) {

@@ -1,6 +1,6 @@
 import type { BusinessHours, LocalNaive } from "../planning/solver-contract";
 import { computeBookableSlots, slotStepForDurations } from "../booking/slots";
-import { fromLocalNaive } from "../planning/datetime";
+import { floorToLocalGrid, fromLocalNaiveCompatible } from "../planning/datetime";
 
 /** Width of one paintable grid cell, in minutes. Single source of truth —
  *  the invitee client mirrors this value from the grid endpoint's bootstrap
@@ -35,36 +35,14 @@ export interface CandidateBookingConfig {
   buffer_minutes: { before: number; after: number };
 }
 
-/** Probe order for the first local time that exists on a calendar date. Real
- *  spring-forward gaps are 30 or 60 minutes and start at or after midnight;
- *  probing out to 03:00 covers every zone in the tz database with margin. */
-const DAY_START_PROBES = [
-  "00:00:00", "00:15:00", "00:30:00", "00:45:00",
-  "01:00:00", "01:30:00", "02:00:00", "02:30:00", "03:00:00",
-];
-
 /** The UTC instant at which local calendar day `date` begins in `tz`, tolerant
- *  of a DST gap at midnight. `fromLocalNaive` THROWS for a local time that does
- *  not exist, and several zones (America/Santiago, America/Havana, Africa/Cairo,
- *  Asia/Beirut, …) start DST at exactly 00:00 — so on those nights a bare
- *  "T00:00:00" conversion takes down every caller of candidateStarts, silently
- *  in the booking and sweep paths. Stepping forward to the first instant that
- *  does exist is what "the day starts here" means on such a night. */
+ *  of a DST gap at midnight. Several zones (America/Santiago, America/Havana,
+ *  Africa/Cairo, Asia/Beirut, …) start DST at exactly 00:00, so on those
+ *  nights local midnight does not exist; the compatible conversion moves it
+ *  forward to the day's first real instant, which is what "the day starts
+ *  here" means on such a night. */
 function localDayStartUtc(date: string, tz: string): string {
-  for (const probe of DAY_START_PROBES) {
-    try {
-      return fromLocalNaive(`${date}T${probe}` as LocalNaive, tz);
-    } catch {
-      // Inside the gap — try the next candidate. Any other failure mode
-      // (malformed date) will fail identically on every probe and fall through
-      // to the last-resort conversion below.
-    }
-  }
-  // Last resort: local noon always exists in every zone; subtracting 12 hours
-  // lands at or just before the true day start, which for an inclusive lower
-  // bound and an exclusive upper bound is the safe direction (never clips a
-  // legitimate candidate).
-  return new Date(Date.parse(fromLocalNaive(`${date}T12:00:00` as LocalNaive, tz)) - 12 * 3_600_000).toISOString();
+  return fromLocalNaiveCompatible(`${date}T00:00:00` as LocalNaive, tz);
 }
 
 /** Add `n` calendar days to a "YYYY-MM-DD" date string. Pure calendar
@@ -131,15 +109,17 @@ export function candidateStarts(
  *  partial tail (e.g. a 45-min candidate touches two 30-min cells, the
  *  second only half-covered). Invitees paint cells; candidates are what
  *  actually get booked — a cell is offered for painting whenever it could
- *  matter to at least one bookable start. */
-export function paintableCells(candidates: string[], durationMin: number): string[] {
+ *  matter to at least one bookable start. Cells sit on the organiser's LOCAL
+ *  half-hour grid in `tz` (the zone candidateStarts used), so in Kathmandu
+ *  (+5:45) a cell is 10:00-10:30 local, not 10:15-10:45. */
+export function paintableCells(candidates: string[], durationMin: number, tz: string): string[] {
   const cellMs = CELL_MINUTES * 60_000;
   const durMs = durationMin * 60_000;
   const cells = new Set<number>();
   for (const c of candidates) {
     const start = Date.parse(c);
     const end = start + durMs;
-    let cellStart = Math.floor(start / cellMs) * cellMs;
+    let cellStart = floorToLocalGrid(start, CELL_MINUTES, tz);
     while (cellStart < end) {
       cells.add(cellStart);
       cellStart += cellMs;

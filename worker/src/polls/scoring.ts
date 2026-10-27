@@ -5,6 +5,7 @@
 // interval math over booking/slots.ts) rather than duplicated as a literal.
 
 import { CELL_MINUTES } from "./grid";
+import { floorToLocalGrid } from "../planning/datetime";
 
 /** Structural mirror of worker/src/planning/solver-contract.ts's FitCurve —
  *  defined locally (not imported) to keep this module dependency-free. */
@@ -194,14 +195,14 @@ export function organiserFit(
 /** The 30-min cell starts that overlap [slotStartUtc, slotStartUtc+durationMin),
  *  including a partial overlap at the tail (e.g. a 45-min slot spans a third
  *  cell it only half-covers) — matches T4's paintable-cell tail rule. Cells
- *  are epoch-aligned (every UTC instant that is a multiple of CELL_MINUTES
- *  from 1970-01-01T00:00Z), so this is well-defined even for a slot start
- *  that isn't itself cell-aligned. */
-function cellsOverlappingSlot(slotStartUtc: string, durationMin: number): string[] {
+ *  are on the organiser's LOCAL half-hour grid in `timeZone`, the same grid
+ *  paintableCells (grid.ts) offers, so this is well-defined even for a slot
+ *  start that isn't itself cell-aligned. */
+function cellsOverlappingSlot(slotStartUtc: string, durationMin: number, timeZone: string): string[] {
   const startMs = Date.parse(slotStartUtc);
   const endMs = startMs + durationMin * 60_000;
   const cellMs = CELL_MINUTES * 60_000;
-  const firstCellStartMs = Math.floor(startMs / cellMs) * cellMs;
+  const firstCellStartMs = floorToLocalGrid(startMs, CELL_MINUTES, timeZone);
   const cells: string[] = [];
   for (let c = firstCellStartMs; c < endMs; c += cellMs) {
     cells.push(new Date(c).toISOString());
@@ -209,16 +210,65 @@ function cellsOverlappingSlot(slotStartUtc: string, durationMin: number): string
   return cells;
 }
 
+const CELL_MS = CELL_MINUTES * 60_000;
+
+/** A response's saved cells on the organiser's CURRENT grid in `timeZone`.
+ *  Saved cells are keyed by their exact UTC start on the grid at save time,
+ *  and the grid moves when the organiser's tz moves between the UTC :00/:30
+ *  lattice (every whole- and half-hour zone) and :15/:45 (Kathmandu, Chatham,
+ *  Eucla). When every saved cell already sits on the current grid, this is a
+ *  copy of the input with misaligned:false, so aligned paint reads exactly
+ *  as saved. Otherwise each current cell a saved cell touches keeps a state
+ *  only if the saved cells overlapping it cover it with no gap: if_needed if
+ *  any of them is, else free. A partly covered cell is unpainted (rounding
+ *  down), so a painted run loses its two half-covered edge cells. */
+export function alignCellsToGrid(
+  saved: ReadonlyMap<string, PaintState>,
+  timeZone: string,
+): { cells: Map<string, PaintState>; misaligned: boolean } {
+  const sorted = [...saved.entries()]
+    .map(([key, state]) => ({ s: Date.parse(key), state }))
+    .sort((a, b) => a.s - b.s);
+  if (sorted.every((c) => floorToLocalGrid(c.s, CELL_MINUTES, timeZone) === c.s)) {
+    return { cells: new Map(saved), misaligned: false };
+  }
+  const targets = new Set<number>();
+  for (const c of sorted) {
+    targets.add(floorToLocalGrid(c.s, CELL_MINUTES, timeZone));
+    targets.add(floorToLocalGrid(c.s + CELL_MS - 1, CELL_MINUTES, timeZone));
+  }
+  const cells = new Map<string, PaintState>();
+  // Saved cells share one length, so sorted by start they are sorted by end
+  // too: `lo` (the first saved cell ending after the target's start) only
+  // moves forward as the targets ascend.
+  let lo = 0;
+  for (const g of [...targets].sort((a, b) => a - b)) {
+    while (lo < sorted.length && sorted[lo]!.s + CELL_MS <= g) lo++;
+    let coveredTo = g;
+    let state: PaintState | undefined;
+    for (let j = lo; j < sorted.length && sorted[j]!.s < g + CELL_MS; j++) {
+      if (sorted[j]!.s > coveredTo) break; // a gap before this saved cell
+      coveredTo = Math.max(coveredTo, sorted[j]!.s + CELL_MS);
+      if (state !== "if_needed") state = sorted[j]!.state;
+    }
+    if (state !== undefined && coveredTo >= g + CELL_MS) cells.set(new Date(g).toISOString(), state);
+  }
+  return { cells, misaligned: true };
+}
+
 /** An invitee covers a slot iff [s, s+d) is a subset of the union of their
  *  painted cells. Weight-relevant state is "if_needed" if any covering cell
- *  is if_needed, else "free"; "none" if any covering cell is unpainted. */
+ *  is if_needed, else "free"; "none" if any covering cell is unpainted. An
+ *  exact key lookup, so `cells` must already be on the organiser's current
+ *  grid in `timeZone` (alignCellsToGrid; rankCandidates aligns at entry). */
 export function inviteeCoverage(
   cells: Map<string, PaintState>,
   slotStartUtc: string,
   durationMin: number,
+  timeZone: string,
 ): CoverageResult {
   let anyIfNeeded = false;
-  for (const cellStart of cellsOverlappingSlot(slotStartUtc, durationMin)) {
+  for (const cellStart of cellsOverlappingSlot(slotStartUtc, durationMin, timeZone)) {
     const state = cells.get(cellStart);
     if (state === undefined) return "none";
     if (state === "if_needed") anyIfNeeded = true;
@@ -243,7 +293,7 @@ export function scoreSlot(
 
   for (const inviteeId of requiredInviteeIds) {
     const cells = cellsById.get(inviteeId) ?? new Map<string, PaintState>();
-    const coverage = inviteeCoverage(cells, slotStartUtc, durationMin);
+    const coverage = inviteeCoverage(cells, slotStartUtc, durationMin, timeZone);
     if (coverage === "none") return null;
     const weight = coverage === "free" ? 1.0 : 0.5;
     weights.push({ inviteeId, weight });
@@ -265,9 +315,13 @@ export function rankCandidates(
   durationMin: number,
   timeZone: string,
 ): CandidateScore[] {
+  // Saved cells are read on the current grid (alignCellsToGrid), once per
+  // response: every ranking (auto-book, deadline, bookBest, near misses, the
+  // organiser's view) goes through here.
+  const aligned = responses.map((r) => ({ ...r, cells: alignCellsToGrid(r.cells, timeZone).cells }));
   const scored: CandidateScore[] = [];
   for (const slotStartUtc of candidates) {
-    const result = scoreSlot(curve, slotStartUtc, durationMin, timeZone, responses, requiredInviteeIds);
+    const result = scoreSlot(curve, slotStartUtc, durationMin, timeZone, aligned, requiredInviteeIds);
     if (result !== null) scored.push({ ...result, slotStartUtc });
   }
   scored.sort((a, b) => {

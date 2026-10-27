@@ -115,6 +115,10 @@ export interface PollStatusPageOptions {
   /** Already capped to the top N by the caller (route.ts) — this file never
    *  slices. Empty for a non-open poll (no live ranking is computed). */
   candidates: CandidateRow[];
+  /** Display names of the non-dropped invitees whose saved cells sat on
+   *  another half-hour grid (the organiser's tz moved between :00/:30 and
+   *  :15/:45 since they responded) and are read by alignCellsToGrid. */
+  realigned: string[];
 }
 
 /** "YYYY-MM-DD HH:MM" in the organiser's home zone — the header line has
@@ -268,6 +272,10 @@ export function renderPollStatusPage(o: PollStatusPageOptions): string {
     o.roster.map(rosterRow).join("") +
     `</table></div>` +
     `<h2>Aggregate</h2>` +
+    (o.realigned.length > 0
+      ? `<p class="muted">Your timezone changed after ${escText(o.realigned.join(", "))} responded, so the grid moved. ` +
+        `Their saved times carry over only where they fully cover a new slot. Nudge them to check.</p>`
+      : "") +
     aggregateTable(o.cells, o.aggregate, o.ownerTz) +
     `<h2>Top candidate times</h2>` +
     candidatesList(o.candidates, o.ownerTz) +

@@ -1,9 +1,15 @@
-import type { Hono } from "hono";
+import type { Context, Hono } from "hono";
 import type { Env } from "../env";
 import type { AppVariables } from "../index-providers";
 import { defaultCalendarProvider, defaultNotificationProvider } from "../index-providers";
 import { OutboundMailCapExceeded, reserveOutboundMail } from "../mail/outbound-cap";
-import type { CalendarProvider } from "../providers/calendar-provider";
+import { getSubjectProvider } from "../auth/identity-store";
+import { cachedEventsReader, type EventsReader } from "../public-read/events-cache";
+import {
+  checkPublicReadIpLimit,
+  PublicReadRateLimitedError,
+  rateLimitedResponse,
+} from "../public-read/rate-limit";
 import type { NotificationProvider } from "../providers/notification-provider";
 import { verifyCapabilityWithEnv, signCapabilityWithEnv } from "../auth/capability";
 import { pollStatusLinkAnchorHolds } from "../auth/identity-rebind";
@@ -30,6 +36,7 @@ import {
 } from "../db/polls";
 import { mintPseudonym } from "./pseudonyms";
 import { candidateStarts, paintableCells, CELL_MINUTES, type CandidateAvailabilityInput } from "./grid";
+import { alignCellsToGrid, type PaintState } from "./scoring";
 import { verifyTurnstile } from "../booking/turnstile";
 import { loadBookingPage } from "../db/booking-page";
 import { getHomeTz } from "../db/users";
@@ -255,7 +262,7 @@ async function assemblePollAvailability(
   db: D1Database,
   env: Env,
   poll: Poll,
-  cal: CalendarProvider,
+  cal: EventsReader,
   now: Date,
 ): Promise<CandidateAvailabilityInput> {
   const owner = poll.subject;
@@ -322,13 +329,16 @@ interface PaintableResult {
   tz: string;
 }
 
-/** The organiser's live paintable cells for this poll, right now. Re-run on
+/** The organiser's paintable cells for this poll, right now. Re-run on
  *  every grid GET and every response PUT (spec decision 9: "live organiser
- *  region, re-validated"). */
+ *  region, re-validated"). Both pass the public read cache's reader, so the
+ *  calendar half can be up to PUBLIC_READ_CACHE_TTL_SECONDS old; the D1 half
+ *  (bookings, pins, hours) is always fresh, and booking (polls/booking.ts)
+ *  re-reads the calendar live before it books anything. */
 async function computePaintable(
   db: D1Database,
   env: Env,
-  cal: CalendarProvider,
+  cal: EventsReader,
   poll: Poll,
   now: Date,
 ): Promise<PaintableResult> {
@@ -340,7 +350,7 @@ async function computePaintable(
     { min_notice_minutes: bookingCfg.min_notice_minutes, buffer_minutes: bookingCfg.buffer_minutes },
     now,
   );
-  return { paintable: paintableCells(candidates, poll.durationMin), tz: availability.tz };
+  return { paintable: paintableCells(candidates, poll.durationMin, availability.tz), tz: availability.tz };
 }
 
 /** Hidden invitees show their pseudonym to EVERYONE — never the real name —
@@ -352,13 +362,58 @@ function inviteeLabel(i: PollInvitee): string {
   return i.hideName || !i.name ? i.pseudonym : i.name;
 }
 
+type PollContext = Context<{ Bindings: Env; Variables: AppVariables }>;
+
+/** The organiser's calendar for an invitee-facing read, through the public
+ *  read cache (one read per organiser, window and colo per TTL). Only the
+ *  grid GET and the response PUT use it: they are driven by whoever holds an
+ *  invitee link, so they are throttled and cached like the booking page's
+ *  slots. A miss spends the poll's per-target budget and throws
+ *  PublicReadRateLimitedError when it is gone. The status page, the poll API
+ *  and booking read live. */
+async function publicPollReader(c: PollContext, poll: Poll, now: Date): Promise<EventsReader> {
+  const provider = await getSubjectProvider(c.env, poll.subject);
+  return cachedEventsReader(
+    c.get("calendarProvider") ?? await defaultCalendarProvider(c.env, poll.subject, provider),
+    {
+      env: c.env,
+      owner: poll.subject,
+      provider,
+      origin: new URL(c.req.url).origin,
+      now,
+      limitTarget: `poll:${poll.id}`,
+    },
+  );
+}
+
+/** The per-IP limit on the invitee-facing reads, checked after the token (a
+ *  bad link is a 401 and spends nothing). The per-poll budget is spent by
+ *  publicPollReader, only on a cache miss. Runbook §L. */
+function pollReadLimited(c: PollContext): Promise<Response | null> {
+  return checkPublicReadIpLimit(c.env, c.req.header("cf-connecting-ip") ?? "");
+}
+
 interface OpenGridPayload {
   paintableCells: string[];
   durationMin: number;
   aggregate: Record<string, { free: number; ifNeeded: number; freeWho: string[]; ifNeededWho: string[] }>;
   respondents: Array<{ label: string; responded: boolean }>;
-  you: { cells: Array<{ cell: string; state: ResponseState }>; hideName: boolean; name: string };
+  /** `realigned`: the viewer's saved cells sat on another half-hour grid
+   *  (the organiser's tz moved across grids since they saved) and `cells` is
+   *  their alignCellsToGrid reading; the page asks them to check it. */
+  you: { cells: Array<{ cell: string; state: ResponseState }>; hideName: boolean; name: string; realigned: boolean };
   ownerTz: string;
+}
+
+/** Each response's saved cells on the organiser's current grid in `tz`
+ *  (alignCellsToGrid), keyed by invitee. */
+function alignedResponses(
+  byInvitee: Array<{ inviteeId: string; cells: Array<{ cellStartUtc: string; state: ResponseState }> }>,
+  tz: string,
+): Map<string, { cells: Map<string, PaintState>; misaligned: boolean }> {
+  return new Map(
+    byInvitee.map((r) => [r.inviteeId, alignCellsToGrid(new Map(r.cells.map((c) => [c.cellStartUtc, c.state])), tz)]),
+  );
 }
 
 /** Assembles the fixed grid-endpoint payload (plan §5 / WAVE-1-seam contract)
@@ -373,9 +428,13 @@ async function buildOpenGridPayload(
   paintable: string[],
   ownerTz: string,
 ): Promise<OpenGridPayload> {
-  const { cellCounts, byInvitee } = await aggregateResponses(db, poll.id);
-  const aggregate: Record<string, { free: number; ifNeeded: number; freeWho: string[]; ifNeededWho: string[] }> = {};
-  for (const c of cellCounts) aggregate[c.cellStartUtc] = { free: c.free, ifNeeded: c.ifNeeded, freeWho: [], ifNeededWho: [] };
+  const { byInvitee } = await aggregateResponses(db, poll.id);
+  // Saved cells are keyed by their UTC start on the grid at save time; read
+  // each response on the current grid (an exact copy unless the organiser's
+  // tz moved between the :00/:30 and :15/:45 lattices since).
+  const aligned = alignedResponses(byInvitee, ownerTz);
+  const cellsOf = (inviteeId: string) =>
+    [...(aligned.get(inviteeId)?.cells ?? new Map<string, PaintState>()).entries()].map(([cellStartUtc, state]) => ({ cellStartUtc, state }));
 
   // R1-F5: listInvitees is ORDER BY email, but this array's order is public
   // (it drives BOTH `respondents` and the freeWho/ifNeededWho arrays below).
@@ -394,14 +453,32 @@ async function buildOpenGridPayload(
     responded: i.respondedAt !== null,
   }));
 
+  // Counts per cell over the non-dropped invitees' aligned cells, in
+  // ascending cell order (what aggregateResponses' cellCounts gives for an
+  // unmoved grid).
+  const counts = new Map<string, { free: number; ifNeeded: number }>();
+  for (const i of invitees) {
+    for (const c of cellsOf(i.id)) {
+      const n = counts.get(c.cellStartUtc) ?? { free: 0, ifNeeded: 0 };
+      if (c.state === "free") n.free++;
+      else n.ifNeeded++;
+      counts.set(c.cellStartUtc, n);
+    }
+  }
+  const aggregate: Record<string, { free: number; ifNeeded: number; freeWho: string[]; ifNeededWho: string[] }> = {};
+  for (const cell of [...counts.keys()].sort()) {
+    const n = counts.get(cell)!;
+    aggregate[cell] = { free: n.free, ifNeeded: n.ifNeeded, freeWho: [], ifNeededWho: [] };
+  }
+
   // Per-cell who-is-free/if-needed labels (decision D3 / M1 hover-who): walk
   // each non-dropped invitee's own painted cells (in the same invitee order
   // as `respondents`, for a stable, deterministic array), appending their
   // label into the matching bucket. `aggregate` already has an entry for
-  // every cell with at least one response (from cellCounts above), so this
+  // every cell with at least one response (from the counts above), so this
   // never needs to create one.
   for (const i of invitees) {
-    const cells = byInvitee.find((b) => b.inviteeId === i.id)?.cells ?? [];
+    const cells = cellsOf(i.id);
     const label = inviteeLabel(i);
     for (const c of cells) {
       const bucket = aggregate[c.cellStartUtc];
@@ -410,11 +487,11 @@ async function buildOpenGridPayload(
     }
   }
 
-  const mine = byInvitee.find((b) => b.inviteeId === invitee.id);
-  const you = {
-    cells: (mine?.cells ?? []).map((c) => ({ cell: c.cellStartUtc, state: c.state })),
+  const you: OpenGridPayload["you"] = {
+    cells: cellsOf(invitee.id).map((c) => ({ cell: c.cellStartUtc, state: c.state })),
     hideName: invitee.hideName,
     name: invitee.name ?? "",
+    realigned: aligned.get(invitee.id)?.misaligned ?? false,
   };
 
   return { paintableCells: paintable, durationMin: poll.durationMin, aggregate, respondents, you, ownerTz };
@@ -527,6 +604,8 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
     const resolved = await resolveInvitee(c.env, c.env.DB, pollId, token);
     if (!resolved) return json({ error: "invalid_token" }, 401);
     const { poll, invitee } = resolved;
+    const limited = await pollReadLimited(c);
+    if (limited) return limited;
 
     // needs_attention (escalated, no common slot) stays unlocked, same as
     // open — invitees may keep revising until the organiser books via the
@@ -534,11 +613,12 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
     if (poll.status !== "open" && poll.status !== "needs_attention") return json({ status: poll.status });
 
     const now = new Date();
-    const cal = c.get("calendarProvider") ?? await defaultCalendarProvider(c.env, poll.subject);
+    const cal = await publicPollReader(c, poll, now);
     let result: PaintableResult;
     try {
       result = await computePaintable(c.env.DB, c.env, cal, poll, now);
     } catch (err) {
+      if (err instanceof PublicReadRateLimitedError) return rateLimitedResponse();
       console.error(`poll ${pollId} grid computation failed:`, String(err));
       return json({ error: "calendar_unavailable" }, 502);
     }
@@ -552,6 +632,12 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
     const resolved = await resolveInvitee(c.env, c.env.DB, pollId, token);
     if (!resolved) return json({ error: "invalid_token" }, 401);
     const { poll, invitee } = resolved;
+    // Per-IP before the body is read: a turned-away save costs no parse, no
+    // calendar read and no write. The per-poll budget is spent only if the
+    // paintable recompute below misses the cache, and that is still before
+    // any write. Either way the client keeps the invitee's selection.
+    const limited = await pollReadLimited(c);
+    if (limited) return limited;
 
     // needs_attention stays unlocked for edits, same as GET /grid — an
     // escalated poll's remedy is the organiser's manual resolveMeetingPoll
@@ -621,11 +707,12 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
     }
 
     const now = new Date();
-    const cal = c.get("calendarProvider") ?? await defaultCalendarProvider(c.env, poll.subject);
+    const cal = await publicPollReader(c, poll, now);
     let result: PaintableResult;
     try {
       result = await computePaintable(c.env.DB, c.env, cal, poll, now);
     } catch (err) {
+      if (err instanceof PublicReadRateLimitedError) return rateLimitedResponse();
       console.error(`poll ${pollId} grid computation failed:`, String(err));
       return json({ error: "calendar_unavailable" }, 502);
     }
@@ -641,10 +728,15 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
     // cell that has since left it, and still rejects a cell that is neither
     // paintable now NOR already saved — that one really is a fresh paint the
     // invitee cannot have.
+    // "Already saved" includes the saved cells as the grid payload showed
+    // them: remapped onto the current grid after an organiser tz move, so a
+    // verbatim resubmit of `you.cells` is never refused for a remapped cell.
     const { byInvitee } = await aggregateResponses(c.env.DB, poll.id);
-    const saved = new Set(
-      (byInvitee.find((b) => b.inviteeId === invitee.id)?.cells ?? []).map((c) => c.cellStartUtc),
-    );
+    const mySaved = byInvitee.find((b) => b.inviteeId === invitee.id)?.cells ?? [];
+    const saved = new Set([
+      ...mySaved.map((c) => c.cellStartUtc),
+      ...alignedResponses([{ inviteeId: invitee.id, cells: mySaved }], result.tz).get(invitee.id)!.cells.keys(),
+    ]);
     const kept = cells.filter((cell) => paintableSet.has(cell.cellStartUtc));
     const offenders = [...new Set(cells.map((cell) => cell.cellStartUtc))].filter(
       (cell) => !paintableSet.has(cell) && !saved.has(cell),
@@ -1054,25 +1146,28 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
       dropped: i.dropped,
     }));
 
-    const { cellCounts, byInvitee } = await aggregateResponses(c.env.DB, poll.id);
-    const cells = cellCounts.map((cc) => cc.cellStartUtc).sort();
-    // Aggregate rows: non-dropped invitees who painted at least one cell —
-    // real names (organiser sees everything), no pseudonym substitution.
-    const aggregate: AggregateRow[] = invitees
-      .filter((i) => !i.dropped)
-      .map((i) => {
-        const mine = byInvitee.find((b) => b.inviteeId === i.id);
-        const statesByCell: Record<string, "free" | "if_needed" | undefined> = {};
-        for (const cell of mine?.cells ?? []) statesByCell[cell.cellStartUtc] = cell.state;
-        return { displayName: nameFor(i), statesByCell };
-      })
-      .filter((row) => Object.keys(row.statesByCell).length > 0);
-
     // Cheap regardless of poll status — the live ranking call below (open
     // and needs_attention only) resolves its own copy internally for
     // scoring, but this page's header line needs a zone even for a
     // booked/cancelled poll, which never calls it.
     const ownerTz = await getHomeTz(c.env.DB, poll.subject, c.env.SCHEDULER_TZ);
+
+    const { byInvitee } = await aggregateResponses(c.env.DB, poll.id);
+    // Read on the organiser's current grid, as the invitee page does.
+    const aligned = alignedResponses(byInvitee, ownerTz);
+    // Aggregate rows: non-dropped invitees who painted at least one cell —
+    // real names (organiser sees everything), no pseudonym substitution.
+    const aggregate: AggregateRow[] = invitees
+      .filter((i) => !i.dropped)
+      .map((i) => {
+        const statesByCell: Record<string, "free" | "if_needed" | undefined> = {};
+        for (const [cell, state] of aligned.get(i.id)?.cells ?? []) statesByCell[cell] = state;
+        return { displayName: nameFor(i), statesByCell };
+      })
+      .filter((row) => Object.keys(row.statesByCell).length > 0);
+    const cells = [...new Set(aggregate.flatMap((row) => Object.keys(row.statesByCell)))].sort();
+    // Non-dropped invitees whose saved cells sat on another grid.
+    const realigned = invitees.filter((i) => !i.dropped && aligned.get(i.id)?.misaligned === true).map(nameFor);
 
     let candidates: CandidateRow[] = [];
     // needs_attention too (matches getMeetingPoll:633) — Card B unlocks
@@ -1123,6 +1218,7 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
         cells,
         aggregate,
         candidates,
+        realigned,
       }),
       { status: 200, headers: htmlHeaders() },
     );

@@ -8,6 +8,14 @@ import {
 
 const PEPPER = "test-pepper";
 
+/** Flip one mid-signature character; see test/capability.test.ts (rewriting
+ *  the final characters can be a no-op, since the last one carries pad bits). */
+function tamperSig(token: string): string {
+  const dot = token.indexOf(".");
+  const i = dot + 1 + Math.floor((token.length - dot - 1) / 2);
+  return token.slice(0, i) + (token[i] === "A" ? "B" : "A") + token.slice(i + 1);
+}
+
 // A token signed with the OLD (pre-poll) accept claims shape, generated once
 // via the unmodified signCapability({planHash, subject, purpose:"accept",
 // ttlSeconds, window}, "test-pepper") and hardcoded here as a byte-compatibility
@@ -67,6 +75,6 @@ describe("capability tokens — poll purpose", () => {
       { purpose: "poll-response", pollId: "p_abc", inviteeId: "pi_123", subject: "org@example.com", ttlSeconds: 60 },
       PEPPER,
     );
-    expect(await verifyCapability(t.slice(0, -2) + "xx", PEPPER)).toBeNull();
+    expect(await verifyCapability(tamperSig(t), PEPPER)).toBeNull();
   });
 });

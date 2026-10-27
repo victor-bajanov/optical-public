@@ -1,6 +1,7 @@
 import { test, fc } from "@fast-check/vitest";
 import { describe, expect } from "vitest";
 import { materialiseTemplate, type TemplateRow } from "../../src/recurrence/materialise";
+import { localWeekWindow } from "../../src/planning/datetime";
 
 const TZS = ["UTC", "Australia/Sydney", "America/New_York", "Asia/Kolkata", "Pacific/Chatham"];
 const RRULES = [
@@ -26,15 +27,19 @@ function tpl(rrule: string, pinned_time: string | null): TemplateRow {
   };
 }
 
-// A fixed week-long window; varied across a year to span DST in Step assertions.
-const WINDOW_START = "2026-06-15T00:00:00Z";
-const WINDOW_END = "2026-06-22T00:00:00Z";
+// The window production hands the sweep: the user's own local week (here the
+// week of Mon 2026-06-15 in each zone), so its local dates are Mon..Sun
+// everywhere.
+function windowFor(tz: string): { start: string; end: string } {
+  return localWeekWindow("2026-06-17T12:00:00Z", tz);
+}
 
-// materialise can legitimately throw on a DST spring-forward gap for a given tz;
-// discard those samples so the property only judges non-throwing runs.
+// Discard a sample that throws (no sample should: a pin inside a DST gap now
+// shifts forward) so the property only judges non-throwing runs.
 function safeMat(t: TemplateRow, tz: string, existing = new Set<string>(), excluded = new Set<string>()) {
+  const w = windowFor(tz);
   try {
-    return materialiseTemplate(t, WINDOW_START, WINDOW_END, existing, tz, excluded);
+    return materialiseTemplate(t, w.start, w.end, existing, tz, excluded);
   } catch {
     // fc.pre(false) aborts this sample as a precondition failure. It is typed
     // `asserts expectTruthy`, so tsc treats everything after it as unreachable —
@@ -45,7 +50,7 @@ function safeMat(t: TemplateRow, tz: string, existing = new Set<string>(), exclu
 
 describe("materialiseTemplate — properties", () => {
   test.prop([rruleArb, pinArb, tzArb, tzArb])(
-    "occurrence_date set is tz-invariant (RC1)",
+    "occurrence_date set over the user's local week is tz-invariant (RC1)",
     (rrule, pin, tzA, tzB) => {
       const t = tpl(rrule, pin);
       const a = safeMat(t, tzA).map((r) => r.occurrence_date).sort();
@@ -60,7 +65,8 @@ describe("materialiseTemplate — properties", () => {
       const t = tpl(rrule, pin);
       const first = safeMat(t, tz);
       const existing = new Set(first.map((r) => r.occurrence_date));
-      const second = materialiseTemplate(t, WINDOW_START, WINDOW_END, existing, tz);
+      const w = windowFor(tz);
+      const second = materialiseTemplate(t, w.start, w.end, existing, tz);
       expect(second).toEqual([]);
     },
   );
