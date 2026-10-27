@@ -192,6 +192,10 @@ describe("poll-sweep cron at the cap", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
     await upsertUser(env.DB, OWNER);
+    // The sweep skips an organiser holding no stored credential (card C8).
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at) VALUES (?, X'01', 's', '2026-01-01T00:00:00Z')",
+    ).bind(OWNER).run();
     const poll = await dbCreatePoll(env.DB, {
       subject: OWNER, title: "Kickoff", durationMin: 30, rangeStart: "2026-08-01", rangeEnd: "2026-08-31",
       deadlineUtc: "2026-08-20T00:00:00Z", location: { kind: "gmeet" }, guestTokenHash: null, now: "2026-08-01T00:00:00Z",
@@ -222,6 +226,10 @@ describe("poll-sweep cron at the cap", () => {
   it("skips the whole nudge (no partial rotation) when only some non-responders fit", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     await upsertUser(env.DB, OWNER);
+    // The sweep skips an organiser holding no stored credential (card C8).
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at) VALUES (?, X'01', 's', '2026-01-01T00:00:00Z')",
+    ).bind(OWNER).run();
     const poll = await dbCreatePoll(env.DB, {
       subject: OWNER, title: "Kickoff", durationMin: 30, rangeStart: "2026-08-01", rangeEnd: "2026-08-31",
       deadlineUtc: "2026-08-20T00:00:00Z", location: { kind: "gmeet" }, guestTokenHash: null, now: "2026-08-01T00:00:00Z",
@@ -325,5 +333,33 @@ describe("guest-join at the organiser's cap (drain scenario)", () => {
     expect(inner.sentPollEmails).toHaveLength(0);
     const rows = await env.DB.prepare("SELECT email, token_hash FROM poll_invitees WHERE poll_id = ?").bind(poll.id).all<{ email: string; token_hash: string }>();
     expect(rows.results).toEqual([{ email: "victim@example.com", token_hash: "h-victim" }]);
+  });
+});
+
+describe("the organiser's login_email is self under the cap (identity port of #105)", () => {
+  const LOGIN = "cap-owner-now@example.com";
+
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+    ).bind(OWNER, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-cap-owner", LOGIN).run();
+  });
+  afterEach(async () => {
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+  });
+
+  it('with OUTBOUND_MAIL_DAILY_CAP="0" a poll whose only invitee is the organiser\'s login_email (any case) is created, sent and not counted', async () => {
+    const mock = new MockNotificationProvider();
+    const capped = withOutboundMailCap({ ...TEST_ENV, OUTBOUND_MAIL_DAILY_CAP: "0" }, OWNER, mock);
+    const res = await makeApp(capped).request("/v1/polls", {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ ...BODY, invitees: [{ email: LOGIN.toUpperCase() }] }),
+    }, { ...TEST_ENV, OUTBOUND_MAIL_DAILY_CAP: "0" });
+    expect(res.status).toBe(201);
+    expect(mock.sentPollEmails).toHaveLength(1);
+    const row = await env.DB.prepare("SELECT count FROM outbound_mail_counts WHERE subject = ?").bind(OWNER).first();
+    expect(row).toBeNull();
   });
 });

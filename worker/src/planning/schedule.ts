@@ -40,7 +40,10 @@ export function mountScheduleRoute(
     // committed plan, never the globally-latest one.
     const plan = await getLatestCommittedPlanForSubject(c.env.DB, owner);
     if (!plan) return c.json({ error: "no_committed_plan" }, 404);
-    const body = plan.body as z.infer<typeof PlanBodySchema>;
+    // body.warnings carries other people's event titles ("<summary>: <code>")
+    // and is not part of PlanBodySchema: never serve it (the daily cleanup
+    // also scrubs it from committed rows).
+    const { warnings: _warnings, ...body } = plan.body as z.infer<typeof PlanBodySchema> & { warnings?: unknown };
     // The committed plan is a snapshot: a task deleted after commit (its chunk
     // events already removed by DELETE /v1/tasks/{id}) would otherwise linger
     // here until the next commit, which an empty-diff plan can't produce on

@@ -40,7 +40,9 @@ dev binding correctly.
 
 Always apply migrations BEFORE the deploy, in every env. Migration **0041**
 (`users.retention_warned_at`) is load-bearing: `requireBearer` reads the
-column, so deploying ahead of it fails every bearer call.
+column, so deploying ahead of it fails every bearer call. Migration **0046**
+(`identity_tokens.login_email`) is load-bearing too: every sign-in writes it
+and every owner email reads it.
 
 Dev is fully isolated from prod: own D1 (`scheduler-dev`), KV, Durable Objects,
 and the `scheduler-dev.example.com` custom domain.
@@ -143,7 +145,9 @@ runbook §O for the full nOAuth rationale and the deploy gate that must be
 cleared before this reaches an env with existing Microsoft users. Signing
 in with the other provider under the same email resets that subject's
 calendar sync state and done marker (provider switch is now safe, not
-destructive-but-silent) — see runbook §O for what a switch does and does
+destructive-but-silent), and kills the account's emailed accept links and
+poll status links, which are bound to the identity anchor that minted them
+— see runbook §O for what a switch does and does
 not clean up. With `REFUSE_PROVIDER_REBIND="true"` the switch (and a
 same-provider rebind) is refused instead with an "Account already linked"
 page; see runbook §S.
@@ -153,7 +157,11 @@ A user's internal identity is anchored on the provider's immutable subject
 mutable email/UPN a login carries; email is display/admission only, so a
 renamed Entra UPN or Google address no longer strands the account under a
 new empty user — see runbook §O ("Identity anchor: provider subject") for
-the resolution rules and the drift log line.
+the resolution rules and the drift log line. Each sign-in also stores its
+verified email as `identity_tokens.login_email` (migration 0046). Owner mail,
+the Gmail `From` and the poll organiser name use it (falling back to the
+subject when it is NULL), so a renamed user's mail follows the new address
+after their next sign-in. Membership and every key stay on the subject.
 
 `MICROSOFT_MAIL_READ_SCOPE_ENABLED` (default unset/"false") appends
 `https://graph.microsoft.com/Mail.Read` to the Microsoft OAuth scope list —
@@ -444,6 +452,12 @@ its own Google OAuth client: Google's revoke removes the whole user-to-client
 grant, so deployments sharing a client would revoke each other's users.
 Runbook "Plan 4 cutover" §4.
 
+**Raw-token route.** `CALENDAR_RAW_TOKEN_ENABLED` (default off; exactly
+"true" enables) gates `GET /v1/calendar-access-token`; off is a 404 before
+auth, like `SELF_SERVE_DELETE_ENABLED`. Only the smoke deployments set
+"true" (the harnesses need it: `RawTokenRouteDisabled` otherwise); prod and
+trial set "false". Runbook "Auth model".
+
 **Retention warning.** The `RETENTION_DAYS` (R) sweep emails a warning at
 `max(R−14, 1)` days idle and deletes only once the warning is ≥ 14 UTC days
 old; any activity clears it. Migration **0041**
@@ -477,12 +491,14 @@ stamped on the first run, never mass-deleted. The sweep also logs
 and `optical-admin list-users` flags them `overdue_unwarned`. Runbook
 "Account lifecycle", "Purge window".
 
-**Agentic safety (runbook §S).** Apply migrations **0042–0045**
+**Agentic safety (runbook §S).** Apply migrations **0042–0046**
 BEFORE deploying: without 0043 every sign-in fails (`touchLastSeen` writes
 `users.deactivated_at`); without 0045 (`pending_actions.mail_channel`) a
 gated op whose own-mailbox confirm send fails 500s at the system-mail
 fallback. 0042 and 0045 also back `replanNow` for every client in every env:
-on an unmigrated D1 any `replanNow` that sends mail returns 500.
+on an unmigrated D1 any `replanNow` that sends mail returns 500. Without
+0046 (`identity_tokens.login_email`) every sign-in (the store upsert writes
+it) and every owner email (`ownerNotificationEmail` reads it) fails.
 - *Agent-confirm.* `AGENT_CONFIRM_CLIENT_IDS` (unset = nobody gated; "*" =
   every OAuth client) lists the clients whose consequential ops answer
   `202 awaiting_confirmation` and run only after the user confirms an
@@ -508,14 +524,36 @@ on an unmigrated D1 any `replanNow` that sends mail returns 500.
   invites and system mail aren't counted.
 - *Untrusted fields.* Response fields carrying third-party text are tagged
   `x-optical-untrusted: true` in the spec, and render snapshots returned over
-  the API show others' event titles as "Busy".
+  the API show others' event titles as "Busy". A plan loses
+  `render_snapshot` and `body.warnings` when it is accepted (the daily cleanup
+  backfills, and also prunes expired `pending_actions`). `GET /v1/schedule` and `GET
+  /v1/plans/{hash}` strip `body.warnings` on read.
 - *Delisted users.* With `MEMBERSHIP_ALLOWLIST` set, every cron, webhook
   replan and public page (booking, poll, feed, accept and confirm links)
   does nothing for a subject not on it (`delisted_skip {path}`); retention
   and the purge still run.
 - *Provider rebind refusal.* `REFUSE_PROVIDER_REBIND` (default off; exactly
   "true" enables) refuses a sign-in whose email belongs to an account bound
-  to a different provider subject or provider; release is an offboard.
+  to a different provider subject or provider. To release it, an operator
+  runs the admin rebind (`bin/optical-admin.py rebind <email> --env E --yes`,
+  `POST /admin/identity-rebind`). It clears the anchor so the next sign-in
+  as that address binds whoever holds it, so confirm who that is first, and
+  ends the account's sessions like offboard and wipes its stored refresh
+  credential, so the account is idle until the next sign-in (connected
+  clients re-authorise, confirm links die, resolve/replanNow answer `409
+  identity_credential_missing`; with `UPSTREAM_REVOKE_ENABLED` the grant is
+  revoked at the IdP too). It also deletes pending plans, revokes calendar feed
+  URLs (recreate them), and kills emailed accept links and organiser poll
+  status links (bound to the identity anchor). Accept links minted before that
+  build carry no anchor and live up to 72 h, so don't rebind within 72 h of
+  deploying it. The booking page stays published for the next holder. Use it
+  only where the flag is on. It answers
+  `409 subject_drifted` when the owner now signs in under another address
+  (`--force` overrides, after confirming ownership) and
+  `409 concurrent_update` when a sign-in raced it (re-run). Runbook §S
+  "Admin rebind". Smoke: `bin/identity-smoke.py` (A, the admin, rebinds a
+  test account B, which then signs in again in a browser; B needs a re-mint
+  afterwards).
 - *Scope valve.* `REQUIRE_EXACT_PROVIDER_SCOPES` (default: require exact
   provider scopes; only "false" relaxes it) lets a partial grant through
   instead of refusing it. With `DEBUG_LOG="true"` the callback logs the raw

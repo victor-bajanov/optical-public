@@ -45,6 +45,7 @@ import {
   type PaintState,
 } from "./scoring";
 import { renderEscalationEmail, renderBookingNoticeEmail, renderPollBookedEmail, type NearMissSlot } from "./emails";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 export type BookOutcome = { ok: true; eventId: string } | { ok: false; reason: string };
 
@@ -354,7 +355,7 @@ async function escalate(
       nearMisses,
       organiserTz: tz,
     });
-    await notification.sendPollEmail({ to: fresh.subject, ...email });
+    await notification.sendPollEmail({ to: await ownerNotificationEmail(env.DB, fresh.subject), ...email });
   }
   // A lost CAS here means a concurrent booking landed in the microsecond
   // window between the fresh-status check above and this write — one
@@ -639,7 +640,8 @@ async function bookPollSlotInternal(
     const content = renderBookingNoticeEmail({
       pollId: poll.id,
       pollTitle: poll.title,
-      organiserName: poll.subject,
+      // The owner's current address, never the subject (db/owner-email.ts).
+      organiserName: await ownerNotificationEmail(db, poll.subject),
       durationMin: poll.durationMin,
       slotStartUtc,
       slotEndUtc: endUtc,
@@ -697,7 +699,7 @@ async function bookPollSlotInternal(
       hiddenFailedNames,
     });
     const orgNotification = await resolveNotification(env, poll.subject);
-    await orgNotification.sendPollEmail({ to: poll.subject, ...content });
+    await orgNotification.sendPollEmail({ to: await ownerNotificationEmail(env.DB, poll.subject), ...content });
   } catch (err) {
     // Non-fatal, same reasoning as the hidden-invitee notice above: the
     // booking already succeeded. Logged by poll id only.

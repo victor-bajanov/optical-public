@@ -706,3 +706,54 @@ describe("plan-commit markers free their live-cap slot (decision K, final review
     expect(n?.n).toBe(20);
   });
 });
+
+// Owner mail goes to the latest verified sign-in address (login_email,
+// migration 0046), never the bare subject, which an IdP rename can hand to
+// someone else; NULL falls back to the subject. The marker row stays keyed
+// on the subject.
+describe("gated commit: accept email recipient (ownerNotificationEmail)", () => {
+  async function seedIdentity(loginEmail: string | null) {
+    await env.DB.prepare("DELETE FROM identity_tokens").run();
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+    ).bind(OWNER, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-o", loginEmail).run();
+  }
+  afterEach(async () => { await env.DB.prepare("DELETE FROM identity_tokens").run(); });
+
+  for (const [label, loginEmail, expected] of [
+    ["login_email set", "owner-now@example.com", "owner-now@example.com"],
+    ["login_email NULL", null, OWNER],
+  ] as const) {
+    it(`own-mailbox accept email goes to ${expected} (${label})`, async () => {
+      await seedIdentity(loginEmail);
+      await seedPlan("h1");
+      const { app, notify } = makeApp();
+      const res = await commit(app, await seedBearer("tok"), "h1");
+      expect(res.status).toBe(202);
+      expect((notify as MockNotificationProvider).sent.map((m) => m.to)).toEqual([expected]);
+      const owners = await env.DB.prepare("SELECT owner_subject FROM pending_actions").all<{ owner_subject: string }>();
+      expect(owners.results.map((r) => r.owner_subject)).toEqual([OWNER]);
+    });
+
+    it(`system-mail fallback goes to ${expected} (${label})`, async () => {
+      await seedIdentity(loginEmail);
+      await seedPlan("h1");
+      const failing: NotificationProvider = {
+        sendReplanNotification: async () => { throw new Error("gmail 500"); },
+        sendPollEmail: async () => {},
+      };
+      const sends: Array<{ to: string[] }> = [];
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (_i: RequestInfo | URL, init?: RequestInit) => {
+        sends.push(JSON.parse(String(init!.body)));
+        return new Response(JSON.stringify({ data: { succeeded: 1, failed: 0 } }), { status: 200 });
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const { app } = makeApp(new MockCalendarProvider(), failing);
+      const res = await commit(app, await seedBearer("tok"), "h1", {
+        ...GATED, SYSTEM_MAIL_ENABLED: "true", SYSTEM_MAIL_FROM: "Optical <o@example.test>", SYSTEM_MAIL_API_KEY: "k",
+      });
+      expect(res.status).toBe(202);
+      expect(sends.map((s) => s.to)).toEqual([[expected]]);
+    });
+  }
+});

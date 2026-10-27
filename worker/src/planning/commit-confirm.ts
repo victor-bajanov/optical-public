@@ -21,6 +21,7 @@ import type { Env } from "../env";
 import type { AppVariables } from "../index-providers";
 import { defaultNotificationProvider } from "../index-providers";
 import { signCapabilityWithEnv } from "../auth/capability";
+import { identityAnchorTag } from "../auth/identity-rebind";
 import { AwaitingConfirmationResponse, confirmationResponses } from "../confirm/defer";
 import { sendPlanAcceptEmailOnce } from "../confirm/plan-mail";
 import { computePlanDiff, type PlanBody } from "../diff/compute-diff";
@@ -90,7 +91,10 @@ export async function deferPlanCommit(c: Ctx, plan: ProposedPlanRow, owner: stri
   }
   const window = plan.body.window as { start: string; end: string };
   const token = await signCapabilityWithEnv(
-    { purpose: "accept", planHash: plan.plan_hash, subject: owner, ttlSeconds: ACCEPT_TTL_SECONDS, window },
+    {
+      purpose: "accept", planHash: plan.plan_hash, subject: owner, ttlSeconds: ACCEPT_TTL_SECONDS, window,
+      anchor: await identityAnchorTag(c.env, owner),
+    },
     c.env,
   );
   const expiresAt = new Date(Math.min(Date.now() + ACCEPT_TTL_SECONDS * 1000, Date.parse(plan.expires_at))).toISOString();
@@ -106,9 +110,9 @@ export async function deferPlanCommit(c: Ctx, plan: ProposedPlanRow, owner: stri
     planHash: plan.plan_hash,
     expiresAt,
     logOp: op,
-    viaProvider: async () => {
+    viaProvider: async (to) => {
       const notify = c.var.notificationProvider ?? await defaultNotificationProvider(c.env, owner);
-      await notify.sendReplanNotification(owner, model, { acceptUrl, planHash: plan.plan_hash });
+      await notify.sendReplanNotification(to, model, { acceptUrl, planHash: plan.plan_hash });
     },
     // Static copy and the link only: the plan's titles stay off the
     // third-party system mailer, and the page behind the link shows them.

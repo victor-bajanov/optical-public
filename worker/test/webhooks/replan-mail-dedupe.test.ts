@@ -235,3 +235,114 @@ describe("replanNow accept-email dedupe and caps (decision L)", () => {
     expect((await markers())[0]!.mail_channel).toBe("system");
   });
 });
+
+// Owner mail goes to the latest verified sign-in address (login_email,
+// migration 0046), never the bare subject; NULL falls back to the subject.
+// Both webhook paths, and the system fallback of the deduped one.
+describe("replan email recipient (ownerNotificationEmail)", () => {
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-18T00:00:00.000Z"));
+    await seedDb();
+    await env.DB.prepare("DELETE FROM pending_actions").run();
+    await env.DB.prepare("DELETE FROM identity_tokens").run();
+  });
+  afterEach(async () => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    await env.DB.prepare("DELETE FROM identity_tokens").run();
+  });
+
+  async function seedIdentity(loginEmail: string | null) {
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+    ).bind("primary", new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-p", loginEmail).run();
+  }
+
+  for (const [label, loginEmail, expected] of [
+    ["login_email set", "owner-now@example.com", "owner-now@example.com"],
+    ["login_email NULL", null, "primary"],
+  ] as const) {
+    it(`no-dedupe webhook replan mails ${expected} (${label})`, async () => {
+      await seedIdentity(loginEmail);
+      const notify = new MockNotificationProvider();
+      const r = await run(notify);
+      if (r.kind !== "replanned") throw new Error(r.kind);
+      expect(notify.sent.map((s) => s.to)).toEqual([expected]);
+    });
+
+    it(`deduped (replanNow) replan mails ${expected} (${label}); the marker stays keyed on the subject`, async () => {
+      await seedIdentity(loginEmail);
+      const notify = new MockNotificationProvider();
+      const r = await run(notify, { dedupeMail: true });
+      if (r.kind !== "replanned") throw new Error(r.kind);
+      expect(r.sent).toBe(true);
+      expect(notify.sent.map((s) => s.to)).toEqual([expected]);
+      expect(await markers()).toHaveLength(1);
+    });
+
+    it(`deduped replan's system fallback mails ${expected} (${label})`, async () => {
+      await seedIdentity(loginEmail);
+      const failing: NotificationProvider = {
+        sendReplanNotification: async () => { throw new Error("gmail 500"); },
+        sendPollEmail: async () => {},
+      };
+      const sends: Array<{ to: string[] }> = [];
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (_i: RequestInfo | URL, init?: RequestInit) => {
+        sends.push(JSON.parse(String(init!.body)));
+        return new Response(JSON.stringify({ data: { succeeded: 1, failed: 0 } }), { status: 200 });
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const r = await run(failing, {
+        dedupeMail: true,
+        env: { SYSTEM_MAIL_ENABLED: "true", SYSTEM_MAIL_FROM: "Optical <o@example.test>", SYSTEM_MAIL_API_KEY: "k" },
+      });
+      if (r.kind !== "replanned") throw new Error(r.kind);
+      expect(r.sent).toBe(true);
+      expect(sends.map((b) => b.to)).toEqual([[expected]]);
+    });
+  }
+});
+
+// CR4: sendPlanAcceptEmailOnce reads the owner's address before reserving the
+// plan.commit-mail marker. A D1 error on that read must not leave a marker,
+// or every retry is deduped onto an email that was never sent.
+describe("replanNow: a failed owner-address read reserves no marker", () => {
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-18T00:00:00.000Z"));
+    await seedDb();
+    await env.DB.prepare("DELETE FROM pending_actions").run();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function failingLoginEmailDb(db: D1Database): D1Database {
+    return new Proxy(db, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            if (/SELECT login_email FROM identity_tokens/.test(sql)) throw new Error("D1 unavailable");
+            return target.prepare(sql);
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+  }
+
+  it("leaves no marker, and a retry with a healthy DB mails exactly once", async () => {
+    const notify = new MockNotificationProvider();
+    await expect(run(notify, { dedupeMail: true, env: { DB: failingLoginEmailDb(env.DB) } })).rejects.toThrow("D1 unavailable");
+    expect(await markers()).toHaveLength(0);
+    expect(notify.sent).toHaveLength(0);
+
+    const r = await run(notify, { dedupeMail: true });
+    if (r.kind !== "replanned") throw new Error(r.kind);
+    expect(r.sent).toBe(true);
+    expect(notify.sent).toHaveLength(1);
+  });
+});

@@ -145,3 +145,18 @@ describe("graph-event-mapping", () => {
     });
   });
 });
+
+describe("toCalendarEventFromGraph read minimisation", () => {
+  it("drops body, bodyPreview and location: no reader consumes them (write-only fields)", () => {
+    const e = toCalendarEventFromGraph({
+      ...base,
+      body: { contentType: "html", content: "<p>secret agenda</p>" },
+      bodyPreview: "secret agenda",
+      location: { displayName: "Board room 4" },
+    } as Parameters<typeof toCalendarEventFromGraph>[0]);
+    expect(Object.keys(e)).not.toContain("description");
+    expect(Object.keys(e)).not.toContain("location");
+    expect(JSON.stringify(e)).not.toContain("secret agenda");
+    expect(JSON.stringify(e)).not.toContain("Board room 4");
+  });
+});

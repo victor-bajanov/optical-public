@@ -218,6 +218,21 @@ class GatedCalendar extends MockCalendarProvider {
 let calendar: MockCalendarProvider;
 let notification: MockNotificationProvider;
 
+// identity port of #105: after an IdP-side rename the subject is the owner's
+// OLD address; owner mail and the organiser name use login_email.
+const OWNER_NOW = "poll-book-now@example.com";
+
+async function seedOwnerLoginEmail(loginEmail: string | null): Promise<void> {
+  await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+  await env.DB.prepare(
+    "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+  ).bind(OWNER, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-owner", loginEmail).run();
+}
+
+async function clearOwnerLoginEmail(): Promise<void> {
+  await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+}
+
 beforeEach(async () => {
   for (const t of ["polls", "poll_invitees", "poll_responses", "bookings", "config_booking_page"]) {
     await env.DB.prepare(`DELETE FROM ${t} WHERE 1=1`).run();
@@ -417,6 +432,37 @@ describe("D2: hidden invitees excluded from the booked event's attendees", () =>
 });
 
 describe("empty intersection — escalation", () => {
+  async function escalateTwoDisjoint(): Promise<void> {
+    const poll = await makePoll();
+    const a = await addInvitee(poll.id, "a@x.com", "Alice");
+    const b = await addInvitee(poll.id, "b@x.com", "Bob");
+    await paintOnly(a.id, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z");
+    await paintOnly(b.id, "2026-08-11T00:00:00Z", "2026-08-11T02:00:00Z");
+    await markResponded(env.DB, a.id, NOW.toISOString());
+    await markResponded(env.DB, b.id, NOW.toISOString());
+    await maybeBookOnAllIn(env, poll.id);
+  }
+
+  it("addresses the escalation email to the organiser's login_email, not the subject", async () => {
+    await seedOwnerLoginEmail(OWNER_NOW);
+    try {
+      await escalateTwoDisjoint();
+      expect(notification.sentPollEmails.map((e) => e.to)).toEqual([OWNER_NOW]);
+    } finally {
+      await clearOwnerLoginEmail();
+    }
+  });
+
+  it("addresses the escalation email to the subject when login_email is NULL", async () => {
+    await seedOwnerLoginEmail(null);
+    try {
+      await escalateTwoDisjoint();
+      expect(notification.sentPollEmails.map((e) => e.to)).toEqual([OWNER]);
+    } finally {
+      await clearOwnerLoginEmail();
+    }
+  });
+
   it("escalates exactly once (idempotent stamp + single email) even when re-attempted after being reopened", async () => {
     const poll = await makePoll();
     const a = await addInvitee(poll.id, "a@x.com", "Alice");
@@ -1128,6 +1174,45 @@ describe("F3: cancel-during-book", () => {
 });
 
 describe("T-notify: organiser booked notification", () => {
+  it("addresses the booked email to the organiser's login_email, not the subject", async () => {
+    await seedOwnerLoginEmail(OWNER_NOW);
+    try {
+      const poll = await makePoll({ title: "Launch review" });
+      const a = await addInvitee(poll.id, "a@x.com", "Alice");
+      await paintWholeWindow(a.id);
+      await markResponded(env.DB, a.id, NOW.toISOString());
+      await maybeBookOnAllIn(env, poll.id);
+      expect((await getPoll(env.DB, poll.id))!.status).toBe("booked");
+      const booked = notification.sentPollEmails.filter((e) => e.subject.includes("Launch review"));
+      expect(booked.map((e) => e.to)).toEqual([OWNER_NOW]);
+      expect(notification.sentPollEmails.some((e) => e.to === OWNER)).toBe(false);
+    } finally {
+      await clearOwnerLoginEmail();
+    }
+  });
+
+  it("names the organiser in a hidden invitee's booking notice by login_email, never the subject", async () => {
+    await seedOwnerLoginEmail(OWNER_NOW);
+    try {
+      const poll = await makePoll({ title: "Team sync" });
+      const a = await addInvitee(poll.id, "a@x.com", "Alice");
+      const b = await addInvitee(poll.id, "b@x.com", "Bob");
+      await setHideName(env.DB, b.id, true);
+      await paintWholeWindow(a.id);
+      await paintWholeWindow(b.id);
+      await markResponded(env.DB, a.id, NOW.toISOString());
+      await markResponded(env.DB, b.id, NOW.toISOString());
+      await maybeBookOnAllIn(env, poll.id);
+      const notices = notification.sentPollEmails.filter((e) => e.to === "b@x.com");
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.text).toContain(OWNER_NOW);
+      expect(notices[0]!.text).not.toContain(OWNER);
+      expect(notices[0]!.html).not.toContain(OWNER);
+    } finally {
+      await clearOwnerLoginEmail();
+    }
+  });
+
   it("emails the organiser after a successful booking, naming the slot, duration, and attendees", async () => {
     const poll = await makePoll({ title: "Launch review" });
     const a = await addInvitee(poll.id, "a@x.com", "Alice");

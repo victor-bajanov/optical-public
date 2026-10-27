@@ -152,16 +152,21 @@ export async function deletePendingAction(db: D1Database, id: string, owner: str
   await db.prepare("DELETE FROM pending_actions WHERE id = ? AND owner_subject = ?").bind(id, owner).run();
 }
 
-/** Housekeeping run at every deferral, across all owners (an owner who never
- *  defers again still gets cleaned): blank every expired row's data, and
- *  delete rows a week past expiry, consumed or not. */
-export async function pruneExpiredPendingActions(db: D1Database, now: Date): Promise<void> {
+/** Housekeeping across all owners, run at every deferral and by the daily
+ *  CLEANUP_CRON (so an idle deployment still gets cleaned): blank every
+ *  expired row's data, and delete rows a week past expiry, consumed or not.
+ *  Returns the row counts each statement changed. */
+export async function pruneExpiredPendingActions(
+  db: D1Database,
+  now: Date,
+): Promise<{ deleted: number; blanked: number }> {
   const iso = now.toISOString();
   const cutoff = new Date(now.getTime() - PENDING_ACTION_PRUNE_GRACE_MS).toISOString();
-  await db.batch([
+  const [del, blank] = await db.batch([
     db.prepare("DELETE FROM pending_actions WHERE expires_at < ?").bind(cutoff),
     db.prepare("UPDATE pending_actions SET payload = '', summary = '' WHERE expires_at <= ? AND (payload != '' OR summary != '')").bind(iso),
   ]);
+  return { deleted: del?.meta.changes ?? 0, blanked: blank?.meta.changes ?? 0 };
 }
 
 /** Blank one expired row's data the moment a link reaches it. */

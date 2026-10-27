@@ -5,6 +5,9 @@ export const CalendarEventSchema = z.object({
   summary: z.string(),
   start: z.string(),
   end: z.string(),
+  // location/description are WRITE-ONLY: createEvent/updateEvent send them,
+  // but no provider populates them on read (both fetch only the fields their
+  // mappers consume: GOOGLE_EVENT_ITEM_FIELDS / GRAPH_EVENT_SELECT).
   location: z.string().optional(),
   description: z.string().optional(),
   colorId: z.string().optional(),

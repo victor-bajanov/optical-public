@@ -108,6 +108,30 @@ describe("runBookingDeclineSweep — happy path", () => {
     expect(notify.sentPollEmails[1]!.text).toContain("Sam Booker");
   });
 
+  // Owner mail goes to the latest verified sign-in address (login_email,
+  // migration 0046), never the bare subject; NULL falls back to the subject.
+  // The booker's address is unchanged.
+  for (const [label, loginEmail, expected] of [
+    ["login_email set", "owner-now@example.com", "owner-now@example.com"],
+    ["login_email NULL", null, OWNER],
+  ] as const) {
+    it(`emails the booker at sam@ and the owner at ${expected} (${label})`, async () => {
+      await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+      await env.DB.prepare(
+        "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+      ).bind(OWNER, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-owner", loginEmail).run();
+      try {
+        const id = await seedDueBooking("gcal-owner-addr", "2026-08-19T00:00:00Z");
+        const cal = new MockCalendarProvider({ events: [declinedEvent("gcal-owner-addr", id)] });
+        const notify = new MockNotificationProvider();
+        await runBookingDeclineSweep(TEST_ENV, new Date("2026-08-19T00:11:00Z"), deps(cal, notify));
+        expect(notify.sentPollEmails.map((e) => e.to)).toEqual(["sam@x.com", expected]);
+      } finally {
+        await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+      }
+    });
+  }
+
   // Regression: the row's own start_utc can go stale (an owner manually
   // dragging the event in Google leaves it untouched — only Optical's own
   // relocation calls syncBookingTime). The re-fetched LIVE event is already

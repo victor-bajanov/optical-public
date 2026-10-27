@@ -4,7 +4,7 @@ import { offboardUser } from "../../src/lifecycle/offboard";
 import { upsertUser, getUser, seedDoneColorIdIfUnset } from "../../src/db/users";
 import { OPTICAL_DONE_CATEGORY } from "../../src/providers/graph-event-mapping";
 import { ProviderDisabledError } from "../../src/index-providers";
-import { storeIdentityTokens } from "../../src/auth/identity-store";
+import { storeIdentityTokens, cacheAccessToken, readCachedAccessToken } from "../../src/auth/identity-store";
 import { MockCalendarProvider } from "../../src/providers/mock-calendar-provider";
 import { OPTICAL_DEPLOYMENT_KEY } from "../../src/providers/types";
 // Vite ?raw import resolves to the file's string contents at build time, same
@@ -48,7 +48,9 @@ async function seedSubject() {
     .bind("ch1", "c1", "auth", "scheduler:read", "2099-01-01T00:00:00Z", SUBJECT).run();
   await env.DB.prepare("INSERT INTO calendar_sync (owner_subject, calendar_id, next_sync_token, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url) VALUES (?,?,?,?,?,?,?,?)")
     .bind(SUBJECT, "primary", null, "chan-1", "tok", "2099-01-01T00:00:00Z", "res-1", "https://cb").run();
-  await env.GOOGLE_TOKEN_CACHE.put("idp_access_token:" + SUBJECT, "cached", { expirationTtl: 600 });
+  await cacheAccessToken(env, SUBJECT, "cached", 600);
+  // A pre-encryption build's plaintext entry, still inside its TTL.
+  await env.GOOGLE_TOKEN_CACHE.put("idp_access_token:" + SUBJECT, "legacy-cached", { expirationTtl: 600 });
 }
 
 beforeEach(async () => {
@@ -76,6 +78,7 @@ describe("offboardUser", () => {
       const n = await env.DB.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${col} = ?`).bind(SUBJECT).first<{ n: number }>();
       expect(n?.n, `${table} should be empty`).toBe(0);
     }
+    expect(await readCachedAccessToken(env, SUBJECT)).toBeNull();
     expect(await env.GOOGLE_TOKEN_CACHE.get("idp_access_token:" + SUBJECT)).toBeNull();
     expect((await getUser(env.DB, SUBJECT))?.is_active).toBe(0);
     const audit = await env.DB.prepare("SELECT subject, actor, action, source FROM audit_log").first<Record<string, unknown>>();
@@ -370,6 +373,10 @@ describe("offboardUser", () => {
 
     async function seedWithRealToken(provider: "google" | "microsoft" = "google") {
       await seedSubject();
+      // A fresh anchored credential, not an anchoring of seedSubject's legacy
+      // row: anchoring an unanchored row resets its push channel
+      // (identity-store CR2), and these cases need the channel to stop.
+      await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(SUBJECT).run();
       await storeIdentityTokens(env, SUBJECT, { refreshToken: REFRESH, accessToken: "at", expiresIn: 3600, scope: "s" }, provider, "psub-1");
     }
     const countTokens = async () =>

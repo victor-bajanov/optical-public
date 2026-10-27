@@ -19,7 +19,10 @@ cookie is not required and not checked.
   Microsoft, whichever provider the subject signed in with) via
   `GET /v1/calendar-access-token`. Restricted to clients whose
   `oauth_clients.allowed_scopes` lists this scope; it is not role-gated, so
-  every user who signs in through such a client can mint one.
+  every user who signs in through such a client can mint one. The route
+  exists only where `CALENDAR_RAW_TOKEN_ENABLED` is exactly `"true"` (the
+  smoke deployments; prod and trial set `"false"`). Anywhere else it answers
+  `404 {"error":"not_found"}` before any auth check, so no IdP fetch happens.
 - `admin` — reach cross-user `/admin/*` operations. Requires the subject to
   carry `role='admin'` in the `users` table; the `/auth/callback` handler
   narrows the granted scopes to `admin` only for subjects with that role.
@@ -118,6 +121,13 @@ letters.
 > **Note on Testing mode:** while the OAuth consent screen is in "Testing" state,
 > refresh tokens issued to your sandbox user expire after 7 days. Acceptable for
 > a sandbox run; publish (with verification) before promoting to daily use.
+
+> **Your OAuth client, your terms with Google.** Optical reads Google user data
+> through this client, so that data is governed by whatever terms exist between
+> your organisation and Google, which may or may not allow data from Google APIs
+> to be used to train AI models. Optical runs no model itself, but the AI
+> assistant you connect to it receives users' scheduling data. Check those terms,
+> and the assistant provider's training settings, before connecting one.
 
 ## B. First-time bootstrap (one-time, ~10 min)
 
@@ -224,13 +234,24 @@ letters.
    "Automatic channel renewal"). Check for a `sign_in_subscribe
    {provider, subscribed}` log line, or a `calendar_sync` row with a `channel_id`.
    To subscribe by hand (idempotent; a fresh channel is left alone),
-   `/admin/webhook/subscribe` is bearer-gated — supply the bearer from Step B.6:
+   `/v1/webhook/subscribe` is bearer-gated — supply the bearer from Step B.6:
    ```bash
-   curl -X POST https://<subdomain>.<zone>/admin/webhook/subscribe \
+   curl -X POST https://<subdomain>.<zone>/v1/webhook/subscribe \
      -H "authorization: Bearer $SCHEDULER_BEARER"
    ```
-   Expect `{"ok":true,"subscribed":true}` the first time, `"subscribed":false` once
-   a fresh channel exists. A `calendar_sync` row with a `channel_id` is written.
+   Expect `{"ok":true,"subscribed":true}` both the first time and once a fresh
+   channel exists: `subscribed` reports whether a live channel for this
+   deployment's callback is stored after the call, not whether the call made one.
+   `true` also needs nothing this call did to have found the user's grant
+   unusable (a fresh channel needs no provider call, so the grant isn't
+   re-checked then); a provider error while renewing a still-unexpired channel
+   still answers `true`.
+   `"subscribed":false` means there is no working push channel (the grant was
+   refused, revoked or wiped, the provider is switched off, or no unexpired
+   channel for this deployment is stored): retry later, or have the user sign
+   in again. Each provider error logs `subscribe_webhook_failed {provider,
+   reason, error}`, with `reason` `grant_unusable` or `error`. A
+   `calendar_sync` row with a `channel_id` is written.
 
 ## C. Smoke test (~5 min, proves the path works)
 
@@ -302,6 +323,9 @@ export SCHEDULER_BEARER=...        # ./bin/mint-token.py (federated PKCE), §B.6
 export SCHEDULER_REFRESH_TOKEN=... # same — printed alongside the bearer
 export D1_DATABASE_ID=REPLACE_WITH_YOUR_PROD_D1_DATABASE_ID
 export EXPECTED_TEST_ACCOUNT=operator.alt@example.com   # the OPERATOR_EMAIL account you minted as
+# The target env must deploy CALENDAR_RAW_TOKEN_ENABLED="true": the harness reads the
+# calendar through /v1/calendar-access-token, and a 404 there ends the run with
+# RawTokenRouteDisabled (a SystemExit naming the flag).
 
 # Dry run (no mutations):
 bin/regression-smoke.py --dry-run --levels=2
@@ -445,6 +469,31 @@ Filter for them in Workers Observability or `wrangler tail`. The
 `--webhook-check` smoke (below) asserts the resolved plan's **window covers the
 triggering event**, which is what catches a resolve firing against the wrong week.
 
+### Daily cleanup: plans and pending actions
+
+The `0 4 * * *` UTC branch (`CLEANUP_CRON`) also cleans two tables, in every env:
+
+- **Proposed plans** (`worker/src/cron/cleanup-proposed-plans.ts`). It deletes expired,
+  never-committed plans (`expires_at` is 72 h after the resolve). Accepting a plan
+  already scrubs it: the commit-mark UPDATE (`worker/src/planning/proposed-plans.ts`) sets
+  `render_snapshot` to NULL and removes `body.warnings`. Both hold other people's text
+  (event titles, invite titles, `"<event.summary>: <code>"` warnings) and nothing reads
+  them once a plan is committed. The daily run is the backfill: it scrubs the same two
+  fields from any committed row that still has them (rows committed before that build,
+  and a snapshot the webhook or Monday-cron `attachRenderSnapshot` re-attached to a
+  committed row). `body.schedule`, `body.dropped` and `window` stay, since they are the
+  churn and drop baselines. The run is idempotent and logs
+  `plans_cleanup {deleted, scrubbed}`.
+- **Pending actions** (`pruneExpiredPendingActions`, `worker/src/db/pending-actions.ts`).
+  It blanks the payload and summary of every expired agent-confirm row and deletes rows 7
+  days past expiry, so an idle deployment doesn't keep request payloads. It runs under
+  `waitUntil`, is not membership-gated (like the retention sweep), and logs
+  `pending_actions_pruned {deleted, blanked}`; a failure logs `pending-actions sweep failed`.
+
+`GET /v1/schedule` and `GET /v1/plans/{hash}` also strip `body.warnings` on read, for
+pending and committed rows alike. The field was never in the response schema; it only
+leaked through the body spread. Warnings are still returned by `POST /v1/resolve`.
+
 ### Automatic channel renewal
 
 Google push channels expire after **~7 days, silently** — no error is delivered,
@@ -475,8 +524,8 @@ by a provider switch). So a failed sign-in subscribe self-heals within a day.
 Delisted users are skipped in both passes (`delisted_skip
 {path:"subscription_renewal"}`), and a grant whose provider is switched off (the
 Microsoft kill switch) is skipped in the create pass rather than counted as a
-failure. `POST /admin/webhook/subscribe` and `subscribeWebhook` still work, and
-are idempotent.
+failure. `subscribeWebhook` (`POST /v1/webhook/subscribe`) still works, and
+is idempotent.
 
 Each sweep logs a `subscription_renewal` summary (`{checked, renewed, created,
 create_failed, failed}`; `checked` counts both passes, `failed` is renew failures
@@ -561,7 +610,7 @@ curl -X POST https://<subdomain>.<zone>/admin/renew-subscriptions \
 Expect `200 {"ok":true,"checked":N,"renewed":M,"created":C,"create_failed":0,"failed":0}`
 (HTTP 500 with the same shape if any renewal failed). Create failures alone stay
 `200` with `ok:true` and show only in `create_failed`, so one dead grant never
-fails the sweep (or `bin/multiuser-smoke.py` M8). Unlike `/admin/webhook/subscribe`
+fails the sweep (or `bin/multiuser-smoke.py` M8). Unlike `/v1/webhook/subscribe`
 this is not caller-scoped — one call renews every subscribed owner and creates
 every missing channel.
 
@@ -576,19 +625,23 @@ op run --env-file=../.env -- npx wrangler dev --env dev --remote --test-schedule
 curl "http://localhost:8787/__scheduled?cron=0+4+*+*+*"
 ```
 
-This fires the whole `0 4 * * *` branch (cleanup + retention sweep + renewal),
+This fires the whole `0 4 * * *` branch (plan cleanup and scrub, pending-action prune,
+retention sweep, renewal),
 all idempotent. A `stopChannel failed … stopChannelCallerNotOwner` warning is
 expected best-effort noise when rotating a channel created by a different
 session; the renewal itself still succeeds. Confirm via the
 `subscription_renewal` summary line and a ~7-days-out `channel_expires_at`.
 Google sends an initial `resourceState=sync` push to the new channel — seeing
 that `POST /v1/webhook/google-calendar` return 200 in Workers Observability
-proves end-to-end delivery.
+proves end-to-end delivery. That needs invocation logs, which only the smoke
+deployments keep. On prod and trial, edit an event on the account's calendar instead and
+look for the `resolve_coordinator_scheduled` console line that the push
+triggers.
 
 ### Clearing a stale push channel
 
 A push channel becomes stale if the Google subscription lapsed and
-`/admin/webhook/subscribe` was called again without stopping the old one first.
+`/v1/webhook/subscribe` was called again without stopping the old one first.
 To clear a stale channel immediately without waiting for Google's 7-day expiry:
 
 ```bash
@@ -609,7 +662,7 @@ This endpoint requires a bearer token with the `admin` scope.
 After stopping the stale channel, re-subscribe:
 
 ```bash
-curl -X POST https://<subdomain>.<zone>/admin/webhook/subscribe \
+curl -X POST https://<subdomain>.<zone>/v1/webhook/subscribe \
   -H "authorization: Bearer $SCHEDULER_BEARER"
 ```
 
@@ -689,7 +742,9 @@ implementation without touching the email model or notification provider.
 both the webhook path and the Monday-cron path call `attachRenderSnapshot` to
 persist the `ReplanEmailModel` JSON in this column. Because it is separate from
 `body`, the `computePlanHash(body)` function — the plan identity — is
-**unaffected**: presentation changes never alter the plan hash.
+**unaffected**: presentation changes never alter the plan hash. The snapshot lives only
+while the plan is pending: accepting the plan sets it to NULL, and the daily cleanup
+scrubs any that survive ("Daily cleanup: plans and pending actions" above).
 
 **Styled accept confirm page.** `GET /v1/plans/:plan_hash/accept?t=<cap>`
 renders a styled HTML confirm page (`worker/src/web/accept-page.ts`,
@@ -1181,14 +1236,14 @@ self-expire in ~7 days).
    Expect zero rows immediately after apply.
 
 4. Re-subscribe the operator's primary calendar (recreates the per-user channel
-   row). `POST /admin/webhook/subscribe` is **caller-scoped**: it subscribes the
+   row). `POST /v1/webhook/subscribe` is **caller-scoped**: it subscribes the
    primary calendar of the **authenticated caller** (the bearer subject, via
    `requireCaller`) and builds the Google watch with that owner's token. Supply
    the bearer for `<OWNER>` — the new `calendar_sync` row is keyed to exactly
    that caller:
 
    ```sh
-   curl -X POST https://<your-worker-host>/admin/webhook/subscribe \
+   curl -X POST https://<your-worker-host>/v1/webhook/subscribe \
      -H "authorization: Bearer $SCHEDULER_BEARER"
    ```
 
@@ -1397,11 +1452,14 @@ The rule lives at the provider boundary, so every path sees the same thing. On e
 | Browser shows "Invitation only" (403) after the IdP consent; `mint-token.py` ends with "No callback received within 300s" | The membership gate refused the account you logged in as: it matches neither `MEMBERSHIP_ALLOWLIST` nor `OPERATOR_EMAIL` (with an allow-list set, an existing active `users` row no longer admits; see Plan 4 cutover §1). The worker revokes the upstream grant it was just handed (only when `UPSTREAM_REVOKE_ENABLED="true"`), stores nothing and does not redirect back to the client | Add it (comma-separated) to `[vars].MEMBERSHIP_ALLOWLIST` (or `OPERATOR_EMAIL` for an admin) and redeploy |
 | `400 invalid_grant` `"not a member"` from `/oauth/token` on a refresh (log `oauth_refresh_refused`) | An allow-list is set and the token's subject is no longer on it (nor in `OPERATOR_EMAIL`); the presented refresh and its paired access token are revoked | Re-add the subject to `MEMBERSHIP_ALLOWLIST` and redeploy, then re-mint; or offboard them (Plan 4 cutover §4) if the removal was intended |
 | An MCP connector or other client starts failing with `400 invalid_grant` `"revoked"` right after a burst of parallel requests (log `oauth_refresh_refused` `reason:"lost_race"`) | The client sent the same refresh token more than once at the same time. Rotation is single-use, so only one request won | Fix the client to single-flight its refreshes, then re-mint its tokens |
+| `404 {"error":"not_found"}` from `GET /v1/calendar-access-token`; a smoke run ends with `RawTokenRouteDisabled` | The deployment doesn't set `CALENDAR_RAW_TOKEN_ENABLED="true"`, so the raw-token route is off (it answers 404 before auth). Prod and trial keep it off by design | Run the smoke against a deployment that sets the flag. Don't turn it on in prod or trial to make a harness work |
 | 401 on `/admin/...` (non-dev-ui) | Bearer missing/expired, `admin` scope absent, or subject not `role='admin'` | Re-mint with `./bin/mint-token.py` after ensuring `smoke-cli` is registered with the `admin` scope (§B.5); confirm the subject's role in D1 |
 | 401/403 on `/admin/dev-ui` from browser | Access cookie expired or `ACCESS_TEAM_DOMAIN`/`ACCESS_POLICY_AUD` mismatch | Compare `wrangler.toml [vars]` to Cloudflare Zero Trust dashboard; this is the only `/admin` route still gated by CF Access |
-| Google webhook returns 401 to Google (`channel_token_mismatch`) | The notification's `X-Goog-Channel-Token` doesn't match `calendar_sync.channel_token`, the random per-channel token `ensureSubscription` generated (a stale channel after a rotation, or a spoof). The `WEBHOOK_CHANNEL_TOKEN` secret plays no part | Re-subscribe via `/admin/webhook/subscribe` (Step B.7) |
+| Google webhook returns 401 to Google (`channel_token_mismatch`) | The notification's `X-Goog-Channel-Token` doesn't match `calendar_sync.channel_token`, the random per-channel token `ensureSubscription` generated (a stale channel after a rotation, or a spoof). The `WEBHOOK_CHANNEL_TOKEN` secret plays no part | Re-subscribe via `/v1/webhook/subscribe` (Step B.7) |
 | Browser shows "Permissions needed" (403) after the IdP consent | The user unticked a permission on Google's consent screen (or the token response lacked a required Microsoft scope); the callback refuses partial grants (log `auth_callback_missing_scopes {provider, missing}`), stores nothing ("Nothing from this sign-in was stored.") and, with `UPSTREAM_REVOKE_ENABLED="true"`, revokes the partial grant UNLESS the identity already holds a stored grant for that provider and the same provider subject (or a legacy NULL one): then `auth_callback_revoke_skipped {provider, reason:"existing_grant"}` is logged and nothing is revoked, so an existing member's working grant survives a botched re-consent, while a partial grant from a *different* account at the same IdP is still revoked | Have them press "Try again" and leave every box ticked; the check runs in every deployment. If a consent that ticked every box is still refused, see §S "Scope check valve" |
-| Browser shows "Account already linked" (403) after the IdP consent | Only with `REFUSE_PROVIDER_REBIND="true"`: the email already belongs to an account bound to a different IdP identity (another Google/Microsoft account with that address, a recreated Entra user, or the same email at the other provider). Log `auth_callback_rebind_refused {provider, mismatch:"provider"\|"subject"}`. Nothing was stored, and with `UPSTREAM_REVOKE_ENABLED="true"` the fresh grant was revoked best-effort (a successful revoke logs nothing; a failure logs `auth_callback_revoke_failed` with `reason:"account_bound"`) | Have them sign in with the account they used first. To move the account to the new identity, offboard it (Plan 4 cutover §4); their next sign-in binds fresh, with none of the old data. See §S "Provider rebind refusal" |
+| Browser shows "Account already linked" (403) after the IdP consent | Only with `REFUSE_PROVIDER_REBIND="true"`: the email already belongs to an account bound to a different IdP identity (another Google/Microsoft account with that address, a recreated Entra user, or the same email at the other provider). Log `auth_callback_rebind_refused {provider, mismatch:"provider"\|"subject"}`. Nothing was stored, and with `UPSTREAM_REVOKE_ENABLED="true"` the fresh grant was revoked best-effort (a successful revoke logs nothing; a failure logs `auth_callback_revoke_failed` with `reason:"account_bound"`) | Have them sign in with the account they used first. To move the account to the new identity, keeping its data, confirm the person is the owner and run the admin rebind (§S "Admin rebind"). Offboard (Plan 4 cutover §4) only when they want a fresh, empty account. See §S "Provider rebind refusal" |
+| `409 identity_credential_missing` from `/v1/resolve` or `/v1/replan-now`; `credential_missing_skip {path}` lines | An admin rebind wiped the account's refresh credential and nobody has signed in as it since (§S "Admin rebind"). Crons, webhook replans and the poll sweep skip the account | The account's owner signs in again (re-mint, or re-authorise the connector). Nothing else restores it |
+| A calendar or mail call fails with `identity_changed_during_refresh` | The account's stored identity changed while an upstream token refresh was in flight: an admin rebind, then a sign-in by a different identity at the same address and provider. The refreshed access token belongs to the previous holder, so it was neither cached nor returned, and a rotated refresh token was not written back | Nothing to fix. The next call reads the new credential. It can also fire once, with no `identity_rebind` audit row, when a legacy NULL-anchor row's first sign-in anchors it, or when a same-provider rebind happens with `REFUSE_PROVIDER_REBIND` off (a recreated Entra user signing in). Repeated failures mean the identity keeps changing: check `audit_log` for `identity_rebind` rows |
 | An agent's call answers `202 {"status":"awaiting_confirmation"}` and nothing happened | The calling OAuth client is listed in `AGENT_CONFIRM_CLIENT_IDS`, so the user was emailed a confirm link (§S "Agent-confirm") | The user confirms in their browser within 24 h. A retry of the same request returns the same 202 and sends no second email |
 | `429 {"error":"too_many_pending_actions"}` from a gated op | The user already has 20 agent actions waiting for confirmation (§S "Agent-confirm", decision K) | The user confirms or ignores the emailed links; slots free as they're confirmed or expire (24 h). A plan's accept email frees its slot as soon as the plan is accepted or superseded, else after 72 h |
 | `429 {"error":"mail_cap_exceeded"}` from a poll op | The subject has used today's `OUTBOUND_MAIL_DAILY_CAP` third-party recipients (§S "Outbound mail cap") | Retry after 00:00 UTC, or raise the cap and redeploy |
@@ -1506,10 +1564,19 @@ identity is re-seeded as admin on sign-in.
 The crypto keys are purpose-split. Each defaults to `TOKEN_HASH_PEPPER`, so doing nothing
 keeps existing tokens/ciphertexts valid. To rotate to distinct values, set Secrets:
 
-- `HASHING_KEY`   — keys `hashToken` (bearer/code lookups). Rotating it invalidates ALL
-  issued bearer/refresh tokens and pending auth codes → every user must re-auth.
-- `ENCRYPTION_KEY` — keys AES-GCM of `identity_tokens.refresh_token_encrypted`. Rotating it
-  makes ALL stored refresh tokens undecryptable → every user must re-connect their calendar.
+- `HASHING_KEY`   — keys `hashToken` (bearer/code lookups, and the KV name of each
+  user's cached provider access token). Rotating it invalidates ALL issued bearer/refresh
+  tokens and pending auth codes → every user must re-auth. Cached provider access tokens
+  become misses (their KV names change), and the next call does a normal refresh. It
+  also keys the identity-anchor tag in accept and poll-status links (`identityAnchorTag`),
+  so every live emailed accept link and organiser `statusUrl` dies too (accept: the
+  invalid-link page or 401; status page: 404). Organisers use `getMeetingPoll` or the
+  bearer path.
+- `ENCRYPTION_KEY` — keys AES-GCM of `identity_tokens.refresh_token_encrypted` and of the
+  cached provider access tokens (purpose `identity-access`). Rotating it makes ALL stored
+  refresh tokens undecryptable → every user must re-connect their calendar. Cached access
+  tokens stop decrypting at once and read as misses, and the refresh that follows fails
+  too, so no call reaches Google or Graph from the moment the new key is live.
 - `HMAC_KEY`      — keys capability tokens AND the OAuth login-nonce cookie. Rotating it
   breaks only in-flight accept links / login flows (short TTL).
 
@@ -1618,6 +1685,27 @@ unset OPTICAL_ADMIN_TOKEN
       login per user instead of switching one shared account.
 
 ## Account lifecycle: retention, deletion and system mail
+
+### Data retention
+
+How long the short-lived, sensitive data lasts while an account is active:
+
+- **Provider access-token cache** (KV `GOOGLE_TOKEN_CACHE`, both providers): at most 1 h
+  per entry. The value is AES-GCM under its own derived key (purpose `identity-access`),
+  and the KV key is a keyed hash of the subject, never the email (§O "Provider switch").
+- **Unaccepted plans:** 72 h from the resolve, then deleted by the next daily cleanup, so
+  at most about 72 h + 24 h.
+- **Accepted plans:** the third-party text (`render_snapshot` and `body.warnings`) is
+  removed when the plan is accepted; the daily cleanup backfills any row that still has it,
+  within 24 h. `body.schedule` and `body.dropped` are kept as the churn and drop baselines.
+- **Pending agent actions** (`pending_actions`): payload and summary are blanked within a
+  day of expiry (by the first link visit or deferral that sees it, else the daily prune),
+  and the row is deleted 7 days after expiry.
+
+Calendar reads ask the provider only for the fields the mappers use (§O "Fields read").
+Event descriptions, bodies and locations are never stored, logged or returned. A Graph
+delta read does deliver the body and location (delta can't `$select`); the mapper drops
+them in memory.
 
 ### Retention (`RETENTION_DAYS`)
 
@@ -1932,7 +2020,8 @@ known to nobody — regenerate to get a working URL.
 ### Troubleshooting a dead feed
 - 404 on the feed URL: endpoint revoked, secret rotated, or the flag is OFF.
   Re-issue via `POST /v1/calendar-feeds/:id/regenerate` (fresh reveal URL) or
-  create a new endpoint via `POST /v1/calendar-feeds`.
+  create a new endpoint via `POST /v1/calendar-feeds`. An admin rebind revokes
+  every feed of the account (§S "Admin rebind"); create new endpoints after one.
 - 502: the upstream Google fetch failed or the output leak-guard tripped (check
   Workers logs for `calendar feed output guard blocked response`).
 - Empty `VCALENDAR` (no `VEVENT`): the user has no meetings and no *pinned*
@@ -3713,7 +3802,18 @@ route.ts:861-895`):
   (`getPollForSubject`) rather than trusting the token's claimed subject
   alone. This is what makes `statusUrl` directly clickable in a browser (a
   plain navigation can't carry an `Authorization` header) — the query param
-  takes priority when present.
+  takes priority when present. The token also carries the organiser's identity-anchor
+  tag (`identityAnchorTag`, `worker/src/auth/identity-rebind.ts`, a keyed hash of provider,
+  provider subject and whether a credential is stored), and `resolveStatusToken` refuses it (404, as for an unknown poll)
+  while the account is anchored to a different identity than the one that minted it: after
+  an admin rebind (§S) or a provider switch (§O). A same-identity sign-in keeps it alive.
+  A token with no tag (minted before this build) is refused outright, because a status
+  link lives until the poll deadline + 7 days and a deadline has no upper bound. **So at
+  deploy every existing poll's `statusUrl` stops opening in a browser, in every
+  deployment, prod and trial included.** Organisers use `getMeetingPoll` (MCP) or the
+  bearer path below; polls created after the deploy get working links. A pre-0037 account
+  (NULL `provider_subject`) gets its anchor at its first sign-in after the deploy, which
+  changes the tag, so that user's own open status and accept links die once.
 - **`requireOwner`** (bearer + subject, no `?t=` present) — the same gate
   `/v1/polls*` uses, for the MCP/curl path.
 
@@ -4951,6 +5051,24 @@ lower-casing and before the membership gate:
   already linked", §S "Provider rebind refusal"); the stored identity keeps
   the account.
 
+**`login_email` (migration 0046).** Every successful sign-in stores its
+verified, lower-cased email as `identity_tokens.login_email`, for both
+providers (the same address the callback already derives: Google needs
+`verified_email`, Microsoft uses `email` only with `xms_edov`, else the UPN).
+It rides the same guarded upsert as the credential, so a refused sign-in
+writes nothing, and a store without one keeps the old value. It is the
+owner's current address: `ownerNotificationEmail` (`db/owner-email.ts`)
+returns it, or the subject when it is NULL or empty. Owner-addressed mail
+(replan and accept emails, poll organiser notices, booking owner notices,
+confirm links and their system-mail fallback, retention and account-deleted
+mail), the Gmail `From` and the organiser name in invitee poll mail all use
+it. The outbound mail cap treats both the subject and `login_email` as self.
+The subject stays the key everywhere else: membership, `OPERATOR_EMAIL`,
+`pending_actions`, audit and the cap's counters. So a renamed user still
+passes the allow-list on their original address. `optical-admin.py
+list-users` shows `login_email` so an operator can see who signs in under
+which address.
+
 **`OPERATOR_EMAIL` stays keyed on the resolved `subject`, not the token's
 current email** — it must therefore list the operator's *original*
 sign-in address. After an IdP-side rename the seed-admin check
@@ -4968,17 +5086,69 @@ claim would carry).
 
 Signing in with the *other* provider under the same email address is not a
 no-op: `storeIdentityTokens` (`auth/identity-store.ts`) detects the stored
-`provider` changing and, in the same write path as the new credential,
-resets that subject's `calendar_sync` row (`next_sync_token` and all
+`provider` changing and, in the same D1 batch as the new credential (one
+transaction, resets first), resets that subject's `calendar_sync` row (`next_sync_token` and all
 channel fields) and `users.done_color_id` — both are provider-shaped (a
 Google sync token thrown at Graph raises `Invalid URL`, never a clean 410,
 and would otherwise wedge webhook-triggered replan forever). The next
-resolve re-seeds `done_color_id` for the new provider. `getAccessToken`'s
-refresh-token write is provider-guarded (`WHERE account_email=? AND
-provider=?`) so a refresh that was in flight on the old provider can't
-clobber the new provider's freshly-stored credential. The same sign-in then
-creates a push channel on the new provider (§"Automatic channel renewal",
-"First channels"), so webhook replans resume without a manual re-subscribe.
+resolve re-seeds `done_color_id` for the new provider. Each reset is
+guarded in SQL on the stored row being under another provider (and, with
+`REFUSE_PROVIDER_REBIND` on, unanchored), so a refused or raced switch
+resets nothing, a failing reset rolls the credential flip back, and a
+concurrent switch that this sign-in flips back is reset too. The same
+sign-in then creates a push channel on the new provider (§"Automatic channel
+renewal", "First channels"), so webhook replans resume without a manual
+re-subscribe.
+
+The sign-in that anchors an unanchored row (NULL `provider_subject`) under
+the **same** provider also resets the `calendar_sync` sync token and channel
+columns, in the same batch, but keeps `done_color_id` (a same-provider colour
+id stays valid). That covers a legacy pre-0037 row and the first sign-in
+after an admin rebind, where the new identity's calendar isn't the one the
+old token describes. A legacy row therefore does one full resync on its
+first anchoring sign-in. A re-sign-in by the identity already anchored
+resets nothing.
+
+`getAccessToken` guards the refresh against an identity change:
+- The rotated refresh-token write is guarded on `provider`, `provider_subject`
+  and the old ciphertext, so a refresh in flight on the old identity can't
+  clobber the new credential, and one racing a rebind can't write a wiped
+  credential back. When the write matches no row but the identity is unchanged
+  (a concurrent refresh or sign-in by the same identity rotated it first;
+  Microsoft keeps the old token valid), it keeps the newer credential, skips
+  the write-back and returns the access token. A wipe mid-refresh fails with
+  `identity_credential_missing`.
+- When the provider is unchanged but `provider_subject` changed mid-refresh
+  (an admin rebind, then a new holder's sign-in), it fails with
+  `identity_changed_during_refresh` and caches nothing: the token is the
+  previous holder's.
+- After writing the access-token cache it re-reads the row once more. If the
+  row is gone or the provider changed, it deletes the cache key and returns
+  the token. If `provider_subject` changed, it deletes the key and throws
+  `identity_changed_during_refresh`.
+
+**The access-token cache** (`GOOGLE_TOKEN_CACHE`, both providers despite the name) is
+owned by four helpers in `auth/identity-store.ts`; nothing else touches its key names:
+- The KV key is `idp_at:` plus a keyed hash (`hashingKey(env)`) of the subject, so no email
+  appears in a key name. The value is AES-GCM under its own derived key (purpose
+  `identity-access`, independent of the refresh-token key). No plaintext token is stored.
+- An entry lives `expires_in − 60` s, clamped to [60, 3600] s, so never more than 1 h
+  (a Graph token can last about 90 min).
+- A value that doesn't decrypt (a key rotation, a corrupt or old plaintext value) is a
+  miss: `getAccessToken` refreshes and overwrites it, and logs nothing.
+- Offboard and the admin rebind drop the cache (the new key and the legacy plaintext
+  `idp_access_token:<subject>` key from older builds, which nothing reads and which
+  expires within 2 h of deploy). Offboard deletes the stored refresh credential and the
+  rebind wipes it (§S "Admin rebind"), so after either nothing can refresh; if the KV
+  delete fails, the cached token itself can still be used for up to 1 h.
+
+**Links die on a switch.** Emailed plan-accept links and the organiser's poll `statusUrl`
+carry a tag of the identity anchor they were minted under: a keyed hash (`hashingKey`) of
+provider, provider subject and whether a credential is stored, so no IdP subject appears
+in an emailed URL.
+A provider switch changes the anchor, so links minted before it are refused (accept: the
+invalid-link page or `401 invalid_token`; status page: 404). A re-sign-in by the same
+identity keeps them working.
 
 What a switch does **not** clean up, by design (v1): the old provider's
 push channel/subscription is **abandoned, not stopped** — Graph and Google
@@ -5320,8 +5490,9 @@ exercised end to end.
   `preferred_username` follows the new primary alias, so allow-list it
   first. The account itself carries over on its provider subject, but keeps
   its original email as its key: `resolveSubject` logs
-  `identity_email_drift` and never renames, so Optical's mail to the user
-  still goes to the old address. Work accounts and native
+  `identity_email_drift` and never renames. Optical's mail to the user
+  follows the new address after their next sign-in (`login_email`, §O
+  "Identity anchor"). Work accounts and native
   Outlook accounts are unaffected. Mail from such an account also goes out
   "on behalf of" the sign-in address (`From` = sign-in address, `Sender` =
   the hidden mailbox), so DMARC fails alignment at every receiver and that
@@ -5386,6 +5557,27 @@ Both fixes are unit-tested (`worker/test/v1-calendar-access-token.test.ts`,
 been exercised against live Graph yet — the round-trip validation described
 above (the `ms-smoke` step 3 ext-prop gate) is still a required LIVE step
 before this feature ships, not a settled fact.
+
+### Fields read
+
+Calendar reads ask only for the fields the read mappers use, and event descriptions,
+bodies and locations are never read into Optical:
+
+- **Google:** `events.list` (window and incremental) sends
+  `fields=nextPageToken,nextSyncToken,items(<GOOGLE_EVENT_ITEM_FIELDS>)`, and `events.get`
+  sends `fields=<GOOGLE_EVENT_ITEM_FIELDS>` (`google-calendar-provider.ts`). The page and
+  sync tokens are named explicitly; without them Google would strip them and paging and
+  sync would stop after one page.
+- **Graph:** the plain `calendarView` read and `GET /me/events/{id}` send
+  `$select=<GRAPH_EVENT_SELECT>` next to the existing `$expand` (`graph-event-mapping.ts`).
+  `calendarView/delta` can't: Microsoft Learn (event: delta, v1.0) documents `$select` as
+  unsupported there. So the body and location do arrive on a delta read, but the mapper
+  drops them in memory. They are never mapped, stored, logged or returned.
+
+`CalendarEventSchema` keeps `location` and `description` as write-only fields (booking and
+poll events Optical creates). The sufficiency tests map full fixtures and the same
+fixtures projected through the field lists, and require identical results, so a field a
+mapper starts reading must be added to the list.
 
 ### Graph delta is window-bound (why the provider opens a wide horizon)
 
@@ -5692,7 +5884,9 @@ sequential engine wall.
   the same ~39 s solve read 0 ms, 1 876 ms, and 4 755 ms on consecutive
   runs. `container_wall_ms` and container-mode `round_trip_ms` stay
   honest (the awaited HTTP hop advances the clock). Read true engine
-  wall/CPU from Workers Observability per-invocation fields. Consequence,
+  wall/CPU from Workers Observability per-invocation fields, on a smoke deployment:
+  prod and trial turn invocation logs off (capability URLs), so those
+  fields aren't recorded there. Consequence,
   also accepted: the fallback `SOLVER_ENGINE_WALL_GUARD_MS` serving guard
   reads this same frozen clock, so a slow synchronous solve largely
   escapes it.
@@ -6338,9 +6532,9 @@ Five vars, all off or at their safe default unless a deployment sets them
 The membership allow-list now also stops background and public activity for a delisted
 user (Plan 4 cutover §1, "Delisted users get nothing done for them").
 
-### Deploy order: migrations 0042 to 0045
+### Deploy order: migrations 0042 to 0046
 
-Apply all four BEFORE deploying the code that uses them:
+Apply all five BEFORE deploying the code that uses them:
 
 - **0042** `pending_actions` (agent-confirm).
 - **0043** `users.deactivated_at` (purge window). Load-bearing: `touchLastSeen` writes the
@@ -6349,6 +6543,9 @@ Apply all four BEFORE deploying the code that uses them:
 - **0045** `pending_actions.mail_channel` (decision K: the system-mailer fallback limit).
   Without it, a gated deferral whose own-mailbox send fails errors (500) at the fallback
   instead of sending through SMTP2GO.
+- **0046** `identity_tokens.login_email` (identity port of #105). Load-bearing in every
+  env: the sign-in store upsert writes it, so **every sign-in fails** without it, and
+  `ownerNotificationEmail` reads it, so every owner email fails too.
 
 0042 and 0045 also back `replanNow` (decision L dedupe) for every client in **every** env,
 trial or not: on an unmigrated D1, any `replanNow` that sends mail returns 500.
@@ -6361,6 +6558,38 @@ op run --env-file=../.env -- npx wrangler deploy --env <env>
 `bin/deploy.sh` applies migrations before deploying, so prod is safe by construction.
 multiuser-smoke M7 seeds a `pending_actions` row and asserts offboard purges it, so it
 needs 0042.
+
+### Deploy notes: OAuth verification hardening (no migration)
+
+This build needs no migration. What changes at deploy:
+
+- **Raw-token route.** Each env's `wrangler.toml` block states `CALENDAR_RAW_TOKEN_ENABLED`
+  (`"true"` only on the smoke deployments). Before deploying prod, check that no prod
+  client relies on the route with the read-only query
+  `SELECT id, allowed_scopes FROM oauth_clients WHERE allowed_scopes LIKE '%raw-token%'`
+  (run from `worker/` through `op run … npx wrangler d1 execute DB --remote`).
+- **Access-token cache.** Each user's first provider call after deploy is a cache miss and
+  one refresh (the key name changed). Old plaintext entries are never read and expire
+  within 2 h.
+- **Poll status links.** Every `statusUrl` minted before the deploy carries no anchor tag
+  and stops opening in a browser at once, in every deployment, prod and trial included
+  (§L "Organiser status page"). Organisers use `getMeetingPoll` (MCP) or the bearer path;
+  tell anyone with a live poll. A pre-0037 account (NULL `provider_subject`) also loses its
+  own open accept and status links once, at its first sign-in after the deploy.
+- **Accept links.** Links minted before the deploy carry no anchor tag and still work until
+  they expire (72 h after deploy at most), so **don't run an admin rebind within 72 h of
+  deploying this build**: a claim-less link survives a rebind and could reach a plan the
+  next holder's resolves make (the plans pending at the rebind are deleted either way).
+- **Rebind wipes the credential.** After a rebind the account is idle until the next
+  sign-in, and `/v1/resolve` and `/v1/replan-now` can answer `409
+  identity_credential_missing` (new in the spec; §S "Admin rebind").
+- **Prod and trial logs.** The top-level `[observability.logs]` (prod) and
+  `[env.trial.observability.logs]` keep console logs (Optical's own structured lines) and set
+  `invocation_logs = false`, because invocation logs record every request URL and the
+  accept, confirm, poll and feed links carry secrets there. The smoke deployments restate their own
+  `[env.*.observability]` so they keep invocation logs (the internal backlog). On prod the
+  per-invocation wall/CPU fields (§P) and request-status checks are gone: read them on a
+  smoke deployment, and use Optical's own console lines on prod.
 
 ### Agent-confirm (`AGENT_CONFIRM_CLIENT_IDS`, migration 0042)
 
@@ -6426,8 +6655,10 @@ Refused, so an agent can't click for the user:
   `accept_link`).
 - A confirm-action token presented to acceptPlan, the poll grid or the poll status page.
 
-Expired rows lose their payload and summary when a link reaches them or at the next
-deferral (by anyone), and are deleted 7 days after expiry. Offboard deletes
+Expired rows lose their payload and summary when a link reaches them, at the next
+deferral (by anyone) or at the daily `0 4 * * *` prune, whichever comes first, and are
+deleted 7 days after expiry. The daily prune means an idle deployment cleans up too
+(`pending_actions_pruned {deleted, blanked}`, §E "Daily cleanup"). Offboard deletes
 `pending_actions`, so an old link can't act on a re-created account.
 
 Logs, carrying the op and action id only: `confirm_action_deferred`,
@@ -6551,8 +6782,8 @@ the fresh grant best-effort (`revokeUpstreamGrant`, `reason:"account_bound"`; it
 the other upstream account, so the stored grant survives) and returns a 403 "Account
 already linked" page. The page tells the person to use the account they signed in with
 first, or to ask `INVITE_CONTACT`, and never names the provider. Nothing is written; sync
-state and done colour are untouched. The only release is an operator offboard, after which
-the next sign-in creates a new, empty account.
+state and done colour are untouched. To release the account, an operator runs the admin
+rebind below. Offboard is for someone who wants a new, empty account instead.
 
 - Rows from before migration 0037 (NULL `provider_subject`) still bind on their next
   sign-in, even across providers.
@@ -6561,6 +6792,169 @@ the next sign-in creates a new, empty account.
 - Unconditional, flag or not: the "existing grant" revoke skip now requires the stored
   `provider_subject` to match (or be NULL), so a partial grant from a different account at
   the same IdP is revoked rather than skipped.
+
+### Admin rebind
+
+`POST /admin/identity-rebind {subject, force?}` (admin bearer with the `admin` scope, like
+`/admin/offboard`; not in the v1 OpenAPI document). It isn't flag-gated, but use it only
+where `REFUSE_PROVIDER_REBIND` is on. With the flag off nothing is refused, so there is
+nothing to release, and a rebind still clears the anchor: the next sign-in by whoever holds
+the address binds the account, which can hand it to a new holder of a reassigned address
+and orphan a renamed owner. CLI:
+
+```bash
+read -rs OPTICAL_ADMIN_TOKEN; export OPTICAL_ADMIN_TOKEN
+uv run bin/optical-admin.py rebind <email> --env <env> --yes [--force]
+```
+
+It clears the account's anchor (`identity_tokens.provider_subject` → NULL), so the next
+sign-in as that address binds whichever IdP identity carries it and keeps all the
+account's data. **Whoever signs in next as that address gets the account, so confirm who
+that is first.** In the same D1 batch it resets the account's `calendar_sync` sync token
+and push-channel columns, because the new identity's calendar isn't the one they describe,
+and it ends the account's sessions the way offboard does: it revokes every `oauth_tokens`
+row (bearer and refresh), deletes outstanding `oauth_codes` and deletes its
+`pending_actions`. So every connected client (codemode-mcp connectors, `mint-token.py`
+tokens) must re-authorise, and any outstanding confirm link (`/confirm/{id}`) is dead.
+
+The same batch also cuts these capabilities the previous holder was emailed or handed,
+since they would otherwise act on or show the next holder's calendar:
+- It deletes the account's **pending (uncommitted) plans**. Committed plans are history and
+  stay.
+- It **revokes the account's live calendar feed tokens** (`calendar_feed_tokens.revoked_at`),
+  so every feed URL stops serving. The user must create their feeds again.
+- **Emailed accept links and the organiser's poll `statusUrl` links die** by the identity
+  anchor. Each carries a tag of the anchor it was minted under (`identityAnchorTag`: a
+  keyed hash, `hashingKey`, of provider, provider subject and whether a credential is
+  stored, so no IdP subject appears in an emailed URL), and a link is refused while the
+  account is anchored to a different identity. The rebind clears the anchor and wipes the
+  credential, which changes the tag even on a legacy row whose `provider_subject` was
+  already NULL, and the next sign-in binds a new one. A dead
+  accept link shows the invalid-link page or gets `401 invalid_token`; a dead status link
+  gets 404. A provider switch kills them the same way (§O). This also covers plans resolved
+  later, which an old accept link could otherwise reach through the superseded-plan flow.
+  Caveat: accept links minted before this build carry no tag and keep working until they
+  expire (72 h after deploy at most), so don't rebind within 72 h of deploying it ("Deploy
+  notes" above). Every rebind kills accept and poll-status links, a pre-0037 account's
+  (NULL `provider_subject`) included.
+
+Polls and their invitees' response links survive (the links belong to the invitees), and so
+does the **published booking page: the next holder inherits it** (a known limitation, a
+product decision). The next sign-in also resets sync once more (§O, the anchoring sign-in).
+**It wipes the stored refresh credential** (`identity_tokens.refresh_token_encrypted`
+becomes zero-length, in the same CAS-guarded batch, so a 409 changes nothing). The account
+is idle until the next sign-in: no Monday resolve, webhook replan, poll nudge or deadline
+booking (polls stay open), booking-page slots and the poll invitee grid and save answer
+`502 calendar_unavailable`, and
+`/v1/resolve` and `/v1/replan-now` answer `409 identity_credential_missing`. Each skipped
+job logs one `credential_missing_skip {path, reason}` line, never an address. An offboard
+of an idle account still completes, skipping its calendar cleanup and upstream revoke. A
+refresh racing the rebind can't write the credential back: the rotated write-back CASes on
+the old ciphertext. The rebind also drops the cached provider access token; if that KV
+delete fails, calendar calls can run on the cached token for up to 1 h. With
+`UPSTREAM_REVOKE_ENABLED="true"` (trial only) it also revokes the grant at the IdP, after
+the clear and the audit row: best-effort, a no-op for Microsoft, and a 409 revokes nothing.
+`done_color_id` stays: a
+cross-provider binder gets the usual switch reset (§O), and same-provider colour ids stay
+valid. The subject resolves like offboard (trimmed, case-insensitive, an exact match wins).
+
+| Response | Meaning |
+|---|---|
+| `200 {ok, subject, previous_provider, previous_provider_subject, login_email, forced}` | Anchor cleared. `previous_provider_subject` is null when the row was already unanchored (a repeat call clears nothing new but still resets sync and ends sessions again) |
+| `400 validation_failed` | Missing, blank or non-string subject, or a non-JSON body |
+| `401` / `403 forbidden_not_admin` / `403 insufficient_scope` | No live bearer; the bearer's subject isn't an active admin; the bearer lacks the `admin` scope. Nothing is resolved or written |
+| `404 unknown_subject` | No such account, or it has no `identity_tokens` row |
+| `409 ambiguous_subject` | Case-variant subjects; name the exact one |
+| `409 subject_drifted {subject, login_email}` | The owner now signs in as `login_email` (it differs from the subject, ignoring case). Whoever is refused at the subject address is probably a new holder of a reassigned address, and a rebind would hand them the account. Nothing is written. Re-run with `--force` only once you've confirmed the person at the subject address is the owner. The CLI prints this hint |
+| `409 concurrent_update` | A sign-in or offboard changed the row (provider, provider_subject or login_email) between the read and the clear. Nothing is written. Re-run to re-evaluate |
+
+`forced` is true only when the row had drifted and `force` overrode the refusal. `force`
+on a row that hasn't drifted is an ordinary rebind.
+
+**A NULL `login_email` has no drift guard.** A row whose owner hasn't signed in since
+migration 0046 has no recorded current address, so `list-users` shows `login_email` null
+and the rebind can't tell a renamed owner from a new holder. Confirm the owner out of band
+(not by email to the subject address, which a new holder may control) before rebinding.
+
+- Audit: one `audit_log` row, action `identity_rebind` (or `identity_rebind_forced` for a
+  forced drift clear), table `identity_tokens`, source `admin`, actor = the admin's
+  subject. A refusal writes none.
+- Log lines, PII-free (no subject, email or provider_subject):
+  `identity_rebind_cleared {provider, had_anchor, forced}` (warn) on success,
+  `identity_rebind_drift_refused {provider}` (warn) on a drift refusal, and
+  `identity_rebind_cache_drop_failed {provider}` (warn) when the KV delete of the cached
+  access token fails. The rebind still answers 200 (the drop runs after the anchor clear
+  and the audit row), and the cached token expires on its own within 1 h.
+- Upstream revoke (flag on): `identity_rebind_revoke_failed {provider}` /
+  `identity_rebind_revoke_skipped {provider}` (no token, subject or email; the rebind still
+  answers 200). `identity_rebind_revoke_raced {provider}` (Google only) is logged after a
+  revoke that went through when the account holds a credential again: a sign-in stored one
+  between the wipe and the revoke, and Google's revoke ends the whole user-to-client
+  grant, so that sign-in's next refresh will fail. Ask the user to sign in again.
+  `identity_rebind_revoke_race_check_failed {provider}` means that post-revoke check's D1
+  read failed; the rebind still answers 200 and the cache is still dropped.
+- `credential_missing_skip {path, reason, polls?|pollId?}` (warn), one per skipped job
+  while the account is idle. Paths: `monday_resolve`, `webhook_replan`, `poll_sweep`
+  (`polls` for the per-subject pre-check, `pollId` for a rebind mid-sweep), `resolve`,
+  `replan_now`, `offboard`.
+- A token refresh in flight across the rebind caches nothing and writes nothing back. It
+  fails with `identity_credential_missing` while the credential is wiped, or with
+  `identity_changed_during_refresh` (Diagnostics) if the next holder has signed in by then.
+
+#### Smoke (`bin/identity-smoke.py`)
+
+`bin/identity-smoke.py` (smoke-runner `identity-smoke`, `default`/`microsoft`,
+interactive) runs the rebind on a smoke env with two accounts. A is the admin: its
+`A_*` bearer carries the `admin` scope, as for multiuser-smoke M7. B is a non-admin test
+account (one of the gmail test accounts), which gets rebound. Never use your own account or
+the admin as B. The harness refuses B = A, and the rebind revokes every token B holds,
+dev MCP connectors included. Each step is checked in D1:
+
+- **I1** (read-only; `--dry-run` stops here): both whoamis. A is an active admin and B
+  isn't. B's row has a `provider_subject`, a stored refresh credential (an earlier rebind
+  that wasn't followed by a re-mint fails here) and a `login_email` equal to its subject (a
+  renamed account would get 409).
+- **I2** seeds B with a done marker task, a push channel, a `pending_actions` row, an
+  `oauth_codes` row, a pending `proposed_plans` row (a long-past week) and a live
+  `calendar_feed_tokens` row (a token hash with no preimage).
+- **I3** checks the refusals. A missing or blank subject and a non-JSON body get 400, an
+  unknown subject gets 404, and B's own bearer gets 403 `forbidden_not_admin` (aimed at an
+  unknown subject). With `login_email` set to another address in D1, the rebind gets 409
+  `subject_drifted` and writes nothing. `login_email` is then restored, guarded on the
+  drift value.
+- **I4** rebinds B, sending the subject padded and upper-cased, and checks the 200 body
+  names the stored subject and the old anchor.
+- **I5** checks the anchor is cleared, the refresh credential is wiped (length 0; the row
+  stays) and the six `calendar_sync` sync and channel columns are NULL (the row stays). Every pre-rebind B token is revoked, and no other subject's
+  token carries the same `revoked_at`. B's codes, pending actions and pending plans are
+  gone and B has no live feed left (the feed rows stay, revoked), there is exactly one new
+  `identity_rebind` audit row with actor A, and B's data is kept (users row, templates,
+  config, marker). B's old bearer gets `401 revoked_token` and its
+  refresh token `400 invalid_grant` "revoked". A still works.
+- **I6** runs `bin/mu-smoke-login.py B` for you: sign in as B in the browser that opens.
+  It then checks `provider_subject` is back to the pre-rebind value (the same IdP identity),
+  a refresh credential is stored again (length > 0), the provider is unchanged, `login_email` is B's address, the data is kept and B can read
+  its marker task.
+
+Cleanup always runs. It deletes the seeded rows and the marker and re-subscribes B's push
+channel with the new bearer. The seeded rows expire an hour after they're written, so a
+killed run doesn't hold one of B's pending-action slots for ever, and
+`bin/reset-smoke-env.py` run with B's tokens sweeps a leftover `[id-smoke]` marker. The
+old Google channel or Graph subscription isn't stopped; it
+expires on its own (§O). The B tokens in your shell are revoked by the run, so re-mint B
+afterwards. The smoke runner queues it after every other run that uses B. It doesn't need
+`REFUSE_PROVIDER_REBIND`: every step holds with the flag off, as on dev. The "Account
+already linked" refusal itself needs a second IdP identity at the same address, so it
+isn't covered.
+
+```bash
+eval "$(bin/mu-smoke-login.py A B --url <dev url> --email-a <admin> --email-b <test account>)"
+op run --env-file=.env -- uv run bin/identity-smoke.py --dry-run
+op run --env-file=.env -- uv run bin/identity-smoke.py 2>&1 | tee /tmp/identity-smoke.out
+```
+
+Don't redirect the live run to a file alone: I6 prints the sign-in prompt and waits for
+the browser. `--provider microsoft` runs the same steps with a Microsoft cast.
 
 ### Scope check valve (`REQUIRE_EXACT_PROVIDER_SCOPES`)
 

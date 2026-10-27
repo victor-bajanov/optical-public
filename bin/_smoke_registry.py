@@ -432,6 +432,35 @@ HARNESSES: dict[str, Harness] = {
         exit_convention="pass012",
         parser="colon",
     ),
+    "identity-smoke": Harness(
+        name="identity-smoke",
+        script="bin/identity-smoke.py",
+        # Admin rebind (runbook §S "Admin rebind"): A (the admin) rebinds B,
+        # which revokes every token B holds, then B signs in again in a
+        # browser mid-run, so the harness needs the real TTY. Its single
+        # "rebind" level is token-destructive, so plan_queue runs it after
+        # everything else that projects B. The re-mint inside the run is the
+        # harness's own: the runner's B token is dead afterwards either way.
+        modes=(
+            Mode(name="default", identities={"A": "google:a", "B": "google:b"},
+                 targets=_SHARED_TARGETS, provider="google"),
+            Mode(name="microsoft", identities={"A": "microsoft:a", "B": "microsoft:b"},
+                 targets=_MICROSOFT_TARGETS, provider="microsoft"),
+        ),
+        provider_flag="--provider",
+        levels=("rebind",),
+        token_destructive_levels=("rebind",),
+        token_destructive_prefixes=("B",),
+        needs=("d1",),
+        advisories=(
+            "rebinds B (revokes every B token, incl. dev MCP connectors) and re-mints it "
+            "in a browser mid-run — re-mint the slot named by token_destructive_slots "
+            "after it runs",
+        ),
+        exit_convention="pass01",
+        parser="colon",
+        interactive=True,
+    ),
 }
 
 

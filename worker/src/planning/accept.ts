@@ -6,6 +6,7 @@ import { requireBearer } from "../middleware/auth-bearer";
 import { verifyCapabilityWithEnv } from "../auth/capability";
 import { confirmationRequired, isForeignFetchSite } from "../confirm/gate";
 import { isActiveMember } from "../auth/membership";
+import { acceptLinkAnchorHolds } from "../auth/identity-rebind";
 import { checkPlanCommittable, commitPlan, type CommitResult } from "./commit";
 import { deferPlanCommit, planConfirmResponses } from "./commit-confirm";
 import { getCommittedPlansForSubject, getPendingPlansForSubject, getProposedPlan, planProducedInTz, type ProposedPlanRow } from "./proposed-plans";
@@ -115,7 +116,7 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
     description: "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer, never both: a request carrying a capability token AND an Authorization header is refused 403 `authorization_not_allowed` (the emailed link is the user's own confirmation, which an agent may not click for them). If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. A pending plan produced under a timezone other than the subject's current effective timezone (a resolve that raced a timezone change) is treated the same way as a superseded hash. Idempotent on an already-committed hash. Bearer calls from an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) commit nothing: after the same checks (409 plan_superseded, 410, idempotent 200), the user is emailed this plan's accept email and the call answers 202 awaiting_confirmation (action_id = plan_hash); only the user's own accept on that email's page (the capability branch) commits it. A gated call on a plan with no reviewable changes is 409 plan_not_reviewable; if the email can't be sent, 503 confirmation_unavailable.",
     responses: {
       200: { content: { "application/json": { schema: z.object({ ok: z.boolean() }) } }, description: "Committed (idempotent on an already-committed plan)" },
-      401: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "Unauthenticated: missing/invalid bearer, or an invalid capability token (including one whose subject is no longer on MEMBERSHIP_ALLOWLIST)" },
+      401: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "Unauthenticated: missing/invalid bearer, or an invalid capability token (including one whose subject is no longer on MEMBERSHIP_ALLOWLIST, and one minted before the account was bound to a different sign-in identity: an admin rebind or a provider switch)" },
       403: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "authorization_not_allowed: a capability token (form field or query `t`) sent together with an Authorization header; or cross_site_not_allowed: a capability POST whose Sec-Fetch-Site is present and not same-origin. The capability path is for the accept page's own form only; nothing was committed." },
       409: { content: { "application/json": { schema: z.object({ error: z.string(), latest_plan_hash: z.string().optional().describe(D.response.latest_plan_hash) }) } }, description: "plan_superseded: the plan no longer exists (or was produced under an older timezone); nothing was committed. Or, for an agent-confirm client's bearer call only, plan_not_reviewable: the plan has no reviewable changes to email; nothing was committed." },
       410: { content: { "application/json": { schema: z.object({ error: z.string() }) } }, description: "Expired" },
@@ -148,6 +149,9 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
     if (cap) {
       const claims = await verifyCapabilityWithEnv(cap, c.env);
       if (!claims || claims.purpose !== "accept") return c.json({ error: "invalid_token" }, 401);
+      // A link minted before the address passed to another identity (admin
+      // rebind, provider switch) commits nothing for the next holder.
+      if (!(await acceptLinkAnchorHolds(c.env, claims))) return c.json({ error: "invalid_token" }, 401);
       // Decision C: a delisted user's emailed link commits nothing on their
       // grant (and bumps nothing): answered exactly like an invalid token.
       if (!(await isActiveMember(c.env, claims.subject, "accept_link"))) {
@@ -286,7 +290,10 @@ export function mountAcceptRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: App
   v1.get("/plans/:plan_hash/accept", async (c) => {
     const cap = c.req.query("t") ?? "";
     const claims = cap ? await verifyCapabilityWithEnv(cap, c.env) : null;
-    if (!claims || claims.purpose !== "accept" || !(await isActiveMember(c.env, claims.subject, "accept_link"))) {
+    if (
+      !claims || claims.purpose !== "accept" || !(await acceptLinkAnchorHolds(c.env, claims)) ||
+      !(await isActiveMember(c.env, claims.subject, "accept_link"))
+    ) {
       return c.html(renderErrorPage(COPY.invalidLink), 400);
     }
     // Subject's effective tz: see the POST handler.

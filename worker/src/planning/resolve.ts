@@ -11,6 +11,7 @@ import type { SolverWeights } from "./build-problem";
 import { runResolve } from "./resolve-internal";
 import { confirmationRequired } from "../confirm/gate";
 import { attachAgentReviewSnapshot } from "./commit-confirm";
+import { IdentityCredentialMissingError, logCredentialMissingSkip } from "../auth/identity-store";
 
 // Maximum solvable window span. The solver builds its CP-SAT model with one pass
 // per 15-minute slot across the whole window, OUTSIDE the 30s solve time-limit,
@@ -51,6 +52,9 @@ const SolverErrorResponse = z.object({
   status: z.number().describe(D.error.solver_status),
   detail: z.string().describe(D.error.solver_detail),
 });
+export const CredentialMissingResponse = z.object({
+  error: z.literal("identity_credential_missing"),
+}).describe(D.error.credential_missing);
 const InternalErrorResponse = z.object({
   error: z.literal("internal_error"),
   detail: z.string().describe(D.error.internal_detail),
@@ -92,6 +96,10 @@ export function mountResolveRoute(
           },
         },
         description: "Caller has no resolvable subject (no_subject)",
+      },
+      409: {
+        content: { "application/json": { schema: CredentialMissingResponse } },
+        description: D.error.credential_missing,
       },
       422: {
         content: { "application/json": { schema: UnsatResponse } },
@@ -156,6 +164,10 @@ export function mountResolveRoute(
         200,
       );
     } catch (e) {
+      if (e instanceof IdentityCredentialMissingError) {
+        logCredentialMissingSkip("resolve");
+        return c.json({ error: "identity_credential_missing" as const }, 409) as any;
+      }
       // Non-dotted message key so Cloudflare log-forwarding does not mangle it,
       // matching the resolve_window_shed / resolve_coordinator_* convention.
       console.error("resolve_failed", {

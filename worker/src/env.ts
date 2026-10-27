@@ -200,6 +200,12 @@ export interface Env {
   // Hosted trial: when exactly "true", enables self-serve account deletion
   // (DELETE /v1/account). Default OFF. Stringly-typed.
   SELF_SERVE_DELETE_ENABLED?: string;
+  // When exactly "true", GET /v1/calendar-access-token exists: it hands a
+  // calendar:raw-token bearer the user's raw provider (Google/Microsoft)
+  // access token. Default OFF; anything else answers 404 not_found before
+  // auth, as SELF_SERVE_DELETE_ENABLED does. On only in the smoke deployments, for
+  // bin/_smoke_lib.py; every other env pins "false". Stringly-typed.
+  CALENDAR_RAW_TOKEN_ENABLED?: string;
   // Hosted trial: when exactly "true", operator mail (deletion confirmations,
   // retention warnings) is sent via the system mail API (SMTP2GO). Default
   // OFF: sends are silent no-ops (no fetch, no log line). Needs SYSTEM_MAIL_FROM and

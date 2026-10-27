@@ -214,6 +214,15 @@ describe("O5 parity with the deployed wrangler.toml vars", () => {
     expect(await isMember(email, envFor("[env.dev.vars]"))).toBe(true);
   });
 
+  // bin/identity-smoke.py rebinds B and refuses an admin B (its non-admin
+  // refusal case runs on B's bearer). OPERATOR_EMAIL re-promotes to admin at
+  // every sign-in, so B (629) must be admitted by the allow-list alone.
+  it("[env.dev.vars] admits 629 by the allow-list, not as a seed admin", async () => {
+    const email = "tester1@example.com";
+    expect(csv(tomlVar("[env.dev.vars]", "OPERATOR_EMAIL"))).not.toContain(email);
+    expect(csv(tomlVar("[env.dev.vars]", "MEMBERSHIP_ALLOWLIST"))).toContain(email);
+  });
+
   it("[env.dev.vars] refuses an active dev user outside the allow-list", async () => {
     expect(csv(tomlVar("[env.dev.vars]", "MEMBERSHIP_ALLOWLIST")).length).toBeGreaterThan(0);
     await upsertUser(env.DB, "stray@unlisted.example");

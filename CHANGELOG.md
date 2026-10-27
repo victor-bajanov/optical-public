@@ -3,6 +3,54 @@
 Curated notes for each public release, newest first. The full commit list for
 a release is in that release's PR on the public repository.
 
+## v1.3.0
+
+Identity hardening and data minimisation, from preparing the hosted trial
+for Google's OAuth verification.
+
+- **Upgrading:** apply migration **0046** (`identity_tokens.login_email`)
+  before deploying, in every environment. Without it every sign-in and every
+  owner email fails. The raw calendar-token route is now off by default
+  (below): set `CALENDAR_RAW_TOKEN_ENABLED = "true"` on any environment the
+  `bin/` smoke harnesses target.
+- **Sign-in address:** each sign-in stores its verified email as
+  `login_email`. Owner mail, the Gmail `From` and the poll organiser name use
+  it, so a user whose Google address or Entra UPN is renamed gets mail at the
+  new address after their next sign-in. Membership and every key stay on the
+  provider subject.
+- **Admin rebind** (`POST /admin/identity-rebind`, `bin/optical-admin.py
+  rebind`): releases an account that `REFUSE_PROVIDER_REBIND` has locked, so
+  the next sign-in as that address binds whoever holds it. It ends the
+  account's sessions, wipes its stored refresh credential, deletes pending
+  plans, revokes calendar feed URLs and kills emailed accept links and
+  organiser poll status links. Until the next sign-in, `resolve` and
+  `replanNow` answer `409 identity_credential_missing`. It answers
+  `409 subject_drifted` when the owner now signs in under another address
+  (`--force` overrides) and `409 concurrent_update` when a sign-in raced it.
+  Runbook §S; smoke: `bin/identity-smoke.py`.
+- **Provider switch:** signing in with the other provider under the same
+  email now resets that subject's calendar sync state atomically, and closes
+  a race between the switch and a concurrent token refresh.
+- **Data minimisation:**
+  - Calendar reads fetch only the event fields Optical uses (Google
+    `fields=`, Graph `$select`); location and description are no longer kept.
+  - Third-party event titles leave a plan when it is accepted, and a daily
+    sweep scrubs any committed plan that still holds them. `GET /v1/schedule`
+    and `GET /v1/plans/{hash}` no longer return `body.warnings`.
+  - The cached IdP access token is encrypted, keyed by a hash rather than
+    the user's email, and kept for at most an hour.
+  - Expired agent-confirm actions are pruned daily.
+  - Prod turns Workers invocation logs off, since capability links carry
+    secrets in request URLs. Console logs still ship.
+- **Raw calendar-token route:** `GET /v1/calendar-access-token` is behind
+  `CALENDAR_RAW_TOKEN_ENABLED` (off: a 404 before auth).
+- **`subscribeWebhook`** now answers `subscribed: true` whenever the caller
+  has a live push channel, including one that already existed. Provider
+  errors no longer return 500.
+- **Docs:** if you run your own OAuth client, your organisation's terms with
+  Google govern the calendar data your users' AI assistant receives,
+  including whether it may be used for model training (runbook §A, README).
+
 ## v1.2.0
 
 Hardening for running Optical for people other than its operator: agents act

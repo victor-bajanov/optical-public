@@ -106,22 +106,6 @@ export async function upsertCalendarSync(
     .run();
 }
 
-/** Forget everything provider-shaped for an owner: sync token AND push channel
- *  fields. Used on an identity-provider switch — a Google sync token handed to
- *  Graph (or a Graph deltaLink handed to Google) is not a 410, it is a hard
- *  error on every replan forever. The row is kept (nulled), not deleted. */
-export async function resetCalendarSyncForOwner(db: D1Database, ownerSubject: string): Promise<void> {
-  const owner = requireOwner(ownerSubject);
-  await db
-    .prepare(
-      `UPDATE calendar_sync SET next_sync_token = NULL, channel_id = NULL, channel_token = NULL,
-         channel_expires_at = NULL, channel_resource_id = NULL, channel_callback_url = NULL
-       WHERE owner_subject = ?`,
-    )
-    .bind(owner)
-    .run();
-}
-
 export interface CalendarSyncChannelOwnerWithProvider {
   owner_subject: string;
   provider: ProviderName;
@@ -156,7 +140,9 @@ export async function listCalendarSyncChannelOwnersWithProvider(
 // calendar_sync row at all, or a row whose channel_id is NULL (sync-token
 // only, or nulled by a provider switch). Disjoint from the renew pass's set
 // at read time. Provider coalesces to "google" exactly as above. The users
-// join keeps a deactivated row out even if a grant row survived it.
+// join keeps a deactivated row out even if a grant row survived it, and a row
+// whose credential an admin rebind wiped holds no grant (it is idle until the
+// next sign-in, whose own subscribe then runs).
 export async function listGrantHoldersWithoutChannel(
   db: D1Database,
 ): Promise<CalendarSyncChannelOwnerWithProvider[]> {
@@ -166,7 +152,7 @@ export async function listGrantHoldersWithoutChannel(
        FROM identity_tokens it
        JOIN users u ON u.subject = it.account_email AND u.is_active = 1
        LEFT JOIN calendar_sync cs ON cs.owner_subject = it.account_email AND cs.calendar_id = ?
-       WHERE cs.channel_id IS NULL
+       WHERE cs.channel_id IS NULL AND length(it.refresh_token_encrypted) > 0
        ORDER BY it.account_email`,
     )
     .bind(PRIMARY_CALENDAR_ID)
@@ -180,12 +166,14 @@ export async function listGrantHoldersWithoutChannel(
 /** Compare-and-set the push-channel fields: writes only while the stored
  *  channel_id still IS `expectedChannelId` (NULL included; a missing row is
  *  inserted) AND the subject still holds a stored grant (an identity_tokens
- *  row). next_sync_token is never touched. Returns false when another writer
- *  changed the channel since `expectedChannelId` was read, or when the subject
- *  has no grant (offboarded while this caller was subscribing — the insert
- *  would otherwise recreate a row the offboard just deleted, keyed by email so
- *  it outlives the purge). Either way the caller's channel lost and must be
- *  stopped (subscription-manager.ts). */
+ *  row whose credential an admin rebind has not wiped). next_sync_token is
+ *  never touched. Returns false when another writer changed the channel since
+ *  `expectedChannelId` was read, or when the subject has no grant (offboarded
+ *  while this caller was subscribing — the insert would otherwise recreate a
+ *  row the offboard just deleted, keyed by email so it outlives the purge; or
+ *  rebound, whose previous holder's channel must not land on the idle
+ *  account). Either way the caller's channel lost and must be stopped
+ *  (subscription-manager.ts). */
 export async function casCalendarSyncChannel(
   db: D1Database,
   ownerSubject: string,
@@ -204,7 +192,7 @@ export async function casCalendarSyncChannel(
     .prepare(
       `INSERT INTO calendar_sync (owner_subject, calendar_id, channel_id, channel_token, channel_expires_at, channel_resource_id, channel_callback_url)
        SELECT ?, ?, ?, ?, ?, ?, ?
-       WHERE EXISTS (SELECT 1 FROM identity_tokens WHERE account_email = ?)
+       WHERE EXISTS (SELECT 1 FROM identity_tokens WHERE account_email = ? AND length(refresh_token_encrypted) > 0)
        ON CONFLICT(owner_subject, calendar_id) DO UPDATE SET
          channel_id = excluded.channel_id,
          channel_token = excluded.channel_token,

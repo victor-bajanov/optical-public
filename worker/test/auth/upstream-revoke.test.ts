@@ -75,6 +75,23 @@ describe("revokeUpstreamGrant", () => {
     for (const l of lines) expect(l).not.toContain(TOKEN);
   });
 
+  it("redacts each `redact` string (case-insensitively) from the logged error, as well as the token", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const out = await revokeUpstreamGrant(ON, {
+      token: TOKEN,
+      idp: { revokeGrant: async (t: string) => { throw new Error(`upstream echoed ${t} for Alice@Example.com`); } },
+      logPrefix: "identity_rebind_revoke",
+      redact: ["alice@example.com"],
+    });
+    expect(out).toBe("failed");
+    const lines = warnLines(warn);
+    expect(lines.filter((l) => l.includes("identity_rebind_revoke_failed"))).toHaveLength(1);
+    for (const l of lines) {
+      expect(l).not.toContain(TOKEN);
+      expect(l.toLowerCase()).not.toContain("alice@example.com");
+    }
+  });
+
   it("never throws: a token-source error (e.g. undecryptable ciphertext) logs <prefix>_failed", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await revokeUpstreamGrant(ON, {

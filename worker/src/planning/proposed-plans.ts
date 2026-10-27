@@ -214,8 +214,24 @@ export function deletePendingPlansForSubjectStmt(db: D1Database, subject: string
     .bind(subject);
 }
 
+/** SET-clause fragment that scrubs a plan's third-party text: render_snapshot
+ *  (other people's event titles, trigger.inviteTitle) and body.warnings
+ *  ("<event.summary>: <code>" for meetings and bookings). Both are read only
+ *  while a plan is pending (accept page, latest-plan, commit confirm); after
+ *  commit only body.schedule / body.dropped / window are read, as the churn and
+ *  drop baselines. A body without warnings is left byte-identical. The plan
+ *  hash is computed once, at insert, and never re-verified against the body.
+ *  Applied at acceptance (the commit-mark) and by the daily cleanup backfill. */
+export const SCRUB_THIRD_PARTY_SET_SQL = `render_snapshot = NULL,
+       body = CASE WHEN json_type(body, '$.warnings') IS NULL THEN body
+                   ELSE json_remove(body, '$.warnings') END`;
+
+const MARK_COMMITTED_SQL =
+  `UPDATE proposed_plans SET committed_at = ?, ${SCRUB_THIRD_PARTY_SET_SQL} WHERE plan_hash = ? AND subject = ?`;
+
 // Owner-scoped for the same reason: the commit path may only flip a plan the
-// caller owns. Returns true iff an owned row was updated.
+// caller owns. Returns true iff an owned row was updated. Scrubs the plan's
+// third-party text in the same UPDATE (SCRUB_THIRD_PARTY_SET_SQL).
 export async function markProposedPlanCommitted(
   db: D1Database,
   planHash: string,
@@ -223,7 +239,7 @@ export async function markProposedPlanCommitted(
   ownerSubject: string,
 ): Promise<boolean> {
   const res = await db
-    .prepare("UPDATE proposed_plans SET committed_at = ? WHERE plan_hash = ? AND subject = ?")
+    .prepare(MARK_COMMITTED_SQL)
     .bind(committedAt, planHash, ownerSubject)
     .run();
   return (res.meta?.changes ?? 0) > 0;
@@ -240,7 +256,7 @@ export function markProposedPlanCommittedStmt(
   ownerSubject: string,
 ): D1PreparedStatement {
   return db
-    .prepare("UPDATE proposed_plans SET committed_at = ? WHERE plan_hash = ? AND subject = ?")
+    .prepare(MARK_COMMITTED_SQL)
     .bind(committedAt, planHash, ownerSubject);
 }
 

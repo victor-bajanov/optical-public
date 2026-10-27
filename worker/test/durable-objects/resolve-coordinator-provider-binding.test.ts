@@ -4,7 +4,7 @@ import {
   defaultRunner,
   __setWebhookReplanForTests,
 } from "../../src/durable-objects/resolve-coordinator";
-import { ACCESS_PREFIX } from "../../src/auth/identity-store";
+import { cacheAccessToken } from "../../src/auth/identity-store";
 import type { CalendarProvider } from "../../src/providers/calendar-provider";
 import type { NotificationProvider } from "../../src/providers/notification-provider";
 
@@ -42,8 +42,8 @@ describe("defaultRunner binds providers to the webhook owner, not the active sub
       .run();
     // Distinct cached access tokens per subject so the bound subject is
     // observable via getAccessToken() with no upstream call.
-    await env.GOOGLE_TOKEN_CACHE.put(ACCESS_PREFIX + ACTIVE_X, "tok-X");
-    await env.GOOGLE_TOKEN_CACHE.put(ACCESS_PREFIX + OWNER_B, "tok-B");
+    await cacheAccessToken(env, ACTIVE_X, "tok-X", 3600);
+    await cacheAccessToken(env, OWNER_B, "tok-B", 3600);
   });
 
   afterEach(() => {

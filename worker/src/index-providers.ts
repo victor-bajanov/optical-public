@@ -14,6 +14,7 @@ import { getAccessToken, getSubjectProvider } from "./auth/identity-store";
 import type { ProviderName } from "./providers/provider-name";
 import type { Env } from "./env";
 import { withOutboundMailCap } from "./mail/outbound-cap";
+import { ownerNotificationEmail } from "./db/owner-email";
 
 export interface AppVariables {
   calendarProvider: CalendarProvider;
@@ -83,6 +84,16 @@ export async function defaultCalendarProvider(
   return new GoogleCalendarProvider({ calendarId: "primary", getAccessToken: getToken, deploymentId: deploymentIdFromEnv(env) });
 }
 
+/** The Gmail provider sends From the owner's current address
+ *  (ownerNotificationEmail: login_email, else the subject), never a possibly
+ *  reassigned subject. Resolved per send, so building a provider never
+ *  touches D1. Graph sends as /me and has no From to set. */
+function gmailNotificationProvider(
+  env: Env, subject: string, getToken: (opts?: { forceRefresh?: boolean }) => Promise<string>,
+): GmailNotificationProvider {
+  return new GmailNotificationProvider({ getFrom: () => ownerNotificationEmail(env.DB, subject), getAccessToken: getToken });
+}
+
 export async function defaultNotificationProvider(
   env: Env, subject: string, providerArg?: ProviderName,
 ): Promise<NotificationProvider> {
@@ -95,9 +106,7 @@ export async function defaultNotificationProvider(
   if (provider === "microsoft") {
     return withOutboundMailCap(env, subject, new MicrosoftGraphNotificationProvider({ getAccessToken: getToken }));
   }
-  return withOutboundMailCap(
-    env, subject, new GmailNotificationProvider({ getFrom: () => Promise.resolve(subject), getAccessToken: getToken }),
-  );
+  return withOutboundMailCap(env, subject, gmailNotificationProvider(env, subject, getToken));
 }
 
 /**
@@ -137,8 +146,6 @@ export async function defaultProviders(
   }
   return {
     calendar: new GoogleCalendarProvider({ calendarId: "primary", getAccessToken: getToken, deploymentId: deploymentIdFromEnv(env) }),
-    notification: withOutboundMailCap(
-      env, subject, new GmailNotificationProvider({ getFrom: () => Promise.resolve(subject), getAccessToken: getToken }),
-    ),
+    notification: withOutboundMailCap(env, subject, gmailNotificationProvider(env, subject, getToken)),
   };
 }

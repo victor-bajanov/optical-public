@@ -6,6 +6,7 @@ import { storeIdentityTokens } from "../../src/auth/identity-store";
 import { MicrosoftCalendarProvider } from "../../src/providers/microsoft-calendar-provider";
 import { MicrosoftGraphNotificationProvider } from "../../src/providers/microsoft-graph-notification-provider";
 import * as mondayResolve from "../../src/cron/monday-resolve";
+import * as pendingActions from "../../src/db/pending-actions";
 
 describe("dispatchScheduled", () => {
   beforeEach(() => __setHandlersForTests(null));
@@ -101,6 +102,61 @@ describe("dispatchScheduled", () => {
     expect((await getUser(env.DB, "stale@org"))?.is_active).toBe(0);
     const auditRow = await env.DB.prepare("SELECT action, source FROM audit_log WHERE action = 'sweep_offboard'").first<Record<string, unknown>>();
     expect(auditRow).toEqual({ action: "sweep_offboard", source: "cron" });
+  });
+
+  it("prunes expired pending_actions on '0 4 * * *' when injected=null (real wiring path)", async () => {
+    __setHandlersForTests(null);
+    await env.DB.prepare("DELETE FROM pending_actions").run();
+    const now = Date.now();
+    const at = (ms: number) => new Date(now + ms).toISOString();
+    const DAY = 24 * 3600 * 1000;
+    const seed = (id: string, expiresAt: string) =>
+      env.DB.prepare(
+        `INSERT INTO pending_actions (id, owner_subject, op, payload, summary, created_at, expires_at, consumed_at)
+         VALUES (?, 'p@org', 'createMeetingPoll', ?, ?, ?, ?, NULL)`,
+      ).bind(id, `{"id":"${id}"}`, `summary ${id}`, at(-10 * DAY), expiresAt).run();
+    await seed("expired", at(-DAY));
+    await seed("old", at(-8 * DAY));
+    await seed("live", at(DAY));
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    const tasks: Promise<unknown>[] = [];
+    await dispatchScheduled(
+      { cron: "0 4 * * *", scheduledTime: now } as unknown as ScheduledEvent,
+      env,
+      {
+        waitUntil: (p: Promise<unknown>) => { tasks.push(p); },
+        passThroughOnException: () => {},
+      } as unknown as ExecutionContext,
+    );
+    await Promise.all(tasks);
+
+    const get = (id: string) =>
+      env.DB.prepare("SELECT payload, summary FROM pending_actions WHERE id = ?").bind(id).first<{ payload: string; summary: string }>();
+    expect(await get("expired")).toEqual({ payload: "", summary: "" });
+    expect(await get("old")).toBeNull();
+    expect(await get("live")).toEqual({ payload: '{"id":"live"}', summary: "summary live" });
+    expect(info).toHaveBeenCalledWith("pending_actions_pruned", { deleted: 1, blanked: 1 });
+  });
+
+  it("logs and swallows a pending_actions prune failure on '0 4 * * *'", async () => {
+    __setHandlersForTests(null);
+    const boom = new Error("boom");
+    vi.spyOn(pendingActions, "pruneExpiredPendingActions").mockRejectedValue(boom);
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const tasks: Promise<unknown>[] = [];
+    await dispatchScheduled(
+      { cron: "0 4 * * *", scheduledTime: Date.now() } as unknown as ScheduledEvent,
+      env,
+      {
+        waitUntil: (p: Promise<unknown>) => { tasks.push(p); },
+        passThroughOnException: () => {},
+      } as unknown as ExecutionContext,
+    );
+    await Promise.all(tasks);
+    expect(pendingActions.pruneExpiredPendingActions).toHaveBeenCalledTimes(1);
+    expect(err).toHaveBeenCalledWith("pending-actions sweep failed", boom);
   });
 
   it("logs and ignores unknown cron expressions", async () => {

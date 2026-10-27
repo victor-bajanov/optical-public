@@ -10,6 +10,7 @@
 import type { Env } from "../env";
 import { PLAN_COMMIT_MAIL_OP } from "../db/pending-actions";
 import { canonicalJson, deliverConfirmation, reserveConfirmation } from "./defer";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 export type PlanMailOutcome =
   | { kind: "sent" }
@@ -26,10 +27,14 @@ export async function sendPlanAcceptEmailOnce(
     expiresAt: string;
     /** Op name for log lines only (no PII). */
     logOp: string;
-    viaProvider: () => Promise<void>;
+    /** Sends to `to`, the owner's notification address (deliverConfirmation). */
+    viaProvider: (to: string) => Promise<void>;
     viaSystem: { subject: string; text: string };
   },
 ): Promise<PlanMailOutcome> {
+  // Before the reserve: a failed read must leave no marker, or every retry is
+  // deduped onto an email that never went out (deliverConfirmation).
+  const to = await ownerNotificationEmail(env.DB, args.owner);
   const now = new Date();
   const rowId = crypto.randomUUID();
   const reserved = await reserveConfirmation(env.DB, {
@@ -51,6 +56,7 @@ export async function sendPlanAcceptEmailOnce(
   }
   const delivered = await deliverConfirmation(env, {
     owner: args.owner,
+    to,
     rowId,
     logOp: args.logOp,
     viaProvider: args.viaProvider,

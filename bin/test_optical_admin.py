@@ -233,6 +233,113 @@ def test_offboard_token_never_printed():
 
 
 # =============================================================================
+# rebind (POST /admin/identity-rebind, plan 2026-10-23-identity-port-105 d10)
+# =============================================================================
+
+def test_parse_rebind_defaults():
+    ns = admin.build_parser().parse_args(["rebind", "a@example.com", "--env", "prod"])
+    assert (ns.command, ns.email, ns.env, ns.yes, ns.force) == (
+        "rebind", "a@example.com", "prod", False, False)
+
+
+def test_parse_rebind_flags():
+    ns = admin.build_parser().parse_args(
+        ["rebind", "a@example.com", "--env", "dev", "--yes", "--force"])
+    assert (ns.yes, ns.force) == (True, True)
+
+
+def test_rebind_without_yes_refuses_before_any_http_and_echoes_target():
+    http = FakeHttp()
+    code, _, err = _run_main(["rebind", "a@example.com", "--env", "dev", "--force"], http=http)
+    assert code == 2
+    assert http.calls == []
+    assert "--yes" in err
+    assert "a@example.com" in err and "env=dev" in err and EXPECTED_HOSTS["dev"] in err
+
+
+def test_rebind_without_yes_refuses_even_without_a_token():
+    http = FakeHttp()
+    code, _, err = _run_main(["rebind", "a@example.com", "--env", "dev"], http=http, environ={})
+    assert code == 2
+    assert http.calls == []
+    assert "--yes" in err
+
+
+@pytest.mark.parametrize("env", sorted(EXPECTED_HOSTS))
+def test_rebind_posts_trimmed_subject_without_force(env):
+    http = FakeHttp(body={"ok": True, "subject": "a@example.com"})
+    code, out, err = _run_main(["rebind", "  a@example.com ", "--env", env, "--yes"], http=http)
+    assert code == 0
+    assert len(http.calls) == 1
+    req = http.calls[0]
+    assert req.get_method() == "POST"
+    assert req.full_url == f"https://{EXPECTED_HOSTS[env]}/admin/identity-rebind"
+    assert json.loads(req.data) == {"subject": "a@example.com"}
+    assert req.get_header("Content-type") == "application/json"
+    assert f"env={env}" in err and EXPECTED_HOSTS[env] in err and "a@example.com" in err
+    assert json.loads(out) == {"ok": True, "subject": "a@example.com"}
+
+
+def test_rebind_force_adds_force_true():
+    http = FakeHttp()
+    _run_main(["rebind", "a@example.com", "--env", "dev", "--yes", "--force"], http=http)
+    assert json.loads(http.calls[0].data) == {"subject": "a@example.com", "force": True}
+
+
+def test_rebind_request_carries_bearer_and_user_agent_and_never_prints_token():
+    http = FakeHttp(status=401, body={"error": "invalid_token"})
+    _, out, err = _run_main(["rebind", "a@example.com", "--env", "dev", "--yes"], http=http)
+    req = http.calls[0]
+    assert req.get_header("Authorization") == f"Bearer {TOKEN}"
+    assert req.get_header("User-agent").startswith("optical-admin/")
+    assert TOKEN not in out and TOKEN not in err
+
+
+def test_rebind_missing_token_refuses_before_any_http():
+    http = FakeHttp()
+    code, _, err = _run_main(["rebind", "a@example.com", "--env", "dev", "--yes"],
+                             http=http, environ={})
+    assert code == 2
+    assert http.calls == []
+    assert "OPTICAL_ADMIN_TOKEN" in err
+
+
+def test_rebind_subject_drifted_exits_1_with_a_force_hint():
+    http = FakeHttp(status=409, body={"error": "subject_drifted", "subject": "old@example.com",
+                                      "login_email": "new@example.org"})
+    code, _, err = _run_main(["rebind", "old@example.com", "--env", "prod", "--yes"], http=http)
+    assert code == 1
+    assert "409" in err and "subject_drifted" in err
+    assert "--force" in err
+    assert "new@example.org" in err
+    assert "confirm" in err.lower()
+
+
+def test_rebind_other_409_has_no_force_hint():
+    http = FakeHttp(status=409, body={"error": "ambiguous_subject"})
+    code, _, err = _run_main(["rebind", "a@example.com", "--env", "dev", "--yes"], http=http)
+    assert code == 1
+    assert "ambiguous_subject" in err
+    assert "--force" not in err
+
+
+def test_rebind_docs_warn_that_sessions_end():
+    # The rebind revokes the subject's Optical sessions (oauth_tokens, codes,
+    # pending confirm links), so the operator must know clients re-authorise.
+    doc = admin.__doc__
+    assert "revokes" in doc and "re-authorise" in doc
+    rb = admin.build_parser()._subparsers._group_actions[0].choices["rebind"]
+    assert "re-authorise" in rb.format_help()
+
+
+def test_offboard_409_has_no_force_hint():
+    http = FakeHttp(status=409, body={"error": "subject_drifted"})
+    code, _, err = _run_main(["offboard", "a@example.com", "--env", "dev", "--yes"], http=http)
+    assert code == 1
+    assert "--force" not in err
+
+
+# =============================================================================
 # run-cron
 # =============================================================================
 
@@ -288,7 +395,7 @@ def test_list_users_dev_command_shape():
     assert call["cmd"] == [
         "npx", "wrangler", "d1", "execute", "DB", "--env", "dev", "--remote", "--json",
         "--command",
-        "SELECT subject, role, is_active, last_seen, retention_warned_at, deactivated_at FROM users",
+        admin.USERS_SQL_TIERS[0],
     ]
     assert Path(call["cwd"]) == BIN.parent / "worker"
     assert "a@x.example" in out
@@ -308,15 +415,16 @@ def test_list_users_query_is_read_only_select():
 
 
 def test_list_users_falls_back_without_retention_column():
-    # A pre-0041 env also lacks 0043's deactivated_at: two misses, then legacy.
+    # A pre-0041 env also lacks 0043's deactivated_at and 0046's login_email:
+    # three misses, then legacy.
     missing = subprocess.CompletedProcess(
         [], 1, stdout='{"error":{"text":"no such column: retention_warned_at"}}', stderr="")
     rows = [{k: v for k, v in ROWS[0].items() if k != "retention_warned_at"}]
-    run = FakeRun([missing, missing, _ok(rows)])
+    run = FakeRun([missing, missing, missing, _ok(rows)])
     code, out, _ = _run_main(["list-users", "--env", "dev"], run=run, environ={})
     assert code == 0
-    assert len(run.calls) == 3
-    assert run.calls[2]["cmd"][-1] == "SELECT subject, role, is_active, last_seen FROM users"
+    assert len(run.calls) == 4
+    assert run.calls[3]["cmd"][-1] == "SELECT subject, role, is_active, last_seen FROM users"
     assert "a@x.example" in out
 
 
@@ -457,12 +565,46 @@ def test_list_users_selects_deactivated_at():
 def test_list_users_falls_back_without_deactivated_at_column():
     missing = subprocess.CompletedProcess(
         [], 1, stdout='{"error":{"text":"no such column: deactivated_at"}}', stderr="")
-    run = FakeRun([missing, _ok(ROWS)])
+    run = FakeRun([missing, missing, _ok(ROWS)])
     code, out, _ = _run_main(["list-users", "--env", "dev"], run=run, environ={})
     assert code == 0
-    assert run.calls[1]["cmd"][-1] == (
+    assert run.calls[2]["cmd"][-1] == (
         "SELECT subject, role, is_active, last_seen, retention_warned_at FROM users")
     assert "a@x.example" in out
+
+
+# login_email (migration 0046): who signs in under which address. Membership
+# stays on the subject, so a renamed user is easy to miss without this column.
+
+def test_list_users_top_tier_joins_login_email():
+    sql = admin.USERS_SQL_TIERS[0]
+    assert sql.startswith("SELECT ") and ";" not in sql
+    assert "LEFT JOIN identity_tokens" in sql
+    assert "login_email" in sql
+    # Every column the lower tiers carry is still there, under its bare name.
+    for col in ("subject", "role", "is_active", "last_seen", "retention_warned_at",
+                "deactivated_at"):
+        assert f"AS {col}" in sql
+
+
+def test_list_users_reports_login_email():
+    rows = [dict(ROWS[0], deactivated_at=None, login_email="renamed@example.org")]
+    run = FakeRun([_ok(rows)])
+    code, out, _ = _run_main(["list-users", "--env", "dev"], run=run, environ={})
+    assert code == 0
+    assert json.loads(out)[0]["login_email"] == "renamed@example.org"
+
+
+def test_list_users_falls_back_without_login_email_column():
+    missing = subprocess.CompletedProcess(
+        [], 1, stdout='{"error":{"text":"no such column: i.login_email"}}', stderr="")
+    run = FakeRun([missing, _ok(ROWS)])
+    code, out, err = _run_main(["list-users", "--env", "dev"], run=run, environ={})
+    assert code == 0
+    assert run.calls[1]["cmd"][-1] == (
+        "SELECT subject, role, is_active, last_seen, retention_warned_at, deactivated_at FROM users")
+    assert "a@x.example" in out
+    assert "older schema" in err
 
 
 # =============================================================================

@@ -24,6 +24,7 @@ import {
 import type { AppVariables } from "../index-providers";
 import { requireOwner } from "../middleware/owner-gate";
 import { defaultCalendarProvider, defaultNotificationProvider } from "../index-providers";
+import { ownerNotificationEmail } from "../db/owner-email";
 import { hasOutboundMailBudget, OutboundMailCapExceeded, reserveOutboundMail } from "../mail/outbound-cap";
 import {
   createPoll,
@@ -67,6 +68,7 @@ import {
   formatDateTime,
 } from "../polls/emails";
 import { signCapabilityWithEnv } from "../auth/capability";
+import { identityAnchorTag } from "../auth/identity-rebind";
 import { hashToken, generateOpaqueToken } from "../auth/tokens";
 import { hashingKey } from "../auth/crypto-keys";
 import { ALL_KINDS, MAX_LOCATION_LENGTH, type LocationKind } from "../booking/location";
@@ -160,7 +162,10 @@ async function mintInviteeToken(
  *  working through the same escalation/resolve window. */
 async function mintStatusToken(env: Env, pollId: string, subject: string, deadlineUtc: string, now: Date): Promise<string> {
   const ttlSeconds = Math.max(1, Math.round((Date.parse(deadlineUtc) - now.getTime()) / 1000)) + 7 * 86_400;
-  return signCapabilityWithEnv({ purpose: "poll-status", pollId, subject, ttlSeconds }, env);
+  return signCapabilityWithEnv(
+    { purpose: "poll-status", pollId, subject, ttlSeconds, anchor: await identityAnchorTag(env, subject) },
+    env,
+  );
 }
 
 function statusUrlFor(env: Env, pollId: string, token: string): string {
@@ -413,7 +418,7 @@ const CreatePollBody = z.object({
 
 const CreatePollResponse = z.object({
   id: z.string().describe("Poll id."),
-  statusUrl: z.string().describe("The organiser's own read-only status page for this poll (GET /poll/{id}/status): roster, response grid, and top candidate slots. Carries an embedded capability token (query param `t`) so it opens directly in a browser; it also accepts the same bearer-token auth as this API. Expires poll deadline + 7 days grace, same window as invitee links."),
+  statusUrl: z.string().describe("The organiser's own read-only status page for this poll (GET /poll/{id}/status): roster, response grid, and top candidate slots. Carries an embedded capability token (query param `t`) so it opens directly in a browser; it also accepts the same bearer-token auth as this API. Expires poll deadline + 7 days grace, same window as invitee links. The link stops working if the account is later bound to a different sign-in identity (an admin rebind or a provider switch); the bearer path still opens the page."),
   guestUrl: z.string().optional().describe("Shareable guest-join link; present only when guestLink was true. Opens a public join form (name, email, Turnstile challenge) — submitting it does not return a URL or token. Instead it emails the submitter their own personal, tokenised poll link, the same way an originally-invited invitee gets theirs."),
 });
 
@@ -681,6 +686,9 @@ async function createPollCore<H>(
   // middleware does) — mirrors the established fallback idiom at
   // replan-now.ts:50 / admin/run-cron-route.ts:20.
   const notification = io.notification ?? await defaultNotificationProvider(env, owner);
+  // Invitees see (and may reply to) this name, so it is the owner's current
+  // address, never the subject (db/owner-email.ts).
+  const organiserName = await ownerNotificationEmail(db, owner);
   for (const inv of invitees) {
     const inviteeId = newInviteeId();
     const pseudonym = mintPseudonym(taken);
@@ -699,7 +707,7 @@ async function createPollCore<H>(
     const inviteeUrl = inviteeUrlFor(env, poll.id, token);
     const content = renderInviteEmail({
       pollTitle: body.title,
-      organiserName: owner,
+      organiserName,
       durationMin: body.durationMin,
       rangeStart: body.rangeStart,
       rangeEnd: body.rangeEnd,
@@ -764,6 +772,9 @@ async function nudgePollCore<H>(
   // middleware does) — mirrors the established fallback idiom at
   // replan-now.ts:50 / admin/run-cron-route.ts:20.
   const notification = io.notification ?? await defaultNotificationProvider(env, owner);
+  // Invitees see (and may reply to) this name, so it is the owner's current
+  // address, never the subject (db/owner-email.ts).
+  const organiserName = await ownerNotificationEmail(db, owner);
   // O9.8: reserve every recipient BEFORE rotating any token, all or nothing.
   try {
     await reserveOutboundMail(env, owner, notification, nonResponders.map((i) => i.email), now);
@@ -778,7 +789,7 @@ async function nudgePollCore<H>(
     const inviteeUrl = inviteeUrlFor(env, poll.id, token);
     const content = renderNudgeEmail({
       pollTitle: poll.title,
-      organiserName: owner,
+      organiserName,
       durationMin: poll.durationMin,
       rangeStart: poll.rangeStart,
       rangeEnd: poll.rangeEnd,
@@ -816,6 +827,11 @@ async function cancelPollCore<H>(
   const halted = await stopAt(io, { poll });
   if (halted) return halted;
 
+  // Read before the CAS below, so a failed read cancels nothing.
+  // Invitees see (and may reply to) this name, so it is the owner's current
+  // address, never the subject (db/owner-email.ts).
+  const organiserName = await ownerNotificationEmail(db, owner);
+
   // CAS, not a blind write: a concurrent casSetBooked (cron bookAtDeadline
   // or the all-in path) can land between the getPollForSubject read above
   // and this write. A blind UPDATE would clobber a just-booked poll back
@@ -840,7 +856,7 @@ async function cancelPollCore<H>(
   const notification = io.notification ?? await defaultNotificationProvider(env, owner);
   const content = renderPollCancelledEmail({
     pollTitle: poll.title,
-    organiserName: owner,
+    organiserName,
     durationMin: poll.durationMin,
     rangeStart: poll.rangeStart,
     rangeEnd: poll.rangeEnd,
@@ -1202,11 +1218,14 @@ async function updatePollCore<H>(
   // middleware does) — mirrors the established fallback idiom at
   // replan-now.ts:50 / admin/run-cron-route.ts:20.
   const notification = io.notification ?? await defaultNotificationProvider(env, owner);
+  // Invitees see (and may reply to) this name, so it is the owner's current
+  // address, never the subject (db/owner-email.ts).
+  const organiserName = await ownerNotificationEmail(db, owner);
 
   for (const { inviteeId, email, url } of toInviteEmail) {
     const content = renderInviteEmail({
       pollTitle: finalPollRow.title,
-      organiserName: owner,
+      organiserName,
       durationMin: finalPollRow.durationMin,
       rangeStart: finalPollRow.rangeStart,
       rangeEnd: finalPollRow.rangeEnd,
@@ -1223,7 +1242,7 @@ async function updatePollCore<H>(
   for (const removed of actuallyRemoved) {
     const content = renderInviteeRemovedEmail({
       pollTitle: finalPollRow.title,
-      organiserName: owner,
+      organiserName,
       durationMin: finalPollRow.durationMin,
       rangeStart: finalPollRow.rangeStart,
       rangeEnd: finalPollRow.rangeEnd,
@@ -1252,7 +1271,7 @@ async function updatePollCore<H>(
       const inviteeUrl = inviteeUrlFor(env, poll.id, token);
       const content = renderDeadlineExtendedEmail({
         pollTitle: finalPollRow.title,
-        organiserName: owner,
+        organiserName,
         durationMin: finalPollRow.durationMin,
         rangeStart: finalPollRow.rangeStart,
         rangeEnd: finalPollRow.rangeEnd,
@@ -1435,7 +1454,7 @@ async function deferCreate(c: PollCtx, owner: string, body: CreatePollInput, pla
     op: "createMeetingPoll",
     payload: body,
     summary: createPollView({
-      owner,
+      organiserName: await ownerNotificationEmail(c.env.DB, owner),
       tz,
       basics: { title: body.title, durationMin: body.durationMin, rangeStart: body.rangeStart, rangeEnd: body.rangeEnd },
       deadlineUtc: body.deadlineUtc,
@@ -1453,7 +1472,7 @@ async function deferNudge(c: PollCtx, owner: string, plan: NudgePlan): Promise<R
   return deferForConfirmation(c, {
     op: "nudgeMeetingPoll",
     payload: { pollId: plan.poll.id, recipients, content: contentOf(plan.poll) },
-    summary: nudgeView({ owner, ...plan }),
+    summary: nudgeView({ organiserName: await ownerNotificationEmail(c.env.DB, owner), ...plan }),
   });
 }
 
@@ -1462,7 +1481,7 @@ async function deferCancel(c: PollCtx, owner: string, plan: CancelPlan): Promise
   return deferForConfirmation(c, {
     op: "cancelMeetingPoll",
     payload: { pollId: plan.poll.id, content: contentOf(plan.poll) },
-    summary: cancelView({ owner, poll: plan.poll, recipients }),
+    summary: cancelView({ organiserName: await ownerNotificationEmail(c.env.DB, owner), poll: plan.poll, recipients }),
   });
 }
 
@@ -1492,7 +1511,7 @@ async function deferUpdate(c: PollCtx, owner: string, body: UpdatePollInput, pla
       bookingAttendees: plan.mayBook ? plan.remaining.map((i) => i.email) : [],
     },
     summary: updateView({
-      owner,
+      organiserName: await ownerNotificationEmail(c.env.DB, owner),
       tz: await getHomeTz(c.env.DB, owner, c.env.SCHEDULER_TZ),
       poll: plan.poll,
       newTitle: body.title,

@@ -88,6 +88,18 @@ def test_tzsmoke_task_title_is_harness_row():
     assert rse.is_harness_row(row, rse.HARNESS_TITLE_PREFIXES) is True
 
 
+def test_id_smoke_marker_title_is_harness_row():
+    # bin/identity-smoke.py's marker task ("[id-smoke] rebind marker"), owned
+    # by B; a run killed before its cleanup leaves it behind.
+    row = {"title": "[id-smoke] rebind marker"}
+    assert rse.is_harness_row(row, rse.HARNESS_TITLE_PREFIXES) is True
+
+
+def test_id_smoke_marker_matched_by_external_id():
+    task = {"title": "renamed", "source": {"kind": "mcp", "external_id": "id-smoke-0123456789ab"}}
+    assert rse.is_harness_task(task) is True
+
+
 def test_real_user_row_is_not_harness_row():
     row = {"title": "Write memo"}
     assert rse.is_harness_row(row, rse.HARNESS_TITLE_PREFIXES) is False

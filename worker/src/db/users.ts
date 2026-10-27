@@ -233,10 +233,3 @@ export async function getDoneColorId(db: D1Database, subject: string, envDefault
   }
   return resolved;
 }
-
-/** Forget the user's done marker. It is provider-shaped (a Google colorId vs
- *  the Outlook "Optical Done" category), so an identity-provider switch clears
- *  it and the login callback re-seeds the new provider's default. */
-export async function clearDoneColorId(db: D1Database, subject: string): Promise<void> {
-  await db.prepare(`UPDATE users SET done_color_id = NULL WHERE subject = ?`).bind(subject).run();
-}

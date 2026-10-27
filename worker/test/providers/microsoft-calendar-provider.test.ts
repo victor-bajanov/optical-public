@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { MicrosoftCalendarProvider } from "../../src/providers/microsoft-calendar-provider";
-import { OPTICAL_DONE_CATEGORY, graphPropId } from "../../src/providers/graph-event-mapping";
+import { OPTICAL_DONE_CATEGORY, GRAPH_EVENT_SELECT, graphPropId } from "../../src/providers/graph-event-mapping";
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -571,5 +571,122 @@ describe("MicrosoftCalendarProvider delta horizon", () => {
     const u = new URL(fetchFn.mock.calls[0]![0] as string);
     expect(u.searchParams.get("startDateTime")).toBe("2026-06-12T00:00:00.000Z");
     expect(u.searchParams.get("endDateTime")).toBe("2028-01-10T00:00:00.000Z");
+  });
+});
+
+// Partial response (OAuth verification, data minimisation): the plain
+// calendarView and single-event reads $select only what the mapper consumes.
+// The delta read cannot: Microsoft Learn (event: delta, v1.0) says a delta on
+// calendarView returns the GET /calendarView property set and "You cannot use
+// $select to get only a subset of those properties", so it stays unselected.
+const FULL_GRAPH_EVENT = {
+  "@odata.etag": 'W/"abc"',
+  id: "full-1",
+  createdDateTime: "2026-07-01T00:00:00Z",
+  lastModifiedDateTime: "2026-07-02T00:00:00Z",
+  changeKey: "ck",
+  iCalUId: "ical-1",
+  webLink: "https://outlook.office365.com/owa/?itemid=x",
+  subject: "Quarterly review",
+  bodyPreview: "Secret agenda",
+  body: { contentType: "html", content: "<p>Secret agenda</p>" },
+  location: { displayName: "Board room 4" },
+  locations: [{ displayName: "Board room 4" }],
+  start: { dateTime: "2026-07-06T09:00:00.0000000", timeZone: "UTC" },
+  end: { dateTime: "2026-07-06T10:00:00.0000000", timeZone: "UTC" },
+  showAs: "tentative",
+  isCancelled: false,
+  isAllDay: false,
+  isOrganizer: true,
+  isOnlineMeeting: true,
+  onlineMeeting: { joinUrl: "https://teams.microsoft.com/l/x" },
+  organizer: { emailAddress: { name: "Me", address: "me@example.com" } },
+  attendees: [
+    { type: "required", status: { response: "accepted" }, emailAddress: { name: "Me", address: "ME@example.com" } },
+    { type: "optional", status: { response: "tentativelyAccepted" }, emailAddress: { address: "a@example.com" } },
+    { type: "resource", status: { response: "none" }, emailAddress: { address: "room@example.com" } },
+  ],
+  categories: ["Blue", OPTICAL_DONE_CATEGORY],
+  singleValueExtendedProperties: [{ id: graphPropId("scheduler_chunk_id"), value: "chunk-1" }],
+};
+
+/** A Graph fake that honours $select the way Graph does: only the named
+ *  top-level properties come back, plus OData annotations and whatever
+ *  $expand asked for (singleValueExtendedProperties). */
+function selectingGraphFake(event: Record<string, unknown>, honourSelect: boolean) {
+  return vi.fn(async (input: string) => {
+    const url = new URL(input);
+    const select = url.searchParams.get("$select");
+    const shape = (e: Record<string, unknown>) => {
+      if (!honourSelect || !select) return e;
+      const keep = new Set(select.split(","));
+      return Object.fromEntries(
+        Object.entries(e).filter(
+          ([k]) => keep.has(k) || k.startsWith("@odata.") || k === "singleValueExtendedProperties",
+        ),
+      );
+    };
+    if (url.pathname.includes("/me/events/")) return json(shape(event));
+    return json({ value: [shape(event)] });
+  });
+}
+
+describe("MicrosoftCalendarProvider partial response ($select)", () => {
+  it("exports the select list: the mapper's fields only, no body/bodyPreview/location", () => {
+    expect(GRAPH_EVENT_SELECT.split(",").sort()).toEqual(
+      [
+        "id", "subject", "start", "end", "showAs", "isCancelled", "isAllDay",
+        "isOrganizer", "organizer", "attendees", "categories",
+      ].sort(),
+    );
+  });
+
+  it("plain calendarView and getEvent carry $select = GRAPH_EVENT_SELECT and keep $expand", async () => {
+    const fetchFn = selectingGraphFake(FULL_GRAPH_EVENT, false);
+    const p = provider(fetchFn);
+    await p.fetchEventsInWindow("2026-07-06T00:00:00Z", "2026-07-13T00:00:00Z", { syncToken: false });
+    await p.getEvent("full-1");
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    for (const call of fetchFn.mock.calls) {
+      const u = new URL(call[0] as string);
+      expect(u.searchParams.get("$select")).toBe(GRAPH_EVENT_SELECT);
+      expect(u.searchParams.get("$expand")).toContain("singleValueExtendedProperties($filter=");
+    }
+  });
+
+  it("the delta initial URL carries no $select (documented unsupported on delta)", async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(json({ value: [], "@odata.deltaLink": "d" }));
+    await provider(fetchFn).fetchEventsInWindow("2026-07-06T00:00:00Z", "2026-07-13T00:00:00Z");
+    const u = new URL(fetchFn.mock.calls[0]![0] as string);
+    expect(u.pathname).toContain("/me/calendarView/delta");
+    expect(u.searchParams.has("$select")).toBe(false);
+  });
+
+  it("delta reads still never surface body or location in the mapped event", async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(json({ value: [FULL_GRAPH_EVENT], "@odata.deltaLink": "d" }));
+    const r = await provider(fetchFn).fetchEventsInWindow("2026-07-06T00:00:00Z", "2026-07-13T00:00:00Z");
+    expect(r.events).toHaveLength(1);
+    expect(JSON.stringify(r.events)).not.toContain("Secret agenda");
+    expect(JSON.stringify(r.events)).not.toContain("Board room 4");
+  });
+
+  it("sufficiency: plain calendarView maps identically from the full and the selected response", async () => {
+    const window = ["2026-07-06T00:00:00Z", "2026-07-13T00:00:00Z", { syncToken: false }] as const;
+    const full = await provider(selectingGraphFake(FULL_GRAPH_EVENT, false)).fetchEventsInWindow(...window);
+    const selected = await provider(selectingGraphFake(FULL_GRAPH_EVENT, true)).fetchEventsInWindow(...window);
+    expect(full.events.map((e) => e.id)).toEqual(["full-1"]);
+    expect(selected).toEqual(full);
+  });
+
+  it("sufficiency: getEvent maps identically from the full and the selected response", async () => {
+    for (const ev of [
+      FULL_GRAPH_EVENT,
+      { ...FULL_GRAPH_EVENT, isCancelled: true },
+      { ...FULL_GRAPH_EVENT, isAllDay: true, showAs: "oof", isOrganizer: false },
+    ]) {
+      const full = await provider(selectingGraphFake(ev, false)).getEvent("full-1");
+      const selected = await provider(selectingGraphFake(ev, true)).getEvent("full-1");
+      expect(selected).toEqual(full);
+    }
   });
 });

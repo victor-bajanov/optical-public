@@ -4,7 +4,12 @@ import { v1 as app } from "../src/v1";
 import { hashToken } from "../src/auth/tokens";
 import { hashingKey } from "../src/auth/crypto-keys";
 import { upsertUser } from "../src/db/users";
-import { storeIdentityTokens, ACCESS_PREFIX } from "../src/auth/identity-store";
+import { storeIdentityTokens, dropCachedAccessToken } from "../src/auth/identity-store";
+
+// Card C5: the route exists only where CALENDAR_RAW_TOKEN_ENABLED is "true";
+// vitest inherits prod's top-level "false", so every case here turns it on.
+// The flag-off behaviour lives in test/handlers/calendar-access-token-flag.test.ts.
+const onEnv = { ...env, CALENDAR_RAW_TOKEN_ENABLED: "true" };
 
 async function seedBearer(token: string, subject: string, scopes: string) {
   const h = await hashToken(token, hashingKey(env));
@@ -26,7 +31,7 @@ beforeEach(async () => {
 
 describe("GET /v1/calendar-access-token", () => {
   it("401 without bearer", async () => {
-    expect((await app.request("/calendar-access-token", {}, env)).status).toBe(401);
+    expect((await app.request("/calendar-access-token", {}, onEnv)).status).toBe(401);
   });
 
   it("403 insufficient_scope when the bearer lacks calendar:raw-token", async () => {
@@ -34,7 +39,7 @@ describe("GET /v1/calendar-access-token", () => {
     const res = await app.request(
       "/calendar-access-token",
       { headers: { Authorization: "Bearer tok" } },
-      env,
+      onEnv,
     );
     expect(res.status).toBe(403);
     expect((await res.json() as { error: string }).error).toBe("insufficient_scope");
@@ -45,7 +50,7 @@ describe("GET /v1/calendar-access-token", () => {
 
     it("mints the token through the Microsoft IdP for a subject signed in with Microsoft", async () => {
       const msEnv = {
-        ...env,
+        ...onEnv,
         MS_PROVIDER_ENABLED: "true",
         MICROSOFT_OAUTH_CLIENT_ID: "ms-client",
         MICROSOFT_OAUTH_CLIENT_SECRET: "ms-secret",
@@ -57,7 +62,7 @@ describe("GET /v1/calendar-access-token", () => {
       );
       // storeIdentityTokens caches the access token; delete it so getAccessToken
       // falls through to idp.refreshAccessToken and we can observe which IdP fired.
-      await msEnv.GOOGLE_TOKEN_CACHE.delete(ACCESS_PREFIX + "u@org");
+      await dropCachedAccessToken(msEnv, "u@org");
       await seedBearer("tok", "u@org", "scheduler:read scheduler:write calendar:raw-token");
 
       const fetchFn = vi.fn(async () => new Response(JSON.stringify({

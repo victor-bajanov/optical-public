@@ -4,6 +4,7 @@ import { writeAudit } from "../db/audit";
 import { systemMailer, type SystemMailer } from "../mail/system-mailer";
 import { retentionDeletedEmail, retentionWarningEmail } from "../mail/lifecycle-templates";
 import { parsePurgeDays, purgeDeletedAccounts } from "./purge-deleted";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -116,7 +117,10 @@ async function retentionSweep(
           retentionDays: days,
           deploymentLabel: env.DEPLOYMENT_LABEL,
         });
-        const { ok } = await mailer.send({ to: subject, ...mail });
+        // The latest verified sign-in address: the subject can belong to
+        // someone else after an IdP rename (db/owner-email.ts).
+        const to = await ownerNotificationEmail(env.DB, subject);
+        const { ok } = await mailer.send({ to, ...mail });
         if (!ok) continue; // no stamp: retry next run (the mailer logged why)
       } else {
         // Never the address: the subject is the user's email.
@@ -181,6 +185,9 @@ async function retentionSweep(
 
   const swept: string[] = [];
   for (const subject of stale) {
+    // Resolved before offboardUser, which deletes the identity_tokens row the
+    // address lives in.
+    let to = subject;
     try {
       // `stale` was read once, and offboarding earlier users takes a while
       // (calendar sweep, upstream revoke), so re-run the predicate for this
@@ -197,6 +204,7 @@ async function retentionSweep(
         console.warn("retention_delete_raced");
         continue;
       }
+      to = await ownerNotificationEmail(env.DB, subject);
       await offboardUser(env, subject, "cron-sweep", { ...offboardOpts, auditSource: "cron" });
       await writeAudit(env.DB, {
         subject,
@@ -213,7 +221,7 @@ async function retentionSweep(
     // Best-effort: the mailer never throws and logs its own failures; a lost
     // notice never undoes or blocks the offboard.
     await mailer.send({
-      to: subject,
+      to,
       ...retentionDeletedEmail({
         retentionDays: days,
         purgeAfterDays: parsePurgeDays(env.DELETED_ACCOUNT_RETENTION_DAYS),

@@ -3,6 +3,7 @@ import type { NotificationProvider, PollEmail } from "../providers/notification-
 import type { ReplanEmailModel } from "../diff/email-model";
 import type { RenderOpts } from "../diff/diff-email-renderer";
 import { parseEnvNumberWithFloor } from "../util/env-parse";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 /**
  * Per-subject outbound mail cap (hosted-trial card O9.8).
@@ -16,8 +17,10 @@ import { parseEnvNumberWithFloor } from "../util/env-parse";
  * - Unit = third-party RECIPIENTS, not messages: a message to N addresses
  *   costs N. Today every send has a single `to`, so the two coincide, but
  *   recipients stays correct if a multi-address send is ever added.
- * - Self-addressed mail (to === subject: replan emails, organiser booked/
- *   escalation/response notices) is never counted or refused. It cannot
+ * - Self-addressed mail (to the subject or to identity_tokens.login_email,
+ *   the owner's current address after an IdP-side rename: replan emails,
+ *   organiser booked/escalation/response notices) is never counted or
+ *   refused, matched case-insensitively (see selfAddresses). It cannot
  *   exfiltrate anything, and capping it would let poll mail starve the
  *   user's own weekly plan email.
  * - OUTBOUND_MAIL_DAILY_CAP: unset/blank/unparseable → 50. "0" means NO
@@ -62,13 +65,31 @@ function bareAddress(part: string): string {
   return (angle?.[1] ?? part).trim().toLowerCase();
 }
 
-/** Recipients in `to` (comma/semicolon separated) other than `subject`. */
-export function countThirdPartyRecipients(to: string, subject: string): number {
-  const self = subject.trim().toLowerCase();
+/** Recipients in `to` (comma/semicolon separated) other than the sender's
+ *  own address(es), compared case-insensitively. `self` is the subject, or
+ *  every self address (selfAddresses) when the owner has a login_email. */
+export function countThirdPartyRecipients(to: string, self: string | readonly string[]): number {
+  const own = new Set((typeof self === "string" ? [self] : self).map((a) => a.trim().toLowerCase()));
   return to
     .split(/[,;]/)
     .map(bareAddress)
-    .filter((a) => a.length > 0 && a !== self).length;
+    .filter((a) => a.length > 0 && !own.has(a)).length;
+}
+
+/** The subject's own mailbox addresses: the subject, plus login_email (via
+ *  ownerNotificationEmail) when it is set and differs. Owner mail goes to
+ *  login_email after a rename, and it must stay free under the cap. */
+export async function selfAddresses(env: Pick<Env, "DB">, subject: string): Promise<string[]> {
+  const login = await ownerNotificationEmail(env.DB, subject);
+  return login.trim().toLowerCase() === subject.trim().toLowerCase() ? [subject] : [subject, login];
+}
+
+/** Third-party recipients across `recipients`. Reads login_email only when
+ *  something isn't already addressed to the bare subject. */
+async function thirdPartyCounts(env: Env, subject: string, recipients: readonly string[]): Promise<number[]> {
+  if (recipients.every((to) => countThirdPartyRecipients(to, subject) === 0)) return recipients.map(() => 0);
+  const self = await selfAddresses(env, subject);
+  return recipients.map((to) => countThirdPartyRecipients(to, self));
 }
 
 async function currentCount(db: D1Database, subject: string, day: string): Promise<number> {
@@ -114,7 +135,7 @@ async function reserve(env: Env, subject: string, n: number, now: Date): Promise
 export async function hasOutboundMailBudget(
   env: Env, subject: string, recipients: readonly string[], now: Date = new Date(),
 ): Promise<boolean> {
-  const n = recipients.reduce((sum, to) => sum + countThirdPartyRecipients(to, subject), 0);
+  const n = (await thirdPartyCounts(env, subject, recipients)).reduce((a, b) => a + b, 0);
   if (n === 0) return true;
   return (await currentCount(env.DB, subject, utcDay(now))) + n <= outboundMailDailyCap(env);
 }
@@ -148,14 +169,14 @@ function takeCredit(provider: NotificationProvider, to: string): boolean {
 export async function reserveOutboundMail(
   env: Env, subject: string, provider: NotificationProvider, recipients: readonly string[], now: Date = new Date(),
 ): Promise<void> {
-  const n = recipients.reduce((sum, to) => sum + countThirdPartyRecipients(to, subject), 0);
-  await reserve(env, subject, n, now);
+  const counts = await thirdPartyCounts(env, subject, recipients);
+  await reserve(env, subject, counts.reduce((a, b) => a + b, 0), now);
   if (!cappedProviders.has(provider)) return; // an uncapped (test-injected) provider never consumes credits
   const m = credits.get(provider) ?? new Map<string, number>();
-  for (const to of recipients) {
-    if (countThirdPartyRecipients(to, subject) === 0) continue;
+  recipients.forEach((to, i) => {
+    if (counts[i] === 0) return;
     m.set(creditKey(to), (m.get(creditKey(to)) ?? 0) + 1);
-  }
+  });
   credits.set(provider, m);
 }
 
@@ -173,11 +194,11 @@ export function withOutboundMailCap<T extends NotificationProvider>(
   const sendReplan = provider.sendReplanNotification.bind(provider);
   const sendPoll = provider.sendPollEmail.bind(provider);
   provider.sendReplanNotification = async (to: string, model: ReplanEmailModel, opts: RenderOpts): Promise<void> => {
-    if (!takeCredit(provider, to)) await reserve(env, subject, countThirdPartyRecipients(to, subject), clock());
+    if (!takeCredit(provider, to)) await reserve(env, subject, (await thirdPartyCounts(env, subject, [to]))[0]!, clock());
     await sendReplan(to, model, opts);
   };
   provider.sendPollEmail = async (email: PollEmail): Promise<void> => {
-    if (!takeCredit(provider, email.to)) await reserve(env, subject, countThirdPartyRecipients(email.to, subject), clock());
+    if (!takeCredit(provider, email.to)) await reserve(env, subject, (await thirdPartyCounts(env, subject, [email.to]))[0]!, clock());
     await sendPoll(email);
   };
   cappedProviders.add(provider);

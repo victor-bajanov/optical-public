@@ -3,6 +3,7 @@ import type { Env } from "../env";
 import { defaultProviders } from "../index-providers";
 import { runWebhookReplan } from "../webhooks/google-calendar";
 import { isActiveMember } from "../auth/membership";
+import { IdentityCredentialMissingError, logCredentialMissingSkip } from "../auth/identity-store";
 
 /** Fixed-window debounce: a pending alarm is NOT pushed out by later changes,
  *  so worst-case resolve latency is bounded and a stream of edits cannot starve. */
@@ -82,8 +83,10 @@ export class ResolveCoordinator extends DurableObject<Env> {
     } catch (e) {
       // Do NOT re-throw: an uncaught throw makes the runtime auto-retry the
       // alarm, risking a duplicate email. The next webhook re-arms a fresh
-      // resolve, and the Monday cron is a backstop.
-      console.error("resolve_coordinator_alarm_failed", { account: accountEmail, error: String(e) });
+      // resolve, and the Monday cron is a backstop. An alarm armed before an
+      // admin rebind wiped the credential is a skip, not a failure.
+      if (e instanceof IdentityCredentialMissingError) logCredentialMissingSkip("webhook_replan");
+      else console.error("resolve_coordinator_alarm_failed", { account: accountEmail, error: String(e) });
     } finally {
       const dirtyAgain = await this.ctx.storage.get<boolean>(KEY_DIRTY);
       if (dirtyAgain) {

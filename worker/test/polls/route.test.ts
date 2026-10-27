@@ -21,6 +21,7 @@ import {
   type Poll,
 } from "../../src/db/polls";
 import { signCapabilityWithEnv } from "../../src/auth/capability";
+import { identityAnchorTag } from "../../src/auth/identity-rebind";
 import { hashToken } from "../../src/auth/tokens";
 import { hashingKey } from "../../src/auth/crypto-keys";
 import { POLL_CLIENT_HASH } from "../../src/polls/poll-client-source.generated";
@@ -148,6 +149,21 @@ afterEach(() => {
   vi.restoreAllMocks();
   __setMaybeBookOnAllInForTests(null);
 });
+
+// identity port of #105: after an IdP-side rename the subject is the owner's
+// OLD address; owner mail and the organiser name use login_email.
+const OWNER_NOW = "poll-owner-now@example.com";
+
+async function seedOwnerLoginEmail(loginEmail: string | null): Promise<void> {
+  await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+  await env.DB.prepare(
+    "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+  ).bind(OWNER, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-owner", loginEmail).run();
+}
+
+async function clearOwnerLoginEmail(): Promise<void> {
+  await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+}
 
 describe("feature flag", () => {
   it("404s every poll route when MEETING_POLL_ENABLED is not exactly 'true'", async () => {
@@ -869,6 +885,46 @@ describe("PUT /poll/:id/response", () => {
 });
 
 describe("PUT /poll/:id/response — organiser notification (T-notify)", () => {
+  async function saveOneResponse(notification: MockNotificationProvider): Promise<void> {
+    const poll = await seedPoll();
+    const { token } = await seedInvitee(poll, "a@x.com", { name: "Sam" });
+    const app = appWith(new MockCalendarProvider({ events: [] }), notification);
+    const gridRes = await app.request(`/poll/${poll.id}/grid?t=${encodeURIComponent(token)}`, {}, ON);
+    const { paintableCells } = (await gridRes.json()) as { paintableCells: string[] };
+    const res = await app.request(
+      `/poll/${poll.id}/response?t=${encodeURIComponent(token)}`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cells: [{ cell: paintableCells[0], state: "free" }], hideName: false, name: "Sam" }),
+      },
+      ON,
+    );
+    expect(res.status).toBe(200);
+  }
+
+  it("addresses the response-saved email to the organiser's login_email, not the subject", async () => {
+    await seedOwnerLoginEmail(OWNER_NOW);
+    try {
+      const notification = new MockNotificationProvider();
+      await saveOneResponse(notification);
+      expect(notification.sentPollEmails.map((e) => e.to)).toEqual([OWNER_NOW]);
+    } finally {
+      await clearOwnerLoginEmail();
+    }
+  });
+
+  it("addresses the response-saved email to the subject when login_email is NULL", async () => {
+    await seedOwnerLoginEmail(null);
+    try {
+      const notification = new MockNotificationProvider();
+      await saveOneResponse(notification);
+      expect(notification.sentPollEmails.map((e) => e.to)).toEqual([OWNER]);
+    } finally {
+      await clearOwnerLoginEmail();
+    }
+  });
+
   it("emails the organiser naming the respondent, marking a first response, with the response count", async () => {
     const poll = await seedPoll();
     const { token } = await seedInvitee(poll, "a@x.com", { name: "Sam" });
@@ -1346,7 +1402,7 @@ describe("PUT /poll/:id/response — needs_attention unlock (Card B)", () => {
 // times yet." until status flips back to open.
 describe("GET /poll/:id/status — candidates for needs_attention (Card B stretch)", () => {
   async function mintStatusToken(pollId: string, subject: string) {
-    return signCapabilityWithEnv({ purpose: "poll-status", pollId, subject, ttlSeconds: 3600 }, TEST_ENV);
+    return signCapabilityWithEnv({ purpose: "poll-status", pollId, subject, ttlSeconds: 3600, anchor: await identityAnchorTag(env, subject) }, TEST_ENV);
   }
 
   it("computes and renders top candidates for a needs_attention poll once a slot has full coverage again", async () => {
@@ -1466,6 +1522,75 @@ describe("POST /poll/:id/join", () => {
     expect(gridRes.status).toBe(200);
     const body = (await gridRes.json()) as { you: { name: string } };
     expect(body.you.name).toBe("Guest Gary");
+  });
+
+  it("a failing login_email read never kills a known invitee's link: the organiser name is read before the token rotates", async () => {
+    // The guest-join path reads login_email twice for a known invitee (the
+    // organiser name and the cap's self check). Fail the second read: both
+    // must happen before the token rotates, so the old link survives.
+    await seedOwnerLoginEmail(OWNER_NOW);
+    try {
+      const poll = await seedPoll({}, "shared-secret");
+      const { invitee } = await seedInvitee(poll, "kim@x.com", { name: "Kim" });
+      const before = await env.DB.prepare("SELECT token_hash FROM poll_invitees WHERE id = ?").bind(invitee.id).first<{ token_hash: string }>();
+      let reads = 0;
+      const db = new Proxy(env.DB, {
+        get(target, prop) {
+          if (prop === "prepare") {
+            return (sql: string) => {
+              if (/login_email FROM identity_tokens/.test(sql) && ++reads === 2) throw new Error("d1 unavailable");
+              return target.prepare(sql);
+            };
+          }
+          const v = Reflect.get(target, prop);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const notification = new MockNotificationProvider();
+      const app = appWith(new MockCalendarProvider({ events: [] }), notification);
+      await app.request(
+        `/poll/${poll.id}/join`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "cf-connecting-ip": "1.1.1.9" },
+          body: JSON.stringify({ name: "Kim", email: "kim@x.com", turnstileToken: "tok", guestToken: "shared-secret" }),
+        },
+        { ...ON, DB: db },
+      );
+      expect(reads).toBeGreaterThanOrEqual(2);
+      const after = await env.DB.prepare("SELECT token_hash FROM poll_invitees WHERE id = ?").bind(invitee.id).first<{ token_hash: string }>();
+      expect(after!.token_hash).toBe(before!.token_hash);
+      expect(notification.sentPollEmails).toHaveLength(0);
+    } finally {
+      await clearOwnerLoginEmail();
+    }
+  });
+
+  it("names the organiser in the guest's invite by login_email, never the subject", async () => {
+    await seedOwnerLoginEmail(OWNER_NOW);
+    try {
+      const poll = await seedPoll({}, "shared-secret");
+      const notification = new MockNotificationProvider();
+      const app = appWith(new MockCalendarProvider({ events: [] }), notification);
+      const res = await app.request(
+        `/poll/${poll.id}/join`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "cf-connecting-ip": "1.1.1.1" },
+          body: JSON.stringify({ name: "Guest Gary", email: "gary@x.com", turnstileToken: "tok", guestToken: "shared-secret" }),
+        },
+        ON,
+      );
+      expect(res.status).toBe(202);
+      expect(notification.sentPollEmails).toHaveLength(1);
+      const email = notification.sentPollEmails[0]!;
+      expect(email.text).toContain(OWNER_NOW);
+      expect(email.text).not.toContain(OWNER);
+      expect(email.html).not.toContain(OWNER);
+    } finally {
+      await clearOwnerLoginEmail();
+    }
   });
 
   it("403s and creates no invitee when Turnstile rejects the token", async () => {
@@ -1967,7 +2092,7 @@ describe("delisted organiser (card C)", () => {
     const poll = await seedPoll();
     await seedInvitee(poll, "a@x.com");
     const statusToken = await signCapabilityWithEnv(
-      { purpose: "poll-status", pollId: poll.id, subject: OWNER, ttlSeconds: 3600 },
+      { purpose: "poll-status", pollId: poll.id, subject: OWNER, ttlSeconds: 3600, anchor: await identityAnchorTag(env, OWNER) },
       TEST_ENV,
     );
     const provider = new MockCalendarProvider({ events: [] });

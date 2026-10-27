@@ -19,13 +19,27 @@ export interface GoogleCalendarProviderOptions {
   deploymentId?: string;
 }
 
+/** Google partial-response `fields` for one event: exactly what isBusyEvent
+ *  and toCalendarEvent read, so a read never pulls description, location,
+ *  conference links or attendee names (OAuth data minimisation). Add a field
+ *  here in the same change as any code that reads it: Google strips
+ *  everything unlisted, silently. `extendedProperties` is a leaf on purpose,
+ *  since both `private` and `shared` are consumed. */
+export const GOOGLE_EVENT_ITEM_FIELDS =
+  "id,status,summary,start,end,colorId,transparency,eventType," +
+  "organizer(email,self),guestsCanModify," +
+  "attendees(email,responseStatus,optional,resource,self),extendedProperties";
+
+/** events.list `fields`: the page and sync tokens must be named explicitly or
+ *  Google strips them too, which would end paging and sync after one page. */
+const GOOGLE_EVENT_LIST_FIELDS = `nextPageToken,nextSyncToken,items(${GOOGLE_EVENT_ITEM_FIELDS})`;
+
+/** The read-side shape: only the fields in GOOGLE_EVENT_ITEM_FIELDS. */
 interface GoogleEvent {
   id: string;
   summary?: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
-  location?: string;
-  description?: string;
   colorId?: string;
   extendedProperties?: { private?: Record<string, string>; shared?: Record<string, string> };
   status?: string;
@@ -64,8 +78,6 @@ function toCalendarEvent(g: GoogleEvent): CalendarEvent {
     summary: g.summary ?? "",
     start,
     end,
-    location: g.location,
-    description: g.description,
     colorId: g.colorId,
     // Thread free/busy metadata so build-problem.ts can apply the all-day-OOO
     // (decision C) and tentative-toggle (decision D) rules and defensively drop
@@ -156,6 +168,7 @@ export class GoogleCalendarProvider implements CalendarProvider {
         singleEvents: "true",
         showDeleted: "false",
         maxResults: "250",
+        fields: GOOGLE_EVENT_LIST_FIELDS,
       });
       if (pageToken) params.set("pageToken", pageToken);
       const res = await this.authedFetch(`${base}?${params.toString()}`);
@@ -233,7 +246,12 @@ export class GoogleCalendarProvider implements CalendarProvider {
     let pageToken: string | undefined;
     let nextSyncToken = "";
     do {
-      const params = new URLSearchParams({ syncToken, showDeleted: "true", maxResults: "250" });
+      const params = new URLSearchParams({
+        syncToken,
+        showDeleted: "true",
+        maxResults: "250",
+        fields: GOOGLE_EVENT_LIST_FIELDS,
+      });
       if (pageToken) params.set("pageToken", pageToken);
       const res = await this.authedFetch(`${base}?${params.toString()}`);
       if (res.status === 410) {
@@ -386,7 +404,9 @@ export class GoogleCalendarProvider implements CalendarProvider {
   async getEvent(eventId: string): Promise<CalendarEvent | null> {
     const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(
       this.calendarId,
-    )}/events/${encodeURIComponent(eventId)}`;
+    )}/events/${encodeURIComponent(eventId)}?${new URLSearchParams({
+      fields: GOOGLE_EVENT_ITEM_FIELDS,
+    }).toString()}`;
     const res = await this.authedFetch(url);
     if (res.status === 404 || res.status === 410) return null;
     if (!res.ok) throw new Error(`Google get failed: ${res.status} ${await res.text()}`);

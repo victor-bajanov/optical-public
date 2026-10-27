@@ -22,7 +22,7 @@ import { runPollSweep } from "../../src/cron/poll-sweep";
 import { upsertUser } from "../../src/db/users";
 import { createPoll as dbCreatePoll, insertInvitee as dbInsertInvitee, newInviteeId, dropInvitee as dbDropInvitee, setHideName, replaceResponses } from "../../src/db/polls";
 import { mountPollRoutes } from "../../src/polls/route";
-import { ACCESS_PREFIX } from "../../src/auth/identity-store";
+import { cacheAccessToken, dropCachedAccessToken } from "../../src/auth/identity-store";
 import type { AppVariables } from "../../src/index-providers";
 import type { Env } from "../../src/env";
 
@@ -368,14 +368,14 @@ describe("R4-H1: notificationProvider production wiring", () => {
   const realFetch = globalThis.fetch;
   afterEach(async () => {
     globalThis.fetch = realFetch;
-    await env.GOOGLE_TOKEN_CACHE.delete(ACCESS_PREFIX + OWNER);
+    await dropCachedAccessToken(env, OWNER);
   });
 
   it("createMeetingPoll: falls back to defaultNotificationProvider and actually sends, instead of 500ing on an undefined provider", async () => {
     // Short-circuits getAccessToken's identity_tokens/refresh path entirely
     // (see auth/identity-store.ts) — this test is about the notification
     // PROVIDER fallback, not the OAuth token machinery.
-    await env.GOOGLE_TOKEN_CACHE.put(ACCESS_PREFIX + OWNER, "fake-access-token");
+    await cacheAccessToken(env, OWNER, "fake-access-token", 3600);
     const sent: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -1128,6 +1128,10 @@ describe("updateMeetingPoll deadlineUtc — episode stamps (Fix 3, ported from r
 
   it("re-arms the deadline-24h nudge cadence after a short extension", async () => {
     await upsertUser(env.DB, OWNER);
+    // The sweep skips an organiser holding no stored credential (card C8).
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at) VALUES (?, X'01', 's', '2026-01-01T00:00:00Z')",
+    ).bind(OWNER).run();
     const notification = new MockNotificationProvider();
 
     // Created well before the original deadline-24h boundary (unlike
@@ -2074,5 +2078,95 @@ describe("PATCH /v1/polls/:id (updateMeetingPoll)", () => {
       TEST_ENV,
     );
     expect(res.status).toBe(404);
+  });
+});
+
+describe("organiser display name: login_email, never the subject (identity port of #105)", () => {
+  // After an IdP-side rename the subject is the owner's OLD address, which
+  // may since belong to someone else: invitees must not see (or reply to) it.
+  const LOGIN = "poll-owner-renamed@example.com";
+
+  async function seedLogin(loginEmail: string | null): Promise<void> {
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+    ).bind(OWNER, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-poll-owner", loginEmail).run();
+  }
+
+  beforeEach(async () => {
+    await seedLogin(LOGIN);
+  });
+  afterEach(async () => {
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+  });
+
+  function expectNamesLogin(emails: PollEmail[]): void {
+    expect(emails.length).toBeGreaterThan(0);
+    for (const e of emails) {
+      expect(e.text).toContain(LOGIN);
+      expect(e.text).not.toContain(OWNER);
+      expect(e.html).not.toContain(OWNER);
+    }
+  }
+
+  async function patch(app: App, pollId: string, body: unknown): Promise<void> {
+    const res = await app.request(
+      `/v1/polls/${pollId}`,
+      { method: "PATCH", headers: { ...AUTH, "content-type": "application/json" }, body: JSON.stringify(body) },
+      TEST_ENV,
+    );
+    expect(res.status).toBe(200);
+  }
+
+  it("createMeetingPoll invites", async () => {
+    const notification = new MockNotificationProvider();
+    await createPoll(makeApp(notification));
+    expectNamesLogin(notification.sentPollEmails);
+  });
+
+  it("createMeetingPoll invites name the subject when login_email is NULL", async () => {
+    await seedLogin(null);
+    const notification = new MockNotificationProvider();
+    await createPoll(makeApp(notification));
+    for (const e of notification.sentPollEmails) expect(e.text).toContain(OWNER);
+  });
+
+  it("nudgeMeetingPoll reminders", async () => {
+    const notification = new MockNotificationProvider();
+    const app = makeApp(notification);
+    const pollId = await createPoll(app);
+    notification.sentPollEmails.length = 0;
+    const res = await app.request(`/v1/polls/${pollId}/nudge`, { method: "POST", headers: AUTH }, TEST_ENV);
+    expect(res.status).toBe(200);
+    expectNamesLogin(notification.sentPollEmails);
+  });
+
+  it("cancelMeetingPoll notices", async () => {
+    const notification = new MockNotificationProvider();
+    const app = makeApp(notification);
+    const pollId = await createPoll(app);
+    notification.sentPollEmails.length = 0;
+    const res = await app.request(`/v1/polls/${pollId}/cancel`, { method: "POST", headers: AUTH }, TEST_ENV);
+    expect(res.status).toBe(200);
+    expectNamesLogin(notification.sentPollEmails);
+  });
+
+  it("updateMeetingPoll: added-invitee invite, removal notice and deadline-extended notice", async () => {
+    const notification = new MockNotificationProvider();
+    const app = makeApp(notification);
+    const pollId = await createPoll(app);
+    const bob = await env.DB.prepare("SELECT id FROM poll_invitees WHERE poll_id = ? AND email = 'bob@example.com'").bind(pollId).first<{ id: string }>();
+
+    notification.sentPollEmails.length = 0;
+    await patch(app, pollId, { addInvitees: [{ email: "carol@example.com", name: "Carol" }] });
+    expectNamesLogin(notification.sentPollEmails);
+
+    notification.sentPollEmails.length = 0;
+    await patch(app, pollId, { removeInviteeIds: [bob!.id] });
+    expectNamesLogin(notification.sentPollEmails);
+
+    notification.sentPollEmails.length = 0;
+    await patch(app, pollId, { deadlineUtc: "2027-01-14T12:00:00Z" });
+    expectNamesLogin(notification.sentPollEmails);
   });
 });

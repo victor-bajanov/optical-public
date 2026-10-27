@@ -12,6 +12,7 @@ import {
 import { v1 } from "./v1";
 import { mountRunCronRoute } from "./admin/run-cron-route";
 import { mountOffboardRoute } from "./admin/offboard-route";
+import { mountIdentityRebindRoute } from "./admin/identity-rebind-route";
 import { mountDevUiRoute } from "./admin/dev-ui-route";
 import { mountStopChannelRoute } from "./admin/stop-channel-route";
 import { mountRenewSubscriptionsRoute } from "./admin/renew-subscriptions-route";
@@ -66,6 +67,7 @@ app.get("/auth/callback", handleAuthCallback);
 
 mountRunCronRoute(app);
 mountOffboardRoute(app);
+mountIdentityRebindRoute(app);
 mountDevUiRoute(app);
 mountStopChannelRoute(app);
 mountRenewSubscriptionsRoute(app);

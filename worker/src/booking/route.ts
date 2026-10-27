@@ -31,6 +31,7 @@ import {
 import { verifyTurnstile, MAX_CLAIMS_PER_IP_24H, MAX_CLAIMS_PER_PAGE_24H } from "./turnstile";
 import { renderBookingPage, BOOKING_PAGE_CSP } from "./page";
 import { BOOKING_CLIENT_JS, BOOKING_CLIENT_HASH } from "./booking-client-source.generated";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 /** Deliberately narrower than RFC 5321: `<>"',;` are the characters that make
  *  an address dangerous *downstream* rather than invalid. The address is
@@ -518,8 +519,9 @@ export function mountBookingRoutes(app: Hono<{ Bindings: Env; Variables: AppVari
 
     // The invitation above goes to the booker only: Google doesn't email you
     // about an event created on your own calendar, so the owner hears from
-    // Optical instead — from and to their own mailbox, which the outbound cap
-    // never counts (to === subject). Fired as soon as the event exists, so a
+    // Optical instead — from and to their own mailbox (their latest verified
+    // sign-in address, db/owner-email.ts), which the outbound cap never counts
+    // as third-party. Fired as soon as the event exists, so a
     // failed confirm below still tells them, and best-effort: everything,
     // provider construction included, is inside one self-swallowing promise,
     // so a mail failure can never fail the booking or change the 201.
@@ -528,7 +530,7 @@ export function mountBookingRoutes(app: Hono<{ Bindings: Env; Variables: AppVari
         const notify = c.get("notificationProvider") ?? await defaultNotificationProvider(c.env, page.owner);
         const ownerTz = await getHomeTz(c.env.DB, page.owner, c.env.SCHEDULER_TZ);
         await notify.sendPollEmail({
-          to: page.owner,
+          to: await ownerNotificationEmail(c.env.DB, page.owner),
           ...renderBookingOwnerNotifiedEmail({
             bookerName: safeName,
             bookerEmail: email,

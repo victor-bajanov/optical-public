@@ -458,6 +458,37 @@ describe("POST /book/:slug", () => {
     }
   });
 
+  // Owner mail goes to the latest verified sign-in address (login_email,
+  // migration 0046), never the bare subject, which an IdP rename can hand to
+  // someone else; NULL falls back to the subject. The booker's invitation is
+  // the calendar's, so it is untouched.
+  for (const [label, loginEmail, expected] of [
+    ["login_email set", "owner-now@example.com", "owner-now@example.com"],
+    ["login_email NULL", null, OWNER],
+  ] as const) {
+    it(`addresses the owner notice to ${expected} (${label})`, async () => {
+      await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+      await env.DB.prepare(
+        "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+      ).bind(OWNER, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-owner", loginEmail).run();
+      try {
+        const notifier = new MockNotificationProvider();
+        const provider = new MockCalendarProvider({ events: [] });
+        const app = appWith(provider, notifier);
+        const start = await firstSlot(app);
+        expect((await app.request("/book/routes", claimBody(start), ON)).status).toBe(201);
+        expect(notifier.sentPollEmails.map((m) => m.to)).toEqual([expected]);
+        // The calendar invitation still goes to the booker only.
+        const created = provider.getCreated();
+        expect(created).toHaveLength(1);
+        expect(JSON.stringify(created[0])).toContain("sam@x.com");
+        expect(JSON.stringify(created[0])).not.toContain("owner-now@example.com");
+      } finally {
+        await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+      }
+    });
+  }
+
   it("still books, and logs the failure, when the owner's email cannot be sent", async () => {
     const notifier = new MockNotificationProvider();
     notifier.sendPollEmail = async () => {

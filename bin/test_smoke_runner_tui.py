@@ -1667,6 +1667,166 @@ async def test_target_and_op_secrets_badges_render_with_classes(tmp_path, stagin
 
 
 @pytest.mark.asyncio
+async def test_t_persists_target_to_config_and_survives_app_focus_rescan(tmp_path, staging_target):
+    """`t` used to change only the in-memory cfg, so the next app-focus
+    rescan reloaded config.toml and snapped the target back. It now writes
+    config.toml (the tmp config_path make_core pins, never ~/.config)."""
+    cfg = make_cfg(target="dev")
+    core = make_core(tmp_path, environ=make_environ(cfg), cfg=cfg, probe=make_probe({}))
+    app = sr.SmokeRunnerApp(core, harness_names=["config-smoke"])
+    next_target = list(reg.TARGETS)[1]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("t")
+        await pilot.pause()
+        assert ident.load_config(core.config_path).target == next_target
+
+        app.on_app_focus(None)
+        await pilot.pause()
+        assert app.core.cfg.target == next_target
+        assert next_target in str(app.query_one("#target-badge").content)
+
+
+@pytest.mark.asyncio
+async def test_P_persists_provider_to_config_and_survives_rescan(tmp_path):
+    cfg = make_cfg(target="dev", provider="google")
+    core = make_core(tmp_path, environ=make_environ(cfg), cfg=cfg, probe=make_probe({}))
+    app = sr.SmokeRunnerApp(core, harness_names=["config-smoke"])
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("P")
+        await pilot.pause()
+        assert ident.load_config(core.config_path).provider == "microsoft"
+
+        await pilot.press("e")  # explicit rescan, same path as app focus
+        await pilot.pause()
+        assert app.core.cfg.provider == "microsoft"
+        assert "microsoft" in str(app.query_one("#provider-badge").content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["t", "P"])
+async def test_t_and_P_keep_a_hand_edit_made_since_the_last_rescan(tmp_path, staging_target, key):
+    """A terminal without focus events never rescans, so the in-memory cfg
+    can be older than config.toml. t/P must re-read the file and change only
+    their own field, not write the stale cfg over a hand edit."""
+    cfg = make_cfg(target="dev", provider="google")
+    core = make_core(tmp_path, environ=make_environ(cfg), cfg=cfg, probe=make_probe({}))
+    app = sr.SmokeRunnerApp(core, harness_names=["config-smoke"])
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        edited = dataclasses.replace(cfg, google={**cfg.google, "b": "edited@example.com"})
+        ident.save_config(edited, core.config_path)  # hand edit, no rescan
+
+        await pilot.press(key)
+        await pilot.pause()
+
+        on_disk = ident.load_config(core.config_path)
+        assert on_disk.google["b"] == "edited@example.com"
+        assert app.core.cfg.google["b"] == "edited@example.com"
+        if key == "t":
+            assert on_disk.target == list(reg.TARGETS)[1]
+        else:
+            assert on_disk.provider == "microsoft"
+
+
+# -- kitty keyboard protocol is popped on exit -------------------------------
+
+
+class _FakeTty:
+    def __init__(self, isatty: bool = True):
+        self.written: list[str] = []
+        self._isatty = isatty
+
+    def write(self, s: str) -> int:
+        self.written.append(s)
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return self._isatty
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_reset_kitty_keyboard_writes_pop_all_to_dev_tty():
+    tty = _FakeTty()
+    opened: list[str] = []
+
+    def opener(path):
+        opened.append(path)
+        return tty
+
+    stdout = _FakeTty(isatty=True)
+    sr.reset_kitty_keyboard(opener=opener, stdout=stdout)
+    assert opened == ["/dev/tty"]
+    assert "".join(tty.written) == "\x1b[<99u"
+    assert stdout.written == []  # /dev/tty worked, so no second write
+
+
+def test_reset_kitty_keyboard_falls_back_to_a_tty_stdout():
+    def opener(path):
+        raise OSError("no controlling terminal")
+
+    stdout = _FakeTty(isatty=True)
+    sr.reset_kitty_keyboard(opener=opener, stdout=stdout)
+    assert "".join(stdout.written) == "\x1b[<99u"
+
+
+def test_reset_kitty_keyboard_is_a_silent_noop_without_any_tty():
+    def opener(path):
+        raise OSError("no controlling terminal")
+
+    stdout = _FakeTty(isatty=False)
+    sr.reset_kitty_keyboard(opener=opener, stdout=stdout)  # must not raise
+    assert stdout.written == []
+
+
+def test_reset_kitty_keyboard_survives_a_none_stdout_without_dev_tty(monkeypatch):
+    """sys.stdout can be None (a detached process); .isatty() then raises
+    AttributeError, which must not escape the finally and mask run()'s own
+    exception."""
+    def opener(path):
+        raise OSError("no controlling terminal")
+
+    sr.reset_kitty_keyboard(opener=opener, stdout=None)  # must not raise
+    monkeypatch.setattr(sys, "stdout", None)
+    sr.reset_kitty_keyboard(opener=opener)  # the default, sys.stdout, is None too
+
+
+def test_reset_kitty_keyboard_swallows_a_write_error():
+    class _Broken(_FakeTty):
+        def write(self, s):
+            raise OSError("EIO")
+
+    sr.reset_kitty_keyboard(opener=lambda p: _Broken(), stdout=_Broken(isatty=True))
+
+
+def test_run_with_terminal_reset_resets_even_when_run_raises():
+    calls: list[str] = []
+
+    def boom():
+        calls.append("run")
+        raise RuntimeError("crash")
+
+    with pytest.raises(RuntimeError):
+        sr.run_with_terminal_reset(boom, reset=lambda: calls.append("reset"))
+    assert calls == ["run", "reset"]
+
+
+def test_run_with_terminal_reset_resets_after_a_clean_run():
+    calls: list[str] = []
+    sr.run_with_terminal_reset(lambda: calls.append("run"), reset=lambda: calls.append("reset"))
+    assert calls == ["run", "reset"]
+
+
+@pytest.mark.asyncio
 async def test_op_secrets_badge_missing_class_without_cloudflare_token(tmp_path):
     cfg = make_cfg()
     environ = make_environ(cfg)

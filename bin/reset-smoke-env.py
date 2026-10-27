@@ -122,6 +122,9 @@ HARNESS_TITLE_PREFIXES: tuple[str, ...] = (
     "[tzsmoke]",    # bin/timezone-smoke.py — its fixture task titles
                     # ("[tzsmoke] task N"); the harness also sweeps its own
                     # leftovers at startup
+    "[id-smoke]",   # bin/identity-smoke.py — B's "[id-smoke] rebind marker"
+                    # task, left behind when a run is killed before cleanup
+                    # (run this script with B's tokens to reach it)
 )
 
 # Tasks identifiable only by source.external_id, not by title — for
@@ -134,6 +137,7 @@ HARNESS_TITLE_PREFIXES: tuple[str, ...] = (
 HARNESS_EXTERNAL_ID_PREFIXES: tuple[str, ...] = (
     "regsmoke-",  # bin/regression-smoke.py — task source.external_id
     "mu-smoke-",  # bin/multiuser-smoke.py — task source.external_id
+    "id-smoke-",  # bin/identity-smoke.py — the marker task's source.external_id
 )
 
 

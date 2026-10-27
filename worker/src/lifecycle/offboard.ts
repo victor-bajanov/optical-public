@@ -5,7 +5,9 @@ import { getCalendarSync, PRIMARY_CALENDAR_ID } from "../db/calendar-sync";
 import { defaultCalendarProvider, defaultIdentityProvider, ProviderDisabledError } from "../index-providers";
 import { deactivateUser } from "../db/users";
 import { writeAudit } from "../db/audit";
-import { ACCESS_PREFIX, getSubjectProvider, readRefreshToken } from "../auth/identity-store";
+import {
+  dropCachedAccessToken, getSubjectProvider, IdentityCredentialMissingError, logCredentialMissingSkip, readRefreshToken,
+} from "../auth/identity-store";
 import { revokeUpstreamGrant, type RevokeCapable } from "../auth/upstream-revoke";
 import { OWNER_SCOPED_TABLES } from "./owner-scoped-tables";
 import { SCHEDULER_HORIZON_MS, deletableChunks } from "../planning/scheduler-chunks";
@@ -66,6 +68,14 @@ export async function offboardUser(
   // silently swallowed into a degraded offboard that still deletes every
   // row — rethrow it and abort BEFORE any deletion happens.
   let cal: MinimalCalendar | null = null;
+  // The subject has no credential (an admin rebind wiped it, so the account
+  // was idle): there is no calendar to clean up and nothing to revoke
+  // upstream (readRefreshToken reads null). One line, then the rest of the
+  // calendar steps are skipped; the D1 removal runs as always.
+  const credentialMissing = (): null => {
+    logCredentialMissingSkip("offboard");
+    return null;
+  };
   try {
     cal = await calendarFor(env, subject);
   } catch (e) {
@@ -84,9 +94,13 @@ export async function offboardUser(
       await cal.stopChannel(sync.channel_id, sync.channel_resource_id);
     } catch (e) {
       // A failed stop must not block deletion — the channel self-expires (~7d).
-      console.warn("offboardUser: stopChannel failed (continuing)", {
-        subject, channelId: sync.channel_id, error: String(e),
-      });
+      if (e instanceof IdentityCredentialMissingError) {
+        cal = credentialMissing();
+      } else {
+        console.warn("offboardUser: stopChannel failed (continuing)", {
+          subject, channelId: sync.channel_id, error: String(e),
+        });
+      }
     }
   }
 
@@ -111,9 +125,13 @@ export async function offboardUser(
         await cal.deleteEvent(e.id);
       }
     } catch (e) {
-      console.warn("offboardUser: scheduler-event sweep failed (continuing)", {
-        subject, error: String(e),
-      });
+      if (e instanceof IdentityCredentialMissingError) {
+        cal = credentialMissing();
+      } else {
+        console.warn("offboardUser: scheduler-event sweep failed (continuing)", {
+          subject, error: String(e),
+        });
+      }
     }
   }
 
@@ -153,8 +171,8 @@ export async function offboardUser(
   }
   await env.DB.batch(deletes);
 
-  // 4: KV access-token cache.
-  await env.GOOGLE_TOKEN_CACHE.delete(ACCESS_PREFIX + subject);
+  // 4: KV access-token cache (and a pre-encryption plaintext entry).
+  await dropCachedAccessToken(env, subject);
 
   // 5: per-user Durable Object debounce state + pending alarm.
   try {

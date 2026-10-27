@@ -27,6 +27,7 @@ import {
 } from "../db/pending-actions";
 import { getConfirmableOp } from "./registry";
 import { confirmActionEmail } from "./page";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 export const PENDING_ACTION_TTL_SECONDS = 24 * 3600;
 
@@ -105,26 +106,34 @@ export async function reserveConfirmation(
 /** Sends a reserved action's confirmation: the user's own mailbox first; if
  *  that fails, the shared system mailer, within the owner's fallback limit.
  *  Undelivered → the reserved row is deleted (no one can confirm a link that
- *  never arrived, and a retry must not be deduped onto it). */
+ *  never arrived, and a retry must not be deduped onto it).
+ *  Both channels go to `to`, the owner's ownerNotificationEmail (latest
+ *  verified sign-in address). Callers resolve it BEFORE reserving the row: a
+ *  failed read after the reserve would strand a row no email ever announced,
+ *  and every retry would be deduped onto it. `owner` stays the key for the
+ *  row and the fallback limit. */
 export async function deliverConfirmation(
   env: Env,
   args: {
     owner: string;
+    /** ownerNotificationEmail(owner), resolved before the row was reserved. */
+    to: string;
     rowId: string;
     logOp: string;
-    viaProvider: () => Promise<void>;
+    viaProvider: (to: string) => Promise<void>;
     viaSystem: { subject: string; text: string };
   },
 ): Promise<boolean> {
+  const { to } = args;
   try {
-    await args.viaProvider();
+    await args.viaProvider(to);
     return true;
   } catch (e) {
     console.error("confirm_mail_provider_failed", { op: args.logOp, error: e instanceof Error ? e.name : "unknown" });
   }
   let delivered = false;
   if (await claimSystemFallback(env.DB, args.rowId, args.owner, new Date())) {
-    delivered = (await systemMailer(env).send({ to: args.owner, ...args.viaSystem })).ok;
+    delivered = (await systemMailer(env).send({ to, ...args.viaSystem })).ok;
   } else {
     console.warn("confirm_system_fallback_capped", { op: args.logOp });
   }
@@ -147,6 +156,8 @@ export async function deferForConfirmation(
   const payload = def.payloadSchema.parse(args.payload);
   const summary = def.summarySchema.parse(args.summary);
 
+  // Before the reserve: a failed read must leave no row (deliverConfirmation).
+  const to = await ownerNotificationEmail(c.env.DB, owner);
   const now = new Date();
   const id = crypto.randomUUID();
   const expiresAt = new Date(now.getTime() + PENDING_ACTION_TTL_SECONDS * 1000).toISOString();
@@ -181,11 +192,12 @@ export async function deferForConfirmation(
 
   const delivered = await deliverConfirmation(c.env, {
     owner,
+    to,
     rowId: id,
     logOp: args.op,
-    viaProvider: async () => {
+    viaProvider: async (to) => {
       const notify = c.var.notificationProvider ?? await defaultNotificationProvider(c.env, owner);
-      await notify.sendPollEmail({ to: owner, ...mail });
+      await notify.sendPollEmail({ to, ...mail });
     },
     viaSystem: { subject: mail.subject, text: mail.text },
   });
