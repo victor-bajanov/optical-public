@@ -41,7 +41,7 @@ const LOG_ERROR_MAX = 200;
 /** An error as log text: String(e) with the subject (matched literally and
  *  case-insensitively) replaced by its pseudonym, every whitespace run
  *  collapsed to one space, capped at 200 characters. Errors can name the
- *  subject in their text (identity-store's "no identity tokens for <subject>"),
+ *  subject in their text (a provider or D1 error that echoes the address),
  *  and Google failure bodies are pretty-printed JSON, so collapsing (rather
  *  than keeping the first line) keeps the reason inside the cap. Redaction
  *  runs before the cap, so a cut can never leave part of an address. */

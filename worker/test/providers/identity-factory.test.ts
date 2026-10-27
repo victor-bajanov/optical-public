@@ -1,5 +1,5 @@
 import { env } from "cloudflare:test";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { defaultCalendarProvider, defaultIdentityProvider, defaultNotificationProvider, defaultProviders, enabledProviders, ProviderDisabledError } from "../../src/index-providers";
 import { GoogleIdentityProvider } from "../../src/auth/google-identity-provider";
 import { GoogleCalendarProvider } from "../../src/providers/google-calendar-provider";
@@ -7,7 +7,7 @@ import { GmailNotificationProvider } from "../../src/providers/gmail-notificatio
 import { MicrosoftIdentityProvider } from "../../src/auth/microsoft-identity-provider";
 import { MicrosoftCalendarProvider } from "../../src/providers/microsoft-calendar-provider";
 import { MicrosoftGraphNotificationProvider } from "../../src/providers/microsoft-graph-notification-provider";
-import { storeIdentityTokens } from "../../src/auth/identity-store";
+import { cacheAccessToken, dropCachedAccessToken, storeIdentityTokens } from "../../src/auth/identity-store";
 
 describe("defaultIdentityProvider", () => {
   it("returns a Google provider by default (no provider argument)", () => {
@@ -144,5 +144,64 @@ describe("enabledProviders", () => {
   });
   it("withholds microsoft when the flag is off regardless of the client id", () => {
     expect(enabledProviders({ ...base, MS_PROVIDER_ENABLED: "false" })).toEqual(["google"]);
+  });
+});
+
+describe("Gmail From header: login_email, never the subject (identity port of #105)", () => {
+  // After an IdP-side rename the subject is the owner's OLD address.
+  const SUBJECT = "from-old@example.com";
+  const LOGIN = "from-new@example.com";
+  const realFetch = globalThis.fetch;
+
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    await dropCachedAccessToken(env, SUBJECT);
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(SUBJECT).run();
+    await env.DB.prepare("DELETE FROM outbound_mail_counts WHERE subject = ?").bind(SUBJECT).run();
+  });
+
+  async function seedAndCaptureFrom(loginEmail: string | null): Promise<() => string | undefined> {
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(SUBJECT).run();
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+    ).bind(SUBJECT, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-from", loginEmail).run();
+    // Short-circuits the refresh path; this is about the header, not OAuth.
+    await cacheAccessToken(env, SUBJECT, "fake-access-token", 3600);
+    let from: string | undefined;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (!url.includes("gmail/v1/users/me/messages/send")) throw new Error(`unexpected fetch: ${url}`);
+      const { raw } = JSON.parse(String(init!.body)) as { raw: string };
+      const mime = atob(raw.replace(/-/g, "+").replace(/_/g, "/"));
+      from = /^From: (.*)$/m.exec(mime)?.[1]?.trim();
+      return new Response(JSON.stringify({ id: "m" }), { status: 200 });
+    }) as typeof fetch;
+    return () => from;
+  }
+
+  const email = { to: "invitee@example.com", subject: "s", text: "t", html: "<p>h</p>" };
+
+  it("defaultNotificationProvider sends From the login email", async () => {
+    const from = await seedAndCaptureFrom(LOGIN);
+    await (await defaultNotificationProvider(env, SUBJECT)).sendPollEmail(email);
+    expect(from()).toBe(LOGIN);
+  });
+
+  it("defaultProviders' notification sends From the login email", async () => {
+    const from = await seedAndCaptureFrom(LOGIN);
+    await (await defaultProviders(env, SUBJECT)).notification.sendPollEmail(email);
+    expect(from()).toBe(LOGIN);
+  });
+
+  it("falls back to the subject when login_email is NULL", async () => {
+    const from = await seedAndCaptureFrom(null);
+    await (await defaultNotificationProvider(env, SUBJECT)).sendPollEmail(email);
+    expect(from()).toBe(SUBJECT);
+  });
+
+  it("defaultProviders falls back to the subject when login_email is NULL", async () => {
+    const from = await seedAndCaptureFrom(null);
+    await (await defaultProviders(env, SUBJECT)).notification.sendPollEmail(email);
+    expect(from()).toBe(SUBJECT);
   });
 });

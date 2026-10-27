@@ -18,6 +18,7 @@ import { getUser } from "../db/users";
 import { confirmationRequired } from "../confirm/gate";
 import { confirmationResponses, deferForConfirmation } from "../confirm/defer";
 import { registerConfirmableOp } from "../confirm/registry";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 type Ctx = Context<{ Bindings: Env; Variables: AppVariables }>;
 
@@ -53,8 +54,12 @@ export function selfServeDeleteEnabled(env: Pick<Env, "SELF_SERVE_DELETE_ENABLED
  *  The confirmation mail is best-effort: systemMailer never throws, no-ops
  *  with system mail off, and logs its own failures (never the address). */
 async function deleteOwnAccount(env: Env, owner: string): Promise<void> {
+  // Resolved first: offboardUser deletes the identity_tokens row holding the
+  // latest verified sign-in address, and the subject itself can belong to
+  // someone else after an IdP rename (db/owner-email.ts).
+  const to = await ownerNotificationEmail(env.DB, owner);
   await offboardUser(env, owner, owner, { auditSource: "api" });
-  await systemMailer(env).send({ to: owner, ...accountDeletedEmail({
+  await systemMailer(env).send({ to, ...accountDeletedEmail({
     purgeAfterDays: parsePurgeDays(env.DELETED_ACCOUNT_RETENTION_DAYS),
     deploymentLabel: env.DEPLOYMENT_LABEL,
   }) });

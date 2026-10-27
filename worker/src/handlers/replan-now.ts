@@ -7,6 +7,9 @@ import { defaultProviders } from "../index-providers";
 import { runWebhookReplan } from "../webhooks/google-calendar";
 import { redactRenderSnapshot } from "../diff/redact-snapshot";
 import { RenderSnapshotSchema, type RenderSnapshot } from "../schema/render-snapshot";
+import { IdentityCredentialMissingError, logCredentialMissingSkip } from "../auth/identity-store";
+import { CredentialMissingResponse } from "../planning/resolve";
+import { D } from "../schema/descriptions";
 
 const ReplanNowResponse = z.object({
   ok: z.literal(true),
@@ -55,6 +58,10 @@ export function mountReplanNowRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: 
         content: { "application/json": { schema: z.object({ error: z.string() }) } },
         description: "Token carries no subject",
       },
+      409: {
+        content: { "application/json": { schema: CredentialMissingResponse } },
+        description: D.error.credential_missing,
+      },
     },
   });
 
@@ -75,18 +82,25 @@ export function mountReplanNowRoute(v1: OpenAPIHono<{ Bindings: Env; Variables: 
     const calendar = c.var.calendarProvider ?? built!.calendar;
     const notify = c.var.notificationProvider ?? built!.notification;
 
-    const result = await runWebhookReplan({
-      env: c.env,
-      calendar,
-      notify,
-      accountEmail: owner,
-      oauthIssuer: c.env.OAUTH_ISSUER,
-      dryRun,
-      forceResolve: force,
-      triggerInviteTitle: trigger,
-      // Decision L: a looping caller can't flood the inbox (confirm/plan-mail.ts).
-      dedupeMail: true,
-    });
+    let result: Awaited<ReturnType<typeof runWebhookReplan>>;
+    try {
+      result = await runWebhookReplan({
+        env: c.env,
+        calendar,
+        notify,
+        accountEmail: owner,
+        oauthIssuer: c.env.OAUTH_ISSUER,
+        dryRun,
+        forceResolve: force,
+        triggerInviteTitle: trigger,
+        // Decision L: a looping caller can't flood the inbox (confirm/plan-mail.ts).
+        dedupeMail: true,
+      });
+    } catch (e) {
+      if (!(e instanceof IdentityCredentialMissingError)) throw e;
+      logCredentialMissingSkip("replan_now");
+      return c.json({ error: "identity_credential_missing" as const }, 409);
+    }
 
     if (result.kind === "no_changes") {
       return c.json({ ok: true, replanned: false, reason: "no_changes" }, 200);

@@ -9,7 +9,7 @@ import {
 import { scopeEventToDeployment, withDeploymentStamp } from "./deployment-scope";
 import {
   type GraphEvent, toCalendarEventFromGraph, isBusyGraphEvent,
-  toGraphPatch, OPTICAL_DONE_CATEGORY, graphPropId, isoZ,
+  toGraphPatch, OPTICAL_DONE_CATEGORY, GRAPH_EVENT_SELECT, graphPropId, isoZ,
 } from "./graph-event-mapping";
 
 type TokenFetcher = (opts?: { forceRefresh?: boolean }) => Promise<string>;
@@ -173,6 +173,9 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
     // the stored deltaLink/nextLink verbatim, and Graph derives those from
     // this request's parameters, so the expand carries forward automatically.
     params.set("$expand", expandOpticalProperties());
+    // No $select here, deliberately: Microsoft Learn (event: delta, v1.0)
+    // documents $select as unsupported on calendarView/delta. body and
+    // location therefore still arrive on this path; the mapper drops them.
     const r = await this.runDelta(`${GRAPH}/me/calendarView/delta?${params.toString()}`);
     if (r.invalidated) {
       // A fresh initial sync can't be stale; surface loudly rather than loop.
@@ -206,6 +209,7 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
       startDateTime: new Date(start).toISOString(),
       endDateTime: new Date(end).toISOString(),
     });
+    params.set("$select", GRAPH_EVENT_SELECT);
     params.set("$expand", expandOpticalProperties());
     const events: CalendarEvent[] = [];
     const warnState = { warned: false };
@@ -355,6 +359,7 @@ export class MicrosoftCalendarProvider implements CalendarProvider {
     // Same $expand as the delta read so scheduler metadata survives a
     // single-event fetch (decline-cancel / poll re-verification read it).
     const params = new URLSearchParams();
+    params.set("$select", GRAPH_EVENT_SELECT);
     params.set("$expand", expandOpticalProperties());
     const res = await this.authedFetch(`${GRAPH}/me/events/${encodeURIComponent(eventId)}?${params.toString()}`);
     if (res.status === 404 || res.status === 410) return null;

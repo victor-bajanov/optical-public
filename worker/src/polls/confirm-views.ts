@@ -91,7 +91,9 @@ const BOOKING_NOTE =
   "Every invitee listed gets a calendar invite from you. Invitees who chose to hide their name get a private email with the invite attached instead.";
 
 export function createPollView(a: {
-  owner: string;
+  /** Shown to invitees as the organiser: the owner's current address
+   *  (ownerNotificationEmail), never the subject. */
+  organiserName: string;
   tz: string;
   basics: PollBasics;
   deadlineUtc: string;
@@ -101,7 +103,7 @@ export function createPollView(a: {
 }): PollConfirmView {
   const mail = renderInviteEmail({
     pollTitle: a.basics.title,
-    organiserName: a.owner,
+    organiserName: a.organiserName,
     durationMin: a.basics.durationMin,
     rangeStart: a.basics.rangeStart,
     rangeEnd: a.basics.rangeEnd,
@@ -129,7 +131,9 @@ export function createPollView(a: {
 }
 
 export function nudgeView(a: {
-  owner: string;
+  /** Shown to invitees as the organiser: the owner's current address
+   *  (ownerNotificationEmail), never the subject. */
+  organiserName: string;
   poll: Poll;
   nonResponders: PollInvitee[];
   respondedCount: number;
@@ -137,7 +141,7 @@ export function nudgeView(a: {
 }): PollConfirmView {
   const mail = renderNudgeEmail({
     pollTitle: a.poll.title,
-    organiserName: a.owner,
+    organiserName: a.organiserName,
     durationMin: a.poll.durationMin,
     rangeStart: a.poll.rangeStart,
     rangeEnd: a.poll.rangeEnd,
@@ -154,8 +158,8 @@ export function nudgeView(a: {
   };
 }
 
-export function cancelView(a: { owner: string; poll: Poll; recipients: PollInvitee[] }): PollConfirmView {
-  const mail = renderPollCancelledEmail({ pollTitle: a.poll.title, organiserName: a.owner, ...basicsOf(a.poll) });
+export function cancelView(a: { organiserName: string; poll: Poll; recipients: PollInvitee[] }): PollConfirmView {
+  const mail = renderPollCancelledEmail({ pollTitle: a.poll.title, organiserName: a.organiserName, ...basicsOf(a.poll) });
   return {
     heading: `Cancel the meeting poll "${a.poll.title}"`,
     recipients: a.recipients.map(personLabel),
@@ -194,7 +198,9 @@ export function bookBestView(a: { poll: Poll; attendees: PollInvitee[] }): PollC
 }
 
 export function updateView(a: {
-  owner: string;
+  /** Shown to invitees as the organiser: the owner's current address
+   *  (ownerNotificationEmail), never the subject. */
+  organiserName: string;
   tz: string;
   poll: Poll;
   newTitle?: string;
@@ -212,7 +218,7 @@ export function updateView(a: {
   const deadline = a.newDeadlineUtc ?? a.poll.deadlineUtc;
   const common = {
     pollTitle: basics.title,
-    organiserName: a.owner,
+    organiserName: a.organiserName,
     durationMin: basics.durationMin,
     rangeStart: basics.rangeStart,
     rangeEnd: basics.rangeEnd,

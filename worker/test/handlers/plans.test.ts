@@ -64,6 +64,21 @@ describe("/v1/plans/:hash", () => {
     expect(json.body.schedule).toHaveLength(1);
   });
 
+  for (const committedAt of [null, "2026-05-18T01:00:00Z"]) {
+    it(`GET never returns body.warnings (third-party event titles), ${committedAt ? "committed" : "pending"} plan`, async () => {
+      await env.DB
+        .prepare("UPDATE proposed_plans SET body = ?, committed_at = ? WHERE plan_hash = 'hash-1'")
+        .bind(JSON.stringify({ ...body, warnings: ["Alice's 1:1: attendee_availability_unknown"] }), committedAt)
+        .run();
+      const res = await makeApp().request("/v1/plans/hash-1", { headers: { Authorization: "Bearer fake" } }, env);
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { body: Record<string, unknown>; committed_at: string | null };
+      expect(json.committed_at).toBe(committedAt);
+      expect("warnings" in json.body).toBe(false);
+      expect(json.body.schedule).toEqual(body.schedule);
+    });
+  }
+
   it("GET returns 404 for unknown plan", async () => {
     const app = makeApp();
     const res = await app.request(

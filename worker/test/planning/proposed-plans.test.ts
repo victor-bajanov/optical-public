@@ -113,6 +113,34 @@ describe("proposed_plans D1 helpers", () => {
     expect(r?.committed_at).toBe("2026-05-18T12:34:56Z");
   });
 
+  it("markProposedPlanCommitted scrubs third-party text (render_snapshot, body.warnings) and keeps the baselines", async () => {
+    const W = body.window;
+    await insertProposedPlan(env.DB, "hash-1", { ...body, warnings: ["Alice's 1:1: attendee_availability_unknown"] },
+      "2026-05-18T12:00:00Z", "2026-05-19T12:00:00Z", "me@x", "UTC");
+    await env.DB.prepare("UPDATE proposed_plans SET render_snapshot = ? WHERE plan_hash = 'hash-1'")
+      .bind(JSON.stringify({ trigger: { kind: "webhook", inviteTitle: "Lunch with Alice" } })).run();
+    await markProposedPlanCommitted(env.DB, "hash-1", "2026-05-18T12:34:56Z", "me@x");
+    const r = await getProposedPlan(env.DB, "hash-1");
+    expect(r?.plan_hash).toBe("hash-1");
+    expect(r?.committed_at).toBe("2026-05-18T12:34:56Z");
+    expect(r?.render_snapshot).toBeNull();
+    expect("warnings" in (r!.body as Record<string, unknown>)).toBe(false);
+    expect(r?.body.schedule).toEqual(body.schedule);
+    expect(r?.body.dropped).toEqual(body.dropped);
+    expect(r?.body.window).toEqual(W);
+    expect((await getCommittedPlanForWeek(env.DB, "me@x", W.start, "UTC", "UTC"))?.plan_hash).toBe("hash-1");
+    expect(await getCommittedDroppedForWeek(env.DB, "me@x", W.start, "UTC", "UTC")).toEqual([]);
+    expect((await getCommittedPlansForSubject(env.DB, "me@x")).map((p) => p.plan_hash)).toEqual(["hash-1"]);
+  });
+
+  it("markProposedPlanCommitted leaves a body without warnings byte-identical", async () => {
+    await insertProposedPlan(env.DB, "hash-1", body, "2026-05-18T12:00:00Z", "2026-05-19T12:00:00Z", "me@x");
+    const before = await env.DB.prepare("SELECT body FROM proposed_plans WHERE plan_hash = 'hash-1'").first<{ body: string }>();
+    await markProposedPlanCommitted(env.DB, "hash-1", "2026-05-18T12:34:56Z", "me@x");
+    const after = await env.DB.prepare("SELECT body FROM proposed_plans WHERE plan_hash = 'hash-1'").first<{ body: string }>();
+    expect(after!.body).toBe(before!.body);
+  });
+
   it("delete removes the row", async () => {
     await insertProposedPlan(
       env.DB,
@@ -618,6 +646,35 @@ describe("commitPlan D1 atomicity (X3)", () => {
     const plan = await env.DB.prepare("SELECT committed_at FROM proposed_plans WHERE plan_hash='h2'")
       .first<{ committed_at: string | null }>();
     expect(plan!.committed_at).not.toBeNull();
+  });
+
+  it("scrubs render_snapshot and body.warnings in the commit batch, keeping schedule/dropped/window", async () => {
+    const body = {
+      schedule: [
+        { task_id: "t1", chunk_id: "t1#0", start: "2026-05-19T09:00:00.000Z", end: "2026-05-19T10:00:00.000Z", context: "deep" },
+      ],
+      dropped: [],
+      window: { start: "2026-05-18T00:00:00Z", end: "2026-05-25T00:00:00Z" },
+      warnings: ["Alice's 1:1: attendee_availability_unknown"],
+    };
+    await env.DB.prepare(
+      "INSERT INTO proposed_plans (plan_hash, body, created_at, expires_at, committed_at, subject, render_snapshot) VALUES ('h3', ?, '2026-05-18T00:00:00Z', '2099-01-01T00:00:00Z', NULL, 'o@org', ?)",
+    ).bind(JSON.stringify(body), JSON.stringify({ trigger: { kind: "webhook", inviteTitle: "Lunch with Alice" } })).run();
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, owner_subject, body, status, created_at, updated_at) VALUES ('t1','o@org',?, 'pending', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    ).bind(JSON.stringify({ id: "t1", title: "deep" })).run();
+
+    const res = await commitPlan(env.DB, new MockCalendarProvider(), "h3", "o@org");
+    expect(res.status).toBe(200);
+    const row = await env.DB.prepare("SELECT plan_hash, body, committed_at, render_snapshot FROM proposed_plans WHERE plan_hash='h3'")
+      .first<{ plan_hash: string; body: string; committed_at: string | null; render_snapshot: string | null }>();
+    expect(row!.committed_at).not.toBeNull();
+    expect(row!.render_snapshot).toBeNull();
+    const stored = JSON.parse(row!.body);
+    expect("warnings" in stored).toBe(false);
+    expect(stored.schedule).toEqual(body.schedule);
+    expect(stored.dropped).toEqual([]);
+    expect(stored.window).toEqual(body.window);
   });
 });
 

@@ -1109,5 +1109,47 @@ def test_reset_smoke_env_has_provider_flag(monkeypatch):
     assert mod.build_parser().parse_args(["--provider", "microsoft"]).provider == "microsoft"
 
 
+# --- C5: raw-token route gated by CALENDAR_RAW_TOKEN_ENABLED ------------------
+
+class StatusScheduler:
+    """A scheduler whose /v1/calendar-access-token answers a fixed status."""
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+    def request(self, method, path, **kw):
+        assert (method, path) == ("GET", "/v1/calendar-access-token")
+        return httpx.Response(self.status, json=self.body,
+                              request=httpx.Request("GET", "https://sched/v1/calendar-access-token"))
+
+
+_TOKEN_CLIENTS = [lib.CalendarClient, lib.GraphCalendarClient, lib.GmailClient, lib.GraphMailClient]
+
+
+@pytest.mark.parametrize("cls", _TOKEN_CLIENTS, ids=lambda c: c.__name__)
+def test_token_fetch_404_names_the_flag(cls):
+    # Flag off, the worker answers 404 not_found before auth. Every token
+    # fetcher must end the run with a message naming the flag, not a bare
+    # httpx.HTTPStatusError traceback.
+    c = cls(StatusScheduler(404, {"error": "not_found"}))
+    with pytest.raises(lib.RawTokenRouteDisabled) as ei:
+        c._get_token()
+    assert isinstance(ei.value, SystemExit)
+    msg = str(ei.value)
+    assert "CALENDAR_RAW_TOKEN_ENABLED" in msg
+    assert "/v1/calendar-access-token" in msg
+
+
+@pytest.mark.parametrize("cls", _TOKEN_CLIENTS, ids=lambda c: c.__name__)
+def test_token_fetch_other_errors_still_raise_http_status_error(cls):
+    c = cls(StatusScheduler(403, {"error": "insufficient_scope", "required": "calendar:raw-token"}))
+    with pytest.raises(httpx.HTTPStatusError):
+        c._get_token()
+
+
+@pytest.mark.parametrize("cls", _TOKEN_CLIENTS, ids=lambda c: c.__name__)
+def test_token_fetch_200_returns_token(cls):
+    c = cls(StatusScheduler(200, {"access_token": "t"}))
+    assert c._get_token() == "t"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

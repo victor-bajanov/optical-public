@@ -20,7 +20,9 @@ import { buildReplanEmailModel } from "../diff/email-model";
 import { attachRenderSnapshot, deleteProposedPlan, getCommittedDroppedForWeek } from "../planning/proposed-plans";
 import { loadTitleMap } from "../diff/load-titles";
 import { signCapabilityWithEnv } from "../auth/capability";
+import { identityAnchorTag } from "../auth/identity-rebind";
 import { ACCEPT_TTL_SECONDS } from "../planning/accept-ttl";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 export interface MondayResolveArgs {
   env: Env;
@@ -100,7 +102,10 @@ export async function runMondayResolve(args: MondayResolveArgs): Promise<MondayR
   const titles = await loadTitleMap(env.DB, accountEmail, ids);
 
   const cap = await signCapabilityWithEnv(
-    { planHash: result.planHash, subject: accountEmail, purpose: "accept", ttlSeconds: ACCEPT_TTL_SECONDS, window: result.body.window },
+    {
+      planHash: result.planHash, subject: accountEmail, purpose: "accept", ttlSeconds: ACCEPT_TTL_SECONDS, window: result.body.window,
+      anchor: await identityAnchorTag(env, accountEmail),
+    },
     env,
   );
   const acceptUrl = `${env.OAUTH_ISSUER}/v1/plans/${result.planHash}/accept?t=${encodeURIComponent(cap)}`;
@@ -117,7 +122,9 @@ export async function runMondayResolve(args: MondayResolveArgs): Promise<MondayR
     meetingTaskIds: result.meetingTaskIds,
   });
   await attachRenderSnapshot(env.DB, result.planHash, model);
-  await notification.sendReplanNotification(accountEmail, model, { acceptUrl, planHash: result.planHash });
+  // Owner mail goes to the latest verified sign-in address (db/owner-email.ts).
+  const to = await ownerNotificationEmail(env.DB, accountEmail);
+  await notification.sendReplanNotification(to, model, { acceptUrl, planHash: result.planHash });
 
   return { kind: "ok", planHash: result.planHash };
 }

@@ -138,6 +138,20 @@ describe("GET /v1/schedule", () => {
     expect(res.status).toBe(403);
   });
 
+  it("never returns body.warnings (third-party event titles) from the committed plan", async () => {
+    await seedCommitted("me@x", {
+      schedule: [],
+      dropped: [],
+      window: { start: "2026-05-11T00:00:00Z", end: "2026-05-18T00:00:00Z" },
+      warnings: ["Alice's 1:1: attendee_availability_unknown"],
+    });
+    const res = await makeApp().request("/v1/schedule", { headers: { Authorization: "Bearer fake" } }, env);
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as Record<string, unknown>;
+    expect("warnings" in json).toBe(false);
+    expect(json.window).toEqual({ start: "2026-05-11T00:00:00Z", end: "2026-05-18T00:00:00Z" });
+  });
+
   describe("omits entries for tasks that no longer exist", () => {
     const live = "11111111-1111-4111-8111-111111111111";
     const gone = "22222222-2222-4222-8222-222222222222";

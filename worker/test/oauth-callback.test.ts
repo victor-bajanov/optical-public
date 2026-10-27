@@ -9,6 +9,9 @@ import { FULL_UPSTREAM_GRANT } from "./fixtures/upstream-grant";
 import { __setSignInSubscriberForTests, ensureSubscriptionOnSignIn } from "../src/webhooks/sign-in-subscribe";
 import { MockCalendarProvider } from "../src/providers/mock-calendar-provider";
 import { getCalendarSync } from "../src/db/calendar-sync";
+import { GoogleIdentityProvider } from "../src/auth/google-identity-provider";
+import { MicrosoftIdentityProvider } from "../src/auth/microsoft-identity-provider";
+import { readCachedAccessToken } from "../src/auth/identity-store";
 
 function mock(email: string, opts: { exchangeThrows?: boolean } = {}): IdentityProvider {
   return {
@@ -536,8 +539,8 @@ const rebindEnv = (over: Partial<Env> = {}) => o6Env({ REFUSE_PROVIDER_REBIND: "
 
 async function seedBoundAccount(email: string, provider: string, providerSubject: string | null) {
   await env.DB.prepare(
-    "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject) VALUES (?,?,?,?,?,?)",
-  ).bind(email, new Uint8Array([7, 7, 7]).buffer, "stored", "2026-01-01T00:00:00Z", provider, providerSubject).run();
+    "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+  ).bind(email, new Uint8Array([7, 7, 7]).buffer, "stored", "2026-01-01T00:00:00Z", provider, providerSubject, "kept@example.org").run();
   await env.DB.prepare("INSERT INTO users (subject, role, is_active, last_seen, created_at, done_color_id) VALUES (?,?,?,?,?,?)")
     .bind(email, "member", 1, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00Z", "11").run();
   await env.DB.prepare(
@@ -547,7 +550,7 @@ async function seedBoundAccount(email: string, provider: string, providerSubject
 
 async function accountSnapshot(email: string) {
   return {
-    tokens: await env.DB.prepare("SELECT hex(refresh_token_encrypted) AS enc, scopes, updated_at, provider, provider_subject FROM identity_tokens WHERE account_email = ?").bind(email).first(),
+    tokens: await env.DB.prepare("SELECT hex(refresh_token_encrypted) AS enc, scopes, updated_at, provider, provider_subject, login_email FROM identity_tokens WHERE account_email = ?").bind(email).first(),
     user: await env.DB.prepare("SELECT role, is_active, last_seen, done_color_id, retention_warned_at FROM users WHERE subject = ?").bind(email).first(),
     sync: await env.DB.prepare("SELECT next_sync_token, channel_id FROM calendar_sync WHERE owner_subject = ?").bind(email).first(),
     counts: await counts(),
@@ -586,7 +589,7 @@ for (const provider of ["google", "microsoft"] as const) {
         expect(revokeGrant).toHaveBeenCalledTimes(1);
         expect(revokeGrant).toHaveBeenCalledWith("upstream-refresh-SECRET");
         expect(await accountSnapshot("member@example.com")).toEqual(before);
-        expect(await env.GOOGLE_TOKEN_CACHE.get("idp_access_token:member@example.com")).toBeNull();
+        expect(await readCachedAccessToken(env, "member@example.com")).toBeNull();
         const lines = warn.mock.calls.map((c) => c.map((a) => JSON.stringify(a)).join(" "));
         const line = lines.find((l) => l.includes("auth_callback_rebind_refused"));
         expect(line).toBeDefined();
@@ -609,6 +612,20 @@ for (const provider of ["google", "microsoft"] as const) {
       expect(await res.text()).toContain("Account already linked");
       expect(revokeGrant).toHaveBeenCalledTimes(1);
       expect(await accountSnapshot("member@example.com")).toEqual(before);
+    });
+
+    it("a refused rebind leaves login_email unchanged (decision 3: it rides the guarded upsert)", async () => {
+      await seedBoundAccount("member@example.com", provider, "owner-sub");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const { idp } = identityMock("Member@Example.com", "intruder-sub");
+        const res = await refusedCallback(rebindEnv(), idp, provider);
+        expect(res.status).toBe(403);
+      } finally {
+        warn.mockRestore();
+      }
+      expect(await env.DB.prepare("SELECT login_email FROM identity_tokens WHERE account_email = ?").bind("member@example.com").first())
+        .toEqual({ login_email: "kept@example.org" });
     });
 
     it("UPSTREAM_REVOKE_ENABLED off: still refused, revokeGrant never called", async () => {
@@ -966,5 +983,75 @@ describe("/auth/callback ensures a push channel (trial finding 1)", () => {
       expect(row?.channel_callback_url).toBe(`${env.OAUTH_ISSUER}/v1/webhook/google-calendar`);
     });
     expect(cal.getSubscribeCallCount()).toBe(1);
+  });
+});
+
+// Decision 3: every successful sign-in persists the token's verified,
+// normalised email as identity_tokens.login_email (the owner's notification
+// address), even when resolveSubject keeps the ORIGINAL subject after a rename.
+// Real provider fetchIdentity, so the verification path is the shipped one:
+// Google's verified_email userinfo, Microsoft's xms_edov email claim.
+describe("/auth/callback persists login_email (decision 3)", () => {
+  const loginEmail = async (subject: string) =>
+    (await env.DB.prepare("SELECT login_email FROM identity_tokens WHERE account_email = ?").bind(subject)
+      .first<{ login_email: string | null }>())?.login_email;
+  async function seedRenamed(provider: "google" | "microsoft", providerSubject: string) {
+    await env.DB.prepare("INSERT INTO users (subject, role, is_active, created_at) VALUES (?,?,?,?)")
+      .bind("old@example.com", "member", 1, "2026-01-01T00:00:00Z").run();
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+    ).bind("old@example.com", new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", provider, providerSubject, "old@example.com").run();
+  }
+  const grant = { accessToken: "upstream-access", refreshToken: "upstream-refresh", expiresIn: 3600, scope: FULL_UPSTREAM_GRANT };
+  function jwt(payload: Record<string, unknown>): string {
+    const b64 = (o: unknown) => btoa(JSON.stringify(o)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    return `${b64({ alg: "RS256", typ: "JWT" })}.${b64(payload)}.sig`;
+  }
+
+  beforeEach(() => { __setSignInSubscriberForTests(async () => {}); });
+  afterEach(() => {
+    __setSignInSubscriberForTests(null);
+    vi.unstubAllGlobals();
+  });
+
+  it("Google: a renamed user's mixed-case verified userinfo email is stored lower-cased on the ORIGINAL subject", async () => {
+    await seedRenamed("google", "1234567890");
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input instanceof Request ? input.url : input).startsWith("https://www.googleapis.com/oauth2/v2/userinfo")
+        ? new Response(JSON.stringify({ id: "1234567890", email: "  Renamed@Example.ORG ", verified_email: true }))
+        : realFetch(input, init)));
+    const idp = new GoogleIdentityProvider({ clientId: "cid", clientSecret: "sec" });
+    idp.exchangeCode = async () => grant;
+    const res = await refusedCallback(env as Env, idp, "google");
+    expect(res.status).toBe(302);
+    const code = await env.DB.prepare("SELECT subject FROM oauth_codes").first<{ subject: string }>();
+    expect(code!.subject).toBe("old@example.com");
+    expect(await loginEmail("old@example.com")).toBe("renamed@example.org");
+    const rows = await env.DB.prepare("SELECT account_email FROM identity_tokens").all<{ account_email: string }>();
+    expect(rows.results.map((r) => r.account_email)).toEqual(["old@example.com"]);
+  });
+
+  it("Microsoft: a renamed user's mixed-case xms_edov email claim (not the UPN) is stored lower-cased on the ORIGINAL subject", async () => {
+    const tid = "11111111-2222-3333-4444-555555555555";
+    await seedRenamed("microsoft", `${tid}:oid-1`);
+    const idp = new MicrosoftIdentityProvider({ clientId: "entra-client-id", clientSecret: "sec" });
+    const idToken = jwt({
+      aud: "entra-client-id", exp: Math.floor(Date.now() / 1000) + 600, tid, oid: "oid-1",
+      email: "Renamed@Example.ORG", xms_edov: true, preferred_username: "upn@tenant.example.org",
+    });
+    idp.exchangeCode = async () => ({ ...grant, idToken });
+    const res = await refusedCallback(o6Env(), idp, "microsoft");
+    expect(res.status).toBe(302);
+    const code = await env.DB.prepare("SELECT subject FROM oauth_codes").first<{ subject: string }>();
+    expect(code!.subject).toBe("old@example.com");
+    expect(await loginEmail("old@example.com")).toBe("renamed@example.org");
+  });
+
+  it("a first sign-in stores its own normalised email", async () => {
+    const { idp } = grantingMock("Operator@Example.com", FULL_UPSTREAM_GRANT);
+    const res = await refusedCallback(o6Env(), idp, "microsoft");
+    expect(res.status).toBe(302);
+    expect(await loginEmail("operator@example.com")).toBe("operator@example.com");
   });
 });

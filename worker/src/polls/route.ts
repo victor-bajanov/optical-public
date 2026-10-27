@@ -6,6 +6,7 @@ import { OutboundMailCapExceeded, reserveOutboundMail } from "../mail/outbound-c
 import type { CalendarProvider } from "../providers/calendar-provider";
 import type { NotificationProvider } from "../providers/notification-provider";
 import { verifyCapabilityWithEnv, signCapabilityWithEnv } from "../auth/capability";
+import { pollStatusLinkAnchorHolds } from "../auth/identity-rebind";
 import { hashToken } from "../auth/tokens";
 import { hashingKey } from "../auth/crypto-keys";
 import {
@@ -68,6 +69,7 @@ import {
   type CandidateRow,
 } from "../web/poll-status-page";
 import { isActiveMember } from "../auth/membership";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 /** Fallback hours when neither the poll's owner nor the instance has a
  *  config_business_hours row — mirrors booking/availability.ts's own
@@ -129,7 +131,7 @@ async function fireOrganiserResponseNotification(
       respondedCount,
       totalCount: nonDropped.length,
     });
-    await notification.sendPollEmail({ to: poll.subject, ...content });
+    await notification.sendPollEmail({ to: await ownerNotificationEmail(env.DB, poll.subject), ...content });
   } catch (err) {
     console.error(`poll ${poll.id}: organiser response notification failed`, String(err));
   }
@@ -220,6 +222,9 @@ async function resolveStatusToken(
   if (!token) return null;
   const claims = await verifyCapabilityWithEnv(token, env);
   if (!claims || claims.purpose !== "poll-status" || claims.pollId !== pollId) return null;
+  // Dead once the address passed to another identity (admin rebind, provider
+  // switch): the page ranks candidates against the CURRENT credential.
+  if (!(await pollStatusLinkAnchorHolds(env, claims))) return null;
   const poll = await getPollForSubject(db, claims.subject, pollId);
   // Card C: each status-link view reads the organiser's calendar to rank
   // candidates, so a delisted organiser's link is the same 404 as no poll.
@@ -863,6 +868,10 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
     await recordJoinAttempt(c.env.DB, pollId, ipHash, new Date(nowMs).toISOString());
 
     const notification = c.get("notificationProvider") ?? await defaultNotificationProvider(c.env, poll.subject);
+    // The organiser name invitees see: the owner's current address, never the
+    // subject (db/owner-email.ts). Read here, before any reservation, token
+    // rotation or insert below, so a failed read leaves every link as it was.
+    const organiserName = await ownerNotificationEmail(c.env.DB, poll.subject);
 
     async function reserveOrSkip(toEmail: string): Promise<boolean> {
       try {
@@ -898,7 +907,7 @@ export function mountPollRoutes(app: Hono<{ Bindings: Env; Variables: AppVariabl
       const inviteeUrl = `${new URL(c.req.url).origin}/poll/${pollId}?t=${encodeURIComponent(capToken)}`;
       const content = renderInviteEmail({
         pollTitle: poll!.title,
-        organiserName: poll!.subject,
+        organiserName,
         durationMin: poll!.durationMin,
         rangeStart: poll!.rangeStart,
         rangeEnd: poll!.rangeEnd,

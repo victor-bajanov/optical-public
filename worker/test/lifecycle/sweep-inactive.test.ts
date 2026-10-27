@@ -139,6 +139,41 @@ describe("sweepInactiveUsers", () => {
     expect(rec.sent).toEqual([expect.objectContaining({ to: "stale@org", subject: "Your Optical data has been deleted" })]);
   });
 
+  // Lifecycle mail goes to the latest verified sign-in address (login_email,
+  // migration 0046), never the bare subject, which an IdP rename can hand to
+  // someone else; NULL falls back to the subject. The deletion notice's
+  // address is resolved before offboardUser deletes the identity_tokens row.
+  for (const [label, loginEmail, expected] of [
+    ["login_email set", "owner-now@example.com", "owner-now@example.com"],
+    ["login_email NULL", null, "stale@org"],
+  ] as const) {
+    async function seedIdentity() {
+      await env.DB.prepare(
+        "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+      ).bind("stale@org", new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-stale", loginEmail).run();
+    }
+
+    it(`the retention warning goes to ${expected} (${label})`, async () => {
+      await seedUser("stale@org", "2026-04-01T00:00:00Z");
+      await seedIdentity();
+      const rec = recordingMailer();
+      await sweepInactiveUsers({ ...env, ...MAIL_ON, RETENTION_DAYS: "30" }, NOW, { ...noopCalendar, mailer: rec.mailer });
+      expect(rec.sent.map((m) => m.to)).toEqual([expected]);
+      expect(await warnedAt("stale@org")).toBe(NOW.toISOString());
+    });
+
+    it(`the deletion notice goes to ${expected} (${label}), resolved before the offboard`, async () => {
+      await seedUser("stale@org", "2026-04-01T00:00:00Z", "2026-05-18T04:00:00.000Z");
+      await seedIdentity();
+      const rec = recordingMailer();
+      const swept = await sweepInactiveUsers({ ...env, ...MAIL_ON, RETENTION_DAYS: "30" }, NOW, { ...noopCalendar, mailer: rec.mailer });
+      expect(swept).toEqual(["stale@org"]);
+      const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM identity_tokens WHERE account_email = ?").bind("stale@org").first<{ n: number }>();
+      expect(left?.n).toBe(0);
+      expect(rec.sent).toEqual([expect.objectContaining({ to: expected, subject: "Your Optical data has been deleted" })]);
+    });
+  }
+
   it("the deletion date in the warning is the day the sweep deletes (UTC-day granularity)", async () => {
     // Warned at 04:00:05 on 18 May; the 1 June sweep at 04:00:00 is a few
     // seconds short of 14 x 24 h but on the promised date, so it deletes.

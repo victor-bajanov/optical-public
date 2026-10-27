@@ -6,11 +6,14 @@ import {
   outboundMailDailyCap,
   countThirdPartyRecipients,
   hasOutboundMailBudget,
+  reserveOutboundMail,
+  selfAddresses,
   withOutboundMailCap,
   utcDay,
 } from "../../src/mail/outbound-cap";
 import { defaultNotificationProvider, defaultProviders } from "../../src/index-providers";
 import { MockNotificationProvider } from "../../src/providers/mock-notification-provider";
+import { cacheAccessToken, dropCachedAccessToken } from "../../src/auth/identity-store";
 import type { Env } from "../../src/env";
 import type { ReplanEmailModel } from "../../src/diff/email-model";
 
@@ -208,5 +211,90 @@ describe("notification-provider factories are the choke point", () => {
     const { notification } = await defaultProviders(capEnv(undefined), ALICE);
     await expect(notification.sendPollEmail({ to: BOB, ...MAIL })).rejects.toBeInstanceOf(OutboundMailCapExceeded);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("login_email counts as self (identity port of #105, decision 7)", () => {
+  // After an IdP-side rename the owner's mail goes to identity_tokens.login_email
+  // (db/owner-email.ts), not the subject. That address is still the user's own
+  // mailbox: it must never be counted or refused, even with the kill switch on.
+  const SUBJECT = "cap-old@example.com";
+  const LOGIN = "cap-new@example.com";
+  const now = new Date("2026-10-09T12:00:00Z");
+  const clock = () => now;
+
+  async function seedLogin(loginEmail: string | null): Promise<void> {
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(SUBJECT).run();
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+    ).bind(SUBJECT, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-cap", loginEmail).run();
+  }
+
+  afterEach(async () => {
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(SUBJECT).run();
+  });
+
+  it("countThirdPartyRecipients accepts several self addresses and excludes each, case-insensitively", () => {
+    expect(countThirdPartyRecipients(`${SUBJECT}, ${LOGIN.toUpperCase()}; ${BOB}`, [SUBJECT, LOGIN])).toBe(1);
+    expect(countThirdPartyRecipients(LOGIN, [SUBJECT, ` ${LOGIN.toUpperCase()} `])).toBe(0);
+    expect(countThirdPartyRecipients(LOGIN, SUBJECT)).toBe(1);
+  });
+
+  it("selfAddresses is the subject plus login_email, or just the subject when NULL or no row", async () => {
+    await seedLogin(LOGIN);
+    expect(await selfAddresses(env as unknown as Env, SUBJECT)).toEqual([SUBJECT, LOGIN]);
+    await seedLogin(null);
+    expect(await selfAddresses(env as unknown as Env, SUBJECT)).toEqual([SUBJECT]);
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(SUBJECT).run();
+    expect(await selfAddresses(env as unknown as Env, SUBJECT)).toEqual([SUBJECT]);
+  });
+
+  it('with cap "0" a send to login_email (any case) is delivered, not refused and not counted', async () => {
+    await seedLogin(LOGIN);
+    const inner = new MockNotificationProvider();
+    const capped = withOutboundMailCap(capEnv("0"), SUBJECT, inner, clock);
+    await capped.sendPollEmail({ to: LOGIN.toUpperCase(), ...MAIL });
+    await capped.sendReplanNotification(LOGIN, {} as ReplanEmailModel, { acceptUrl: "u", planHash: "h" });
+    expect(inner.sentPollEmails.map((e) => e.to)).toEqual([LOGIN.toUpperCase()]);
+    expect(inner.sent).toHaveLength(1);
+    expect(await countFor(SUBJECT, "2026-10-09")).toBeNull();
+  });
+
+  it('with cap "0" a third-party send is still refused when login_email is set', async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await seedLogin(LOGIN);
+    const inner = new MockNotificationProvider();
+    const capped = withOutboundMailCap(capEnv("0"), SUBJECT, inner, clock);
+    await expect(capped.sendPollEmail({ to: BOB, ...MAIL })).rejects.toBeInstanceOf(OutboundMailCapExceeded);
+    expect(inner.sentPollEmails).toHaveLength(0);
+  });
+
+  it("the production factory's capped provider treats login_email as self", async () => {
+    await seedLogin(LOGIN);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ id: "m" }), { status: 200 }));
+    await cacheAccessToken(env, SUBJECT, "fake-access-token", 3600);
+    try {
+      const provider = await defaultNotificationProvider(capEnv("0"), SUBJECT, "google");
+      await provider.sendPollEmail({ to: LOGIN, ...MAIL });
+      expect(fetchSpy).toHaveBeenCalled();
+      expect(await countFor(SUBJECT, utcDay(new Date()))).toBeNull();
+    } finally {
+      await dropCachedAccessToken(env, SUBJECT);
+    }
+  });
+
+  it("hasOutboundMailBudget treats login_email as self", async () => {
+    await seedLogin(LOGIN);
+    expect(await hasOutboundMailBudget(capEnv("0"), SUBJECT, [LOGIN.toUpperCase()], now)).toBe(true);
+    expect(await hasOutboundMailBudget(capEnv("0"), SUBJECT, [LOGIN, BOB], now)).toBe(false);
+  });
+
+  it("reserveOutboundMail treats login_email as self", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await seedLogin(LOGIN);
+    const inner = new MockNotificationProvider();
+    await reserveOutboundMail(capEnv("0"), SUBJECT, inner, [LOGIN.toUpperCase()], now);
+    expect(await countFor(SUBJECT, "2026-10-09")).toBeNull();
+    await expect(reserveOutboundMail(capEnv("0"), SUBJECT, inner, [LOGIN, BOB], now)).rejects.toBeInstanceOf(OutboundMailCapExceeded);
   });
 });

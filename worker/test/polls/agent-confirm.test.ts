@@ -913,3 +913,85 @@ describe("OpenAPI", () => {
     expect(upd).toMatch(/no-op/i);
   });
 });
+
+describe("confirm-page email previews name login_email, never the subject (identity port of #105)", () => {
+  // After an IdP-side rename the subject is the owner's OLD address: the
+  // preview must show invitees' real organiser name, the current address.
+  const LOGIN = "o93-owner-now@example.com";
+
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+    ).bind(OWNER, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-o93", LOGIN).run();
+  });
+  afterEach(async () => {
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(OWNER).run();
+  });
+
+  // The confirm mail's recipient is another task's concern (owner recipients),
+  // so find it by subject alone.
+  async function previewHtml(app: App, notify: MockNotificationProvider): Promise<string> {
+    const mail = notify.sentPollEmails.filter((m) => m.subject.startsWith("Confirm:")).at(-1);
+    if (!mail) throw new Error("no confirm mail");
+    const m = /https:\/\/scheduler\.example\.com\/confirm\/([0-9a-f-]+)\?t=([^\s"<]+)/.exec(mail.text);
+    if (!m) throw new Error("no confirm link in mail");
+    const res = await getPage(app, { id: m[1]!, t: decodeURIComponent(m[2]!) });
+    expect(res.status).toBe(200);
+    return res.text();
+  }
+
+  function expectNamesLogin(html: string): void {
+    expect(html).toContain(LOGIN);
+    expect(html).not.toContain(OWNER);
+  }
+
+  it("createMeetingPoll's invite preview", async () => {
+    const notify = new MockNotificationProvider();
+    const app = makeApp(notify);
+    const res = await app.request("/v1/polls", { method: "POST", ...json(BODY, AGENT_AUTH) }, GATED);
+    expect(res.status).toBe(202);
+    expectNamesLogin(await previewHtml(app, notify));
+  });
+
+  it("nudgeMeetingPoll's reminder preview", async () => {
+    const notify = new MockNotificationProvider();
+    const app = makeApp(notify);
+    const pollId = await createDirect(app, notify);
+    const res = await app.request(`/v1/polls/${pollId}/nudge`, { method: "POST", headers: AGENT_AUTH }, GATED);
+    expect(res.status).toBe(202);
+    expectNamesLogin(await previewHtml(app, notify));
+  });
+
+  it("cancelMeetingPoll's cancellation preview", async () => {
+    const notify = new MockNotificationProvider();
+    const app = makeApp(notify);
+    const pollId = await createDirect(app, notify);
+    const res = await app.request(`/v1/polls/${pollId}/cancel`, { method: "POST", headers: AGENT_AUTH }, GATED);
+    expect(res.status).toBe(202);
+    expectNamesLogin(await previewHtml(app, notify));
+  });
+
+  it("updateMeetingPoll's invite, removal and deadline-extended previews", async () => {
+    const notify = new MockNotificationProvider();
+    const app = makeApp(notify);
+    const pollId = await createDirect(app, notify);
+    const bob = await env.DB.prepare("SELECT id FROM poll_invitees WHERE poll_id = ? AND email = 'bob@example.com'").bind(pollId).first<{ id: string }>();
+    const res = await app.request(
+      `/v1/polls/${pollId}`,
+      {
+        method: "PATCH",
+        ...json(
+          { addInvitees: [{ email: "carol@example.com", name: "Carol" }], removeInviteeIds: [bob!.id], deadlineUtc: "2027-01-14T12:00:00Z" },
+          AGENT_AUTH,
+        ),
+      },
+      GATED,
+    );
+    expect(res.status).toBe(202);
+    const html = await previewHtml(app, notify);
+    expect(html).toMatch(/Invite email/);
+    expect(html).toMatch(/Removal email/);
+    expectNamesLogin(html);
+  });
+});

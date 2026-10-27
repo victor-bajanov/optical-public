@@ -397,8 +397,13 @@ export async function handleAuthCallback(c: Context<{ Bindings: Env }>): Promise
     // provider_subject, or the other provider); a legacy NULL
     // provider_subject still binds. The grant just received belongs to that
     // OTHER upstream identity, so revoking it cannot touch the stored one.
+    //
+    // `email` (this sign-in's verified, normalised address) is stored as
+    // login_email, the owner's notification address. Never the subject for
+    // that: after a rename the subject may belong to someone else
+    // (db/owner-email.ts).
     try {
-      await storeIdentityTokens(c.env, subject, tokens, provider, providerSubject);
+      await storeIdentityTokens(c.env, subject, tokens, provider, providerSubject, email);
     } catch (err) {
       if (!(err instanceof ProviderRebindRefusedError)) throw err;
       console.warn("auth_callback_rebind_refused", { provider, mismatch: err.mismatch });

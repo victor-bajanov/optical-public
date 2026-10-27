@@ -500,7 +500,7 @@ describe("POST /confirm/{id}", () => {
   it("an invalid or wrong-purpose token is refused with no replay", async () => {
     const { app, id } = await deferOne();
     expect((await postConfirm(app, id, "garbage")).status).toBe(400);
-    const acceptToken = await signCapabilityWithEnv({ purpose: "accept", planHash: id, subject: A, ttlSeconds: 300 }, env);
+    const acceptToken = await signCapabilityWithEnv({ purpose: "accept", planHash: id, subject: A, ttlSeconds: 300, anchor: "test-anchor" }, env);
     expect((await postConfirm(app, id, acceptToken)).status).toBe(400);
     expect(calls).toHaveLength(0);
     expect((await row(id))?.consumed_at).toBeNull();
@@ -790,5 +790,89 @@ describe("confirm requires an active account (post-O14 #4)", () => {
     await env.DB.prepare("DELETE FROM users WHERE subject = ?").bind(A).run();
     expect((await postConfirm(app, id, t)).status).toBe(400);
     expect(calls).toHaveLength(0);
+  });
+});
+
+// Owner mail goes to the latest verified sign-in address (login_email,
+// migration 0046), never the bare subject, which an IdP rename can hand to
+// someone else; NULL falls back to the subject. pending_actions stays keyed
+// on the subject.
+describe("deferral mail recipient (ownerNotificationEmail)", () => {
+  async function seedIdentity(loginEmail: string | null) {
+    await env.DB.prepare("DELETE FROM identity_tokens").run();
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+    ).bind(A, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-a", loginEmail).run();
+  }
+  afterEach(async () => { await env.DB.prepare("DELETE FROM identity_tokens").run(); });
+
+  for (const [label, loginEmail, expected] of [
+    ["login_email set", "owner-now@example.com", "owner-now@example.com"],
+    ["login_email NULL", null, A],
+  ] as const) {
+    it(`own-mailbox confirm link goes to ${expected} (${label}); the row stays keyed on the subject`, async () => {
+      await seedIdentity(loginEmail);
+      const { mail, id } = await deferOne();
+      expect(mail.to).toBe(expected);
+      expect((await row(id))?.owner_subject).toBe(A);
+    });
+
+    it(`system-mail fallback goes to ${expected} (${label})`, async () => {
+      await seedIdentity(loginEmail);
+      const failing: NotificationProvider = {
+        sendReplanNotification: async () => {},
+        sendPollEmail: async () => { throw new Error("gmail 500"); },
+      };
+      const sends: Array<{ to: string[]; text_body: string }> = [];
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (_i: RequestInfo | URL, init?: RequestInit) => {
+        sends.push(JSON.parse(String(init!.body)));
+        return new Response(JSON.stringify({ data: { succeeded: 1, failed: 0 } }), { status: 200 });
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const { app } = makeApp(failing);
+      const res = await callOp(app, await seedBearer("tok-fb-login", A), {
+        ...GATED, SYSTEM_MAIL_ENABLED: "true", SYSTEM_MAIL_FROM: "Optical <o@example.test>", SYSTEM_MAIL_API_KEY: "k",
+      });
+      expect(res.status).toBe(202);
+      expect(sends.map((s) => s.to)).toEqual([[expected]]);
+      expect((await row(linkFrom(sends[0]!.text_body).id))?.owner_subject).toBe(A);
+    });
+  }
+});
+
+// CR4: the owner's address is read before the pending action is reserved. A
+// D1 error on that read must not leave a reserved row behind, or every retry
+// is deduped onto a link that was never mailed (and the row counts toward the
+// live cap for 24 h).
+describe("deferral: a failed owner-address read reserves nothing", () => {
+  function failingLoginEmailDb(db: D1Database): D1Database {
+    return new Proxy(db, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            if (/SELECT login_email FROM identity_tokens/.test(sql)) throw new Error("D1 unavailable");
+            return target.prepare(sql);
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+  }
+
+  it("leaves no pending_actions row, and a retry with a healthy DB mails exactly once", async () => {
+    const notify = new MockNotificationProvider();
+    const { app } = makeApp(notify);
+    const headers = await seedBearer("tok-cr4", A);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const bad = await callOp(app, headers, { ...GATED, DB: failingLoginEmailDb(env.DB) });
+    expect(bad.status).toBe(500);
+    const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM pending_actions").first<{ n: number }>();
+    expect(n?.n).toBe(0);
+    expect(notify.sentPollEmails).toHaveLength(0);
+
+    const ok = await callOp(app, headers);
+    expect(ok.status).toBe(202);
+    expect(notify.sentPollEmails).toHaveLength(1);
   });
 });

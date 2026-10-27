@@ -6,6 +6,16 @@ compatibility_flags = ["nodejs_compat"]
 [observability]
 enabled = true
 
+# Mythos F1: invocation logs record every request URL, and accept/confirm/poll
+# links (`?t=`) and feed paths carry capability secrets in theirs. Prod (this
+# top level) and trial keep console logs and drop invocation logs; the smoke
+# deployments keep them for per-invocation wall/CPU and the webhook-200 check (runbook §P)
+# by restating their own [env.*.observability] below — an env-level block
+# REPLACES this one, it does not merge.
+[observability.logs]
+enabled = true
+invocation_logs = false
+
 # Card G: the bespoke solver engine runs SYNCHRONOUSLY inside the isolate, and
 # its own budgets allow up to 60 s of CPU (pass1 + pass2 + mus at 20 s each) —
 # well past the 30 s Workers default, which would kill the isolate before the
@@ -173,6 +183,9 @@ SOLVER_ENGINE_FANOUT = "true"
 # (SMTP2GO) are trial-only. Pinned "false" here so the posture is explicit,
 # not inferred from absence. PRIVACY_URL/TERMS_URL stay unset outside trial.
 SELF_SERVE_DELETE_ENABLED = "false"
+# Raw provider-token route GET /v1/calendar-access-token (env.ts): off here.
+# Only the smoke deployments turn it on; flag off is a 404 before auth.
+CALENDAR_RAW_TOKEN_ENABLED = "false"
 SYSTEM_MAIL_ENABLED = "false"
 
 # Secrets pushed via bin/bootstrap-secrets.sh:
@@ -321,7 +334,10 @@ MS_PROVIDER_ENABLED = "false"
 # in after registering (portal -> App registrations -> New; see runbook).
 MICROSOFT_OAUTH_CLIENT_ID = "<set after Entra app registration>"
 MICROSOFT_TENANT = "common"
-OPERATOR_EMAIL = "operator@example.com,operator.alt@example.com,tester1@example.com,tester2@example.com"
+# 629 is deliberately NOT here: OPERATOR_EMAIL re-promotes to admin at every
+# sign-in, and bin/identity-smoke.py needs a non-admin B (629 is admitted by
+# MEMBERSHIP_ALLOWLIST below). 495 must stay: the allow-list doesn't list it.
+OPERATOR_EMAIL = "operator@example.com,operator.alt@example.com,tester2@example.com"
 # Multi-user enablement knob (Plan 4). Set a wildcard/allowlist here to authorise
 # a 2nd org user in dev and exercise owner-scoped isolation end-to-end.
 MEMBERSHIP_ALLOWLIST = "*@example.com,operator.alt@example.com,tester1@example.com,tester3@example.com"
@@ -403,6 +419,9 @@ SOLVER_ENGINE_FANOUT_MIN_CHUNKS = "1"
 # (SMTP2GO) are trial-only. Pinned "false" here so the posture is explicit,
 # not inferred from absence. PRIVACY_URL/TERMS_URL stay unset outside trial.
 SELF_SERVE_DELETE_ENABLED = "false"
+# Raw provider-token route GET /v1/calendar-access-token (env.ts): on here
+# for the smoke harnesses (bin/_smoke_lib.py token fetchers). Smoke envs only.
+CALENDAR_RAW_TOKEN_ENABLED = "true"
 SYSTEM_MAIL_ENABLED = "false"
 
 # Three crons: daily cleanup (also keeps the dev Google push channel renewed —
@@ -417,5 +436,11 @@ crons = [
   "0 * * * *",   # Hourly meeting-poll sweep (books/nudges); inert unless MEETING_POLL_ENABLED="true"
   "*/5 * * * *", # Booking-page decline auto-cancel sweep; inert unless BOOKING_PAGE_ENABLED="true"
 ]
+
+# Dev keeps invocation logs (runbook §P per-invocation wall/CPU and the
+# webhook-200 check). Its own block stops it inheriting prod's
+# invocation_logs = false.
+[env.dev.observability]
+enabled = true
 
 

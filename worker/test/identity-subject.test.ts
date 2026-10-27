@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { storeIdentityTokens, resolveSubject, ProviderRebindRefusedError, ACCESS_PREFIX } from "../src/auth/identity-store";
+import { storeIdentityTokens, resolveSubject, ProviderRebindRefusedError, readCachedAccessToken } from "../src/auth/identity-store";
 
 const tokens = { refreshToken: "r", accessToken: "a", expiresIn: 3600, scope: "s" };
 
@@ -212,7 +212,7 @@ describe("storeIdentityTokens with REFUSE_PROVIDER_REBIND", () => {
       .bind(email).first(),
     user: await env.DB.prepare("SELECT role, is_active, last_seen, done_color_id FROM users WHERE subject = ?").bind(email).first(),
     sync: await env.DB.prepare("SELECT next_sync_token, channel_id FROM calendar_sync WHERE owner_subject = ?").bind(email).first(),
-    cached: await env.GOOGLE_TOKEN_CACHE.get(ACCESS_PREFIX + email),
+    cached: await readCachedAccessToken(env, email),
   });
 
   for (const provider of ["google", "microsoft"] as const) {

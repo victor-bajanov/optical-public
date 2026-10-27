@@ -21,6 +21,7 @@ import {
 import { getHomeTz } from "../db/users";
 import { isAllDeclined } from "../booking/decline-cancel";
 import { isActiveMember } from "../auth/membership";
+import { ownerNotificationEmail } from "../db/owner-email";
 import {
   renderBookingDeclineCancelledEmail,
   renderBookingDeclineCancelledOwnerEmail,
@@ -160,7 +161,8 @@ async function sweepOneRow(
   }
 
   const ownerEmail: PollEmail = {
-    to: owner,
+    // The owner's latest verified sign-in address, never the bare subject.
+    to: await ownerNotificationEmail(db, owner),
     ...renderBookingDeclineCancelledOwnerEmail({
       bookerName: row.booker_name,
       startUtc,

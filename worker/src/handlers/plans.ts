@@ -111,9 +111,11 @@ export function mountPlansRoutes(
     // render_snapshot is internal presentation data, subject is owner-internal,
     // window_start/window_end just denormalize body.window, and window_tz is
     // internal week-identity bookkeeping; none are part of PlanResponse —
-    // strip all before serializing.
+    // strip all before serializing. body.warnings carries other people's event
+    // titles ("<summary>: <code>") and is not part of PlanBodySchema either.
     const { render_snapshot: _omit, subject: _owner, window_start: _ws, window_end: _we, window_tz: _wtz, ...rest } = row;
-    return c.json(rest as z.infer<typeof PlanResponse>);
+    const { warnings: _warnings, ...body } = rest.body as Record<string, unknown>;
+    return c.json({ ...rest, body } as z.infer<typeof PlanResponse>);
   });
 
   // ── DELETE /plans/:plan_hash ─────────────────────────────────────────────

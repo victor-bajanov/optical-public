@@ -18,6 +18,7 @@ import {
 } from "../../src/db/polls";
 import { hashToken } from "../../src/auth/tokens";
 import { signCapabilityWithEnv } from "../../src/auth/capability";
+import { identityAnchorTag } from "../../src/auth/identity-rebind";
 import type { AppVariables } from "../../src/index-providers";
 import type { Env } from "../../src/env";
 import type { BusinessHours } from "../../src/planning/solver-contract";
@@ -171,7 +172,7 @@ describe("GET /poll/:id/status auth", () => {
 
 describe("GET /poll/:id/status?t= (capability-token browser entry point)", () => {
   async function mintStatusToken(pollId: string, subject: string, ttlSeconds = 3600) {
-    return signCapabilityWithEnv({ purpose: "poll-status", pollId, subject, ttlSeconds }, TEST_ENV);
+    return signCapabilityWithEnv({ purpose: "poll-status", pollId, subject, ttlSeconds, anchor: await identityAnchorTag(env, subject) }, TEST_ENV);
   }
 
   it("a valid status token renders the same organiser page (real names), no bearer needed", async () => {

@@ -577,6 +577,8 @@ def test_run_live_constructs_d1_via_shared_helper(monkeypatch):
 class _FakeTokenScheduler:
     def request(self, method, path, **kwargs):
         class _R:
+            status_code = 200
+
             def raise_for_status(self):
                 pass
 
@@ -908,6 +910,26 @@ def test_preflight_whoami_turns_a_refresh_rejection_into_a_clean_exit():
     assert msg.startswith("identity C (c@x.example): refresh token rejected")
     assert "mu-smoke-login.py C --provider google" in msg
     assert sched.closed
+
+
+# The current token pair is readable (bin/identity-smoke.py checks that the
+# exact bearer and refresh token B holds just before the rebind are dead
+# after it, and a 401 refresh in preflight may have rotated them away from
+# the env's values).
+def test_scheduler_client_exposes_its_current_tokens():
+    import httpx
+    ident = lib.Identity("https://dev.example", "bear-0", "refr-0", "b@x.example")
+    s = lib.SchedulerClient(ident)
+    assert (s.bearer, s.refresh_token) == ("bear-0", "refr-0")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"access_token": "bear-1", "refresh_token": "refr-1",
+                                         "expires_in": 3600})
+
+    s._client = httpx.Client(transport=httpx.MockTransport(handler))
+    s._do_refresh()
+    assert (s.bearer, s.refresh_token) == ("bear-1", "refr-1")
+    s.close()
 
 
 if __name__ == "__main__":

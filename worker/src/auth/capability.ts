@@ -9,6 +9,9 @@ export interface AcceptCapabilityClaims {
   subject: string;
   exp: number;
   window?: CapabilityWindow;
+  /** identityAnchorTag of the subject at mint time (auth/identity-rebind.ts).
+   *  Absent only on links minted before it existed. */
+  anchor?: string;
   // Absent on this variant, typed for property access without narrowing —
   // pre-existing accept-token call sites read `.pollId`-shaped fields never,
   // but this keeps the union ergonomic for callers that only check one field.
@@ -37,6 +40,8 @@ export interface PollStatusCapabilityClaims {
   pollId: string;
   subject: string;
   exp: number;
+  /** identityAnchorTag of the subject at mint time, as on accept links. */
+  anchor?: string;
   inviteeId?: undefined;
   planHash?: undefined;
   window?: undefined;
@@ -66,11 +71,14 @@ export type CapabilityClaims =
   | ConfirmActionCapabilityClaims;
 
 // Signing inputs mirror the claims union minus `exp` (derived from ttlSeconds).
+type AcceptCapabilityInput =
+  { purpose: "accept"; planHash: string; subject: string; ttlSeconds: number; window?: CapabilityWindow; anchor?: string };
 export type CapabilityInput =
-  | { purpose: "accept"; planHash: string; subject: string; ttlSeconds: number; window?: CapabilityWindow }
+  | AcceptCapabilityInput
   | { purpose: "poll-response"; pollId: string; inviteeId: string; subject: string; ttlSeconds: number }
-  | { purpose: "poll-status"; pollId: string; subject: string; ttlSeconds: number }
+  | PollStatusCapabilityInput
   | { purpose: "confirm-action"; actionId: string; subject: string; ttlSeconds: number };
+type PollStatusCapabilityInput = { purpose: "poll-status"; pollId: string; subject: string; ttlSeconds: number; anchor?: string };
 
 function b64url(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -88,11 +96,14 @@ export async function signCapability(p: CapabilityInput, pepper: string): Promis
   const exp = Math.floor(Date.now() / 1000) + p.ttlSeconds;
   const claims: CapabilityClaims =
     p.purpose === "accept"
-      ? { purpose: "accept", planHash: p.planHash, subject: p.subject, exp, ...(p.window ? { window: p.window } : {}) }
+      ? {
+          purpose: "accept", planHash: p.planHash, subject: p.subject, exp,
+          ...(p.window ? { window: p.window } : {}), ...(p.anchor !== undefined ? { anchor: p.anchor } : {}),
+        }
       : p.purpose === "poll-response"
         ? { purpose: "poll-response", pollId: p.pollId, inviteeId: p.inviteeId, subject: p.subject, exp }
         : p.purpose === "poll-status"
-          ? { purpose: "poll-status", pollId: p.pollId, subject: p.subject, exp }
+          ? { purpose: "poll-status", pollId: p.pollId, subject: p.subject, exp, ...(p.anchor !== undefined ? { anchor: p.anchor } : {}) }
           : { purpose: "confirm-action", actionId: p.actionId, subject: p.subject, exp };
   const payload = b64url(new TextEncoder().encode(JSON.stringify(claims)));
   const sig = await crypto.subtle.sign("HMAC", await hmacKey(pepper), new TextEncoder().encode(payload));
@@ -120,7 +131,14 @@ export async function verifyCapability(token: string, pepper: string): Promise<C
 // monday-resolve.ts). They read the purpose-specific HMAC key (Plan 4 brief E)
 // via capabilityHmacKey(env), which defaults to TOKEN_HASH_PEPPER when HMAC_KEY
 // is unset, so existing in-flight capability tokens stay verifiable.
-export function signCapabilityWithEnv(p: CapabilityInput, env: Env): Promise<string> {
+// Every accept and poll-status link the worker mints carries its subject's
+// identity anchor (identityAnchorTag), so the env-aware signer requires it.
+export type EnvCapabilityInput =
+  | Exclude<CapabilityInput, { purpose: "accept" | "poll-status" }>
+  | (AcceptCapabilityInput & { anchor: string })
+  | (PollStatusCapabilityInput & { anchor: string });
+
+export function signCapabilityWithEnv(p: EnvCapabilityInput, env: Env): Promise<string> {
   return signCapability(p, capabilityHmacKey(env));
 }
 

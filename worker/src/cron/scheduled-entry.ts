@@ -6,9 +6,10 @@ import { runPollSweep } from "./poll-sweep";
 import { runBookingDeclineSweep } from "./booking-decline-sweep";
 import { sweepInactiveUsers } from "../lifecycle/sweep-inactive";
 import { defaultProviders } from "../index-providers";
-import { listSubjects } from "../auth/identity-store";
+import { IdentityCredentialMissingError, listSubjects, logCredentialMissingSkip } from "../auth/identity-store";
 import { writeAudit } from "../db/audit";
 import { isActiveMember } from "../auth/membership";
+import { pruneExpiredPendingActions } from "../db/pending-actions";
 
 interface Handlers {
   monday: (...args: unknown[]) => Promise<unknown>;
@@ -60,7 +61,10 @@ export async function dispatchScheduled(
             await runMondayResolve({ env, calendar: cal, notification: notify, accountEmail: subject });
             await writeAudit(env.DB, { subject, action: "monday_resolve", source: "cron" });
           } catch (e) {
-            console.error("monday-resolve failed", { subject, error: String(e) });
+            // An admin rebind wiped the credential: the account is idle until
+            // its next sign-in, which is not a failure.
+            if (e instanceof IdentityCredentialMissingError) logCredentialMissingSkip("monday_resolve");
+            else console.error("monday-resolve failed", { subject, error: String(e) });
           }
         }
       })(),
@@ -93,6 +97,14 @@ export async function dispatchScheduled(
       sweepInactiveUsers(env, new Date()).catch((e: unknown) =>
         console.error("inactive-user sweep failed", e),
       ),
+    );
+    // Expired agent-confirm actions: blank payload/summary at expiry, delete a
+    // week later. Deferral also runs this, but an idle deployment never
+    // defers. Not membership-gated, like the retention sweep above.
+    ctx.waitUntil(
+      pruneExpiredPendingActions(env.DB, new Date())
+        .then((r) => console.info("pending_actions_pruned", r))
+        .catch((e: unknown) => console.error("pending-actions sweep failed", e)),
     );
     return;
   }

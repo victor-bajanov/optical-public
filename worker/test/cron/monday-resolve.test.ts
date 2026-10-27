@@ -37,6 +37,41 @@ describe("runMondayResolve", () => {
     vi.useRealTimers();
   });
 
+  // Owner mail goes to the latest verified sign-in address (login_email,
+  // migration 0046), never the bare subject, which an IdP rename can hand to
+  // someone else. NULL login_email falls back to the subject.
+  for (const [label, loginEmail, expected] of [
+    ["login_email set", "owner-now@example.com", "owner-now@example.com"],
+    ["login_email NULL", null, "primary"],
+  ] as const) {
+    it(`addresses the replan email via ownerNotificationEmail (${label})`, async () => {
+      await env.DB.prepare("DELETE FROM identity_tokens").run();
+      await env.DB.prepare(
+        "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+      ).bind("primary", new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-p", loginEmail).run();
+      const cal = new MockCalendarProvider();
+      const notify = new MockNotificationProvider();
+      const solver = { fetch: async () => new Response(JSON.stringify({ schedule: [{ task_id: "t1", chunk_id: "t1#0", start: "2026-05-19T09:00:00", duration_minutes: 90, context: "deep" }], dropped: [], objective: { total: 0, components: { lateness: 0, fit: 0, churn: 0, daily_cap: 0, streak_cap: 0, drop: 0 } }, diagnostics: { pass1_wall_seconds: 0, pass2_wall_seconds: 0, status: "OPTIMAL" } }), { status: 200, headers: { "content-type": "application/json" } }) } as unknown as Fetcher;
+      try {
+        const result = await runMondayResolve({
+          env: { ...env, SOLVER: solver, OAUTH_ISSUER: "https://scheduler.example.com" },
+          calendar: cal,
+          notification: notify,
+          accountEmail: "primary",
+          now: new Date("2026-05-17T15:00:00Z"),
+        });
+        expect(result.kind).toBe("ok");
+        expect(notify.sent).toHaveLength(1);
+        expect(notify.sent[0]!.to).toBe(expected);
+        // The plan is still keyed on the subject.
+        const row = await getLatestProposedPlanForSubject(env.DB, "primary", new Date("2026-05-17T15:00:00Z"));
+        expect(row).not.toBeNull();
+      } finally {
+        await env.DB.prepare("DELETE FROM identity_tokens").run();
+      }
+    });
+  }
+
   it("resolves and emails the diff", async () => {
     const cal = new MockCalendarProvider();
     const notify = new MockNotificationProvider();

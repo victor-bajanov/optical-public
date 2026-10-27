@@ -28,6 +28,11 @@ const SUBJECT = "organiser@example.com";
 
 async function seedSubject(subject: string = SUBJECT): Promise<void> {
   await upsertUser(env.DB, subject);
+  // The sweep skips an organiser holding no stored credential (card C8); the
+  // providers here are injected, so any non-empty blob stands in for one.
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at) VALUES (?, X'01', 's', '2026-01-01T00:00:00Z')",
+  ).bind(subject).run();
 }
 
 async function seedPoll(overrides: Partial<CreatePollInput> = {}) {
@@ -170,6 +175,32 @@ describe("runPollSweep", () => {
 
     const reloaded = await getPoll(env.DB, poll.id);
     expect(reloaded?.nudgedFinalAt).toBe(now.toISOString());
+  });
+
+  it("names the organiser in the cron nudge by login_email, never the subject (identity port of #105)", async () => {
+    const LOGIN = "organiser-now@example.org";
+    await seedSubject();
+    await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(SUBJECT).run();
+    await env.DB.prepare(
+      "INSERT INTO identity_tokens (account_email, refresh_token_encrypted, scopes, updated_at, provider, provider_subject, login_email) VALUES (?,?,?,?,?,?,?)",
+    ).bind(SUBJECT, new Uint8Array([1]).buffer, "s", "2026-01-01T00:00:00Z", "google", "sub-org", LOGIN).run();
+    try {
+      const poll = await seedPoll({ deadlineUtc: "2026-08-20T00:00:00Z" });
+      await seedInvitee(poll.id, "a@example.com");
+      const mock = new MockNotificationProvider();
+      const result = await runPollSweep(env, new Date("2026-08-19T06:00:00Z"), {
+        bookAtDeadline: vi.fn<BookAtDeadline>(async () => {}),
+        makeNotification: makeConstantNotification(mock),
+      });
+      expect(result.nudgedFinal).toBe(1);
+      expect(mock.sentPollEmails).toHaveLength(1);
+      const email = mock.sentPollEmails[0]!;
+      expect(email.text).toContain(LOGIN);
+      expect(email.text).not.toContain(SUBJECT);
+      expect(email.html).not.toContain(SUBJECT);
+    } finally {
+      await env.DB.prepare("DELETE FROM identity_tokens WHERE account_email = ?").bind(SUBJECT).run();
+    }
   });
 
   it("is idempotent across two consecutive sweeps: the final nudge fires only once", async () => {

@@ -11,6 +11,7 @@ import { loadTitleMap } from "../diff/load-titles";
 import { attachRenderSnapshot, deleteProposedPlan, getCommittedDroppedForWeek, getCommittedPlansForSubject, updateCommittedPlanBodyStmt } from "../planning/proposed-plans";
 import { computeMovedPlanPatch, reconcileMovedTask, type PatchablePlanBody } from "../planning/manual-move-writeback";
 import { signCapabilityWithEnv } from "../auth/capability";
+import { identityAnchorTag } from "../auth/identity-rebind";
 import { ACCEPT_TTL_SECONDS } from "../planning/accept-ttl";
 import { localWeekWindow } from "../planning/datetime";
 import { getDoneColorId, getHomeTz } from "../db/users";
@@ -24,6 +25,7 @@ import { SCHEDULER_CHUNK_ID_KEY } from "../providers/types";
 import type { Change, CalendarEvent } from "../providers/types";
 import { D } from "../schema/descriptions";
 import { sendPlanAcceptEmailOnce } from "../confirm/plan-mail";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 type AppVars = { calendarProvider: CalendarProvider; notificationProvider: NotificationProvider };
 
@@ -471,7 +473,10 @@ async function resolveWeek(args: {
   const titles = await loadTitleMap(env.DB, accountEmail, ids);
 
   const cap = await signCapabilityWithEnv(
-    { planHash: result.planHash, subject: accountEmail, purpose: "accept", ttlSeconds: ACCEPT_TTL_SECONDS, window: result.body.window },
+    {
+      planHash: result.planHash, subject: accountEmail, purpose: "accept", ttlSeconds: ACCEPT_TTL_SECONDS, window: result.body.window,
+      anchor: await identityAnchorTag(env, accountEmail),
+    },
     env,
   );
   const acceptUrl = `${oauthIssuer}/v1/plans/${result.planHash}/accept?t=${encodeURIComponent(cap)}`;
@@ -493,7 +498,10 @@ async function resolveWeek(args: {
 
   if (dryRun) return { kind: "replanned", planHash: result.planHash, sent: false, model };
   if (!dedupeMail) {
-    await notify.sendReplanNotification(accountEmail, model, { acceptUrl, planHash: result.planHash });
+    // Owner mail goes to the latest verified sign-in address, never the bare
+    // subject (db/owner-email.ts); the deduped path resolves it the same way.
+    const to = await ownerNotificationEmail(env.DB, accountEmail);
+    await notify.sendReplanNotification(to, model, { acceptUrl, planHash: result.planHash });
     return { kind: "replanned", planHash: result.planHash, sent: true, model };
   }
   const mailed = await sendPlanAcceptEmailOnce(env, {
@@ -501,7 +509,7 @@ async function resolveWeek(args: {
     planHash: result.planHash,
     expiresAt: new Date(Date.now() + ACCEPT_TTL_SECONDS * 1000).toISOString(),
     logOp: "replanNow",
-    viaProvider: () => notify.sendReplanNotification(accountEmail, model, { acceptUrl, planHash: result.planHash }),
+    viaProvider: (to) => notify.sendReplanNotification(to, model, { acceptUrl, planHash: result.planHash }),
     // Static copy and the link only: no titles through the third-party
     // system mailer; the page behind the link shows them.
     viaSystem: {

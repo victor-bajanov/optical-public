@@ -433,6 +433,17 @@ class SchedulerClient:
     def scheduler_url(self) -> str:
         return self._id.scheduler_url
 
+    @property
+    def bearer(self) -> str:
+        """The bearer in use now (a refresh may have rotated it away from the
+        Identity's). Never print it."""
+        return self._bearer
+
+    @property
+    def refresh_token(self) -> str:
+        """The refresh token in use now. Never print it."""
+        return self._refresh
+
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         h = {
             "Authorization": f"Bearer {self._bearer}",
@@ -544,6 +555,35 @@ def post_commit(sched: SchedulerClient, plan_hash: str) -> tuple[int, dict]:
         return r.status_code, {"_raw": r.text[:200] if r.text else "<empty>"}
 
 
+class RawTokenRouteDisabled(SystemExit):
+    """GET /v1/calendar-access-token answered 404: the target deployment has
+    CALENDAR_RAW_TOKEN_ENABLED off, so the route doesn't exist there (worker
+    answers 404 not_found before auth). Every provider client in this module
+    needs that token, so no level can run: a SystemExit subclass ends the run
+    with the message (no traceback) and isn't swallowed by a level's
+    `except Exception`."""
+
+
+RAW_TOKEN_PATH = "/v1/calendar-access-token"
+
+
+def fetch_raw_provider_token(scheduler: "SchedulerClient") -> str:
+    """The caller's raw provider access token from the scheduler. A 404 means
+    the route is switched off on that deployment (RawTokenRouteDisabled);
+    any other error status raises httpx.HTTPStatusError as before."""
+    r = scheduler.request("GET", RAW_TOKEN_PATH)
+    if r.status_code == 404:
+        raise RawTokenRouteDisabled(
+            f"GET {RAW_TOKEN_PATH} answered 404: CALENDAR_RAW_TOKEN_ENABLED is not "
+            f'"true" on this deployment, so the smoke harness cannot read or write the '
+            f"calendar. Only the smoke deployments set it (worker/wrangler.toml); "
+            f"check you are targeting a smoke env and that it was deployed with "
+            f"the flag set."
+        )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
 class TokenAuthedClient:
     """Base for HTTP clients that authenticate via a bearer token minted from
     the scheduler's /v1/calendar-access-token route (proactive cache, retried
@@ -557,9 +597,7 @@ class TokenAuthedClient:
     def _get_token(self, force_refresh: bool = False) -> str:
         if self._token and not force_refresh:
             return self._token
-        r = self._scheduler.request("GET", "/v1/calendar-access-token")
-        r.raise_for_status()
-        self._token = r.json()["access_token"]
+        self._token = fetch_raw_provider_token(self._scheduler)
         return self._token
 
     def _authed(self, method: str, url: str, **kwargs) -> httpx.Response:
@@ -1564,9 +1602,7 @@ class GmailClient:
     def _get_token(self, force_refresh: bool = False) -> str:
         if self._token and not force_refresh:
             return self._token
-        r = self._scheduler.request("GET", "/v1/calendar-access-token")
-        r.raise_for_status()
-        self._token = r.json()["access_token"]
+        self._token = fetch_raw_provider_token(self._scheduler)
         return self._token
 
     def _authed(self, method: str, url: str, **kwargs) -> httpx.Response:

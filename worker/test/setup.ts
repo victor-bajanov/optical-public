@@ -45,6 +45,7 @@ import pendingActionsSql from "../migrations/0042_pending_actions.sql?raw";
 import usersDeactivatedAtSql from "../migrations/0043_users_deactivated_at.sql?raw";
 import outboundMailCountsSql from "../migrations/0044_outbound_mail_counts.sql?raw";
 import pendingActionsMailChannelSql from "../migrations/0045_pending_actions_mail_channel.sql?raw";
+import identityLoginEmailSql from "../migrations/0046_identity_login_email.sql?raw";
 import { OCCURRENCE_UNIQUE_INDEX_DDL } from "../src/recurrence/occurrence-index";
 import { __setSignInSubscriberForTests } from "../src/webhooks/sign-in-subscribe";
 
@@ -103,5 +104,6 @@ beforeAll(async () => {
     { name: "0043_users_deactivated_at.sql", queries: [usersDeactivatedAtSql] },
     { name: "0044_outbound_mail_counts.sql", queries: [outboundMailCountsSql] },
     { name: "0045_pending_actions_mail_channel.sql", queries: [pendingActionsMailChannelSql] },
+    { name: "0046_identity_login_email.sql", queries: [identityLoginEmailSql] },
   ]);
 });

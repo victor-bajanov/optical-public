@@ -23,7 +23,9 @@ export function upstreamRevokeEnabled(env: Pick<Env, "UPSTREAM_REVOKE_ENABLED">)
  *   `<logPrefix>_skipped`. Any other error from the token source, IdP
  *   construction or the revoke logs `<logPrefix>_failed`.
  * - The token never reaches a log line. Errors are redacted in case an IdP
- *   (or a double) echoes it back.
+ *   (or a double) echoes it back, and so is each `redact` string (matched
+ *   case-insensitively), for a caller whose log lines must not name the
+ *   subject either.
  *
  * `token` and `idp` may be plain values or lazy factories. Factories let a
  * caller defer the decrypt and the provider lookup until the flag says the
@@ -36,6 +38,7 @@ export async function revokeUpstreamGrant(
     idp: RevokeCapable | (() => RevokeCapable | Promise<RevokeCapable>);
     logPrefix: string;
     context?: Record<string, unknown>;
+    redact?: string[];
   },
 ): Promise<RevokeOutcome> {
   if (!upstreamRevokeEnabled(env)) return "disabled";
@@ -51,7 +54,10 @@ export async function revokeUpstreamGrant(
       console.warn(`${args.logPrefix}_skipped`, { ...args.context, reason: "provider_disabled" });
       return "provider_disabled";
     }
-    const error = token ? String(e).split(token).join("[redacted]") : String(e);
+    let error = token ? String(e).split(token).join("[redacted]") : String(e);
+    for (const r of args.redact ?? []) {
+      if (r) error = error.replace(new RegExp(r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]");
+    }
     console.warn(`${args.logPrefix}_failed`, { ...args.context, error });
     return "failed";
   }

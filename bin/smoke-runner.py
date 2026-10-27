@@ -2052,16 +2052,36 @@ class SmokeRunnerApp(App):
                 badge.remove_class(cls)
         badge.add_class(self._provider_class())
 
+    def _persist_cfg(self, update: Callable[["_smoke_identity.RunnerConfig"],
+                                            "_smoke_identity.RunnerConfig"]) -> bool:
+        """Apply `update` to a fresh read of config.toml, save it, then adopt
+        the result in memory. `t` and `P` persist like the settings modal
+        does: an in-memory-only change was undone by the next rescan (`e`, or
+        every app-focus event), which reloads config.toml. Re-reading first
+        matters on a terminal without focus events, where the in-memory cfg
+        can predate a hand edit made in another pane; saving it whole would
+        silently drop that edit. Comments in the file are still lost, since
+        save_config rewrites the schema (the settings modal does the same). A
+        load or save error leaves both copies unchanged."""
+        try:
+            new_cfg = update(_smoke_identity.load_config(self.core.config_path))
+            _smoke_identity.save_config(new_cfg, self.core.config_path)
+        except (OSError, ValueError) as e:
+            self.notify(f"settings not saved: {e}", severity="error")
+            return False
+        self.core.cfg = new_cfg
+        return True
+
     def action_change_provider(self) -> None:
-        """Toggle the campaign provider (google <-> microsoft). In-memory
-        only, like action_change_target — `s` settings persists. Drawer
-        selections whose mode names the OTHER provider are dropped so the
-        row falls back to _default_mode_for under the new campaign; a
-        selection whose mode already matches (or is provider-agnostic)
-        keeps its levels."""
+        """Toggle the campaign provider (google <-> microsoft) and persist it
+        to config.toml, like action_change_target. Drawer selections whose
+        mode names the OTHER provider are dropped so the row falls back to
+        _default_mode_for under the new campaign; a selection whose mode
+        already matches (or is provider-agnostic) keeps its levels."""
         cfg = self.core.cfg
         new_provider = "microsoft" if cfg.provider == "google" else "google"
-        self.core.cfg = dataclasses.replace(cfg, provider=new_provider)
+        if not self._persist_cfg(lambda c: dataclasses.replace(c, provider=new_provider)):
+            return
         for name in list(self._harness_selection):
             harness = _smoke_registry.HARNESSES.get(name)
             if harness is None:
@@ -2118,11 +2138,13 @@ class SmokeRunnerApp(App):
                 pass
 
     def action_change_target(self) -> None:
-        """Cycle to the next target in TARGETS order (a no-op with one)."""
+        """Cycle to the next target in TARGETS order (a no-op with one) and
+        persist it to config.toml (see _persist_cfg)."""
         names = list(_smoke_registry.TARGETS)
         current = names.index(self.core.cfg.target) if self.core.cfg.target in names else -1
         new_target = names[(current + 1) % len(names)]
-        self.core.cfg = dataclasses.replace(self.core.cfg, target=new_target)
+        if not self._persist_cfg(lambda c: dataclasses.replace(c, target=new_target)):
+            return
         self._refresh_target_badge()
         self._refresh_op_secrets_badge()
         self._refresh_harness_options()
@@ -2188,5 +2210,42 @@ class SmokeRunnerApp(App):
         self.push_screen(ResetEnvModal(self.core.cfg), _on_result)
 
 
+# Pops the whole kitty keyboard-protocol stack. Textual pushes the protocol
+# (ESC[>25u) on start and pops one level (ESC[<u) on stop, but some terminals
+# (Orca) and abrupt exits leave it pushed, so the shell afterwards prints
+# keys as `27u`-style codes. Popping a deep count is harmless when the stack
+# is already empty.
+_KITTY_KEYBOARD_POP_ALL = "\x1b[<99u"
+
+
+def reset_kitty_keyboard(*, opener: Callable[[str], object] | None = None,
+                         stdout: object | None = None) -> None:
+    """Write _KITTY_KEYBOARD_POP_ALL to the controlling terminal (/dev/tty),
+    falling back to stdout only when it is a tty. Never raises."""
+    opener = opener if opener is not None else (lambda path: open(path, "w"))
+    stdout = stdout if stdout is not None else sys.stdout
+    try:
+        with opener("/dev/tty") as tty:
+            tty.write(_KITTY_KEYBOARD_POP_ALL)
+            tty.flush()
+        return
+    except OSError:
+        pass
+    try:
+        if stdout.isatty():
+            stdout.write(_KITTY_KEYBOARD_POP_ALL)
+            stdout.flush()
+    except Exception:  # sys.stdout may be None; this runs in a finally
+        pass
+
+
+def run_with_terminal_reset(run: Callable[[], object],
+                            reset: Callable[[], None] = reset_kitty_keyboard) -> None:
+    try:
+        run()
+    finally:
+        reset()
+
+
 if __name__ == "__main__":
-    SmokeRunnerApp(RunnerCore()).run()
+    run_with_terminal_reset(SmokeRunnerApp(RunnerCore()).run)

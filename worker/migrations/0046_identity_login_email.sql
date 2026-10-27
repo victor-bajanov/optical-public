@@ -1,0 +1,12 @@
+-- 0046_identity_login_email.sql — decision 3 of the identity port of #105.
+--
+-- The verified email from the subject's most recent successful sign-in,
+-- written only by storeIdentityTokens from /auth/callback (both providers);
+-- NULL for every row that hasn't signed in since 0046. The subject
+-- (account_email) is the address the account was first created under and is
+-- kept for life (0037 anchors identity on provider_subject), so after an
+-- IdP-side rename it can belong to someone else. Owner-addressed mail goes to
+-- this column instead, via ownerNotificationEmail (worker/src/db/owner-email.ts),
+-- which falls back to the subject when it is NULL or empty. The subject stays
+-- the key everywhere else (pending_actions, audit, outbound cap, membership).
+ALTER TABLE identity_tokens ADD COLUMN login_email TEXT;

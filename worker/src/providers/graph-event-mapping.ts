@@ -14,12 +14,22 @@ export function graphPropId(name: string): string {
   return `String {${SCHEDULER_PROPERTY_GUID}} Name ${name}`;
 }
 
+/** Graph `$select` for an event read: exactly the top-level properties
+ *  toCalendarEventFromGraph and isBusyGraphEvent read (OAuth data
+ *  minimisation: no body, bodyPreview or location). `$expand`ed
+ *  singleValueExtendedProperties come back in addition to these. Add a
+ *  property here in the same change as any code that reads it: Graph strips
+ *  everything unselected, silently. Not usable on calendarView/delta, which
+ *  documents `$select` as unsupported. */
+export const GRAPH_EVENT_SELECT =
+  "id,subject,start,end,showAs,isCancelled,isAllDay,isOrganizer,organizer,attendees,categories";
+
+/** The read-side shape: GRAPH_EVENT_SELECT plus the expanded properties and
+ *  the delta tombstone. A delta read still receives body/location (it can't
+ *  $select); they're dropped here, never mapped. */
 export interface GraphEvent {
   id: string;
   subject?: string;
-  body?: { contentType?: string; content?: string };
-  bodyPreview?: string;
-  location?: { displayName?: string };
   start?: { dateTime?: string; timeZone?: string };
   end?: { dateTime?: string; timeZone?: string };
   showAs?: string;
@@ -78,8 +88,6 @@ export function toCalendarEventFromGraph(g: GraphEvent): CalendarEvent {
     summary: g.subject ?? "",
     start: g.start?.dateTime ? isoZ(g.start.dateTime) : "",
     end: g.end?.dateTime ? isoZ(g.end.dateTime) : "",
-    location: g.location?.displayName,
-    description: g.body?.content ?? g.bodyPreview,
     colorId: hasDoneCategory ? OPTICAL_DONE_CATEGORY : undefined,
     status: g.isCancelled ? "cancelled" : g.showAs === "tentative" ? "tentative" : "confirmed",
     // showAs "oof" is deliberately NOT mapped to eventType:"outOfOffice":

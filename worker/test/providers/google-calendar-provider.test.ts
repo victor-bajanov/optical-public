@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { GoogleCalendarProvider } from "../../src/providers/google-calendar-provider";
+import {
+  GoogleCalendarProvider,
+  GOOGLE_EVENT_ITEM_FIELDS,
+} from "../../src/providers/google-calendar-provider";
 
 function mockFetch(handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -858,5 +861,209 @@ describe("GoogleCalendarProvider.getEvent", () => {
       fetch: fetchFn as unknown as typeof fetch,
     });
     await expect(p.getEvent("evt-err")).rejects.toThrow();
+  });
+});
+
+// Partial response (OAuth verification, data minimisation): every events read
+// asks Google for only the fields the read mapper consumes. `fields` uses
+// Google's partial-response syntax, so the tests below project fixtures through
+// a small parser of that syntax, the way Google does, and check the mapped
+// result is unchanged — i.e. the field list is sufficient.
+type FieldTree = Map<string, FieldTree | null>;
+
+/** Parse "a,b(c,d(e)),f" into a tree; a leaf (null) keeps the whole value. */
+function parseFields(spec: string): FieldTree {
+  let i = 0;
+  const parseList = (): FieldTree => {
+    const out: FieldTree = new Map();
+    while (i < spec.length && spec[i] !== ")") {
+      let name = "";
+      while (i < spec.length && !",()".includes(spec[i]!)) name += spec[i++];
+      let sub: FieldTree | null = null;
+      if (spec[i] === "(") {
+        i++;
+        sub = parseList();
+        if (spec[i] !== ")") throw new Error(`unbalanced fields: ${spec}`);
+        i++;
+      }
+      if (!name) throw new Error(`empty field name in: ${spec}`);
+      out.set(name, sub);
+      if (spec[i] === ",") i++;
+    }
+    return out;
+  };
+  const tree = parseList();
+  if (i !== spec.length) throw new Error(`trailing input in fields: ${spec}`);
+  return tree;
+}
+
+function project(value: unknown, tree: FieldTree | null): unknown {
+  if (tree === null || value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((v) => project(v, tree));
+  const out: Record<string, unknown> = {};
+  for (const [k, sub] of tree) {
+    if (k in (value as Record<string, unknown>)) out[k] = project((value as Record<string, unknown>)[k], sub);
+  }
+  return out;
+}
+
+/** Every field Google can send on an event that the mappers might be tempted
+ *  to read, plus fields that must never reach us (description/location). */
+const FULL_GOOGLE_EVENT = {
+  kind: "calendar#event",
+  etag: '"3181"',
+  id: "full-1",
+  status: "confirmed",
+  htmlLink: "https://www.google.com/calendar/event?eid=x",
+  created: "2026-05-01T00:00:00Z",
+  updated: "2026-05-02T00:00:00Z",
+  summary: "Quarterly review",
+  description: "Secret agenda: layoffs",
+  location: "Board room 4",
+  colorId: "5",
+  creator: { email: "boss@example.com" },
+  organizer: { email: "me@example.com", self: true, displayName: "Me" },
+  start: { dateTime: "2026-05-19T09:00:00Z", timeZone: "UTC" },
+  end: { dateTime: "2026-05-19T10:00:00Z", timeZone: "UTC" },
+  transparency: "opaque",
+  visibility: "default",
+  iCalUID: "full-1@google.com",
+  sequence: 2,
+  eventType: "default",
+  guestsCanModify: false,
+  hangoutLink: "https://meet.google.com/abc",
+  conferenceData: { entryPoints: [{ uri: "https://meet.google.com/abc" }] },
+  attendees: [
+    { email: "me@example.com", responseStatus: "accepted", self: true, organizer: true, displayName: "Me" },
+    { email: "a@example.com", responseStatus: "tentative", optional: true, comment: "maybe" },
+    { email: "room@resource.calendar.google.com", responseStatus: "accepted", resource: true },
+    { displayName: "no email" },
+  ],
+  extendedProperties: {
+    private: { scheduler_chunk_id: "chunk-1", optical_deployment: "https://x.example" },
+    shared: { s: "1" },
+  },
+  reminders: { useDefault: true },
+};
+
+const ALL_DAY_GOOGLE_EVENT = {
+  id: "full-2",
+  status: "confirmed",
+  summary: "OOO",
+  description: "beach",
+  eventType: "outOfOffice",
+  start: { date: "2026-05-20" },
+  end: { date: "2026-05-21" },
+};
+
+const FREE_GOOGLE_EVENT = {
+  id: "free-1",
+  status: "confirmed",
+  summary: "free",
+  transparency: "transparent",
+  start: { dateTime: "2026-05-19T11:00:00Z" },
+  end: { dateTime: "2026-05-19T12:00:00Z" },
+};
+
+const CANCELLED_GOOGLE_EVENT = { id: "gone-1", status: "cancelled", summary: "x", description: "y" };
+
+/** A Google fake that answers every events read with `body`, projected through
+ *  the request's `fields` parameter when `honourFields` is set. */
+function googleFake(body: Record<string, unknown>, honourFields: boolean) {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const fields = url.searchParams.get("fields");
+    const out = honourFields && fields ? project(body, parseFields(fields)) : body;
+    return new Response(JSON.stringify(out), { status: 200 });
+  });
+}
+
+const googleProvider = (fetchFn: unknown) =>
+  new GoogleCalendarProvider({
+    calendarId: "primary",
+    getAccessToken: async () => "t",
+    fetch: fetchFn as typeof fetch,
+    deploymentId: "https://x.example",
+  });
+
+describe("GoogleCalendarProvider partial response (fields=)", () => {
+  const listBody = {
+    kind: "calendar#events",
+    summary: "me@example.com",
+    timeZone: "UTC",
+    items: [FULL_GOOGLE_EVENT, ALL_DAY_GOOGLE_EVENT, FREE_GOOGLE_EVENT, CANCELLED_GOOGLE_EVENT],
+    nextSyncToken: "tok-next",
+  };
+
+  it("exports the item field list and it parses as Google partial-response syntax", () => {
+    const tree = parseFields(GOOGLE_EVENT_ITEM_FIELDS);
+    expect([...tree.keys()].sort()).toEqual(
+      [
+        "id", "status", "summary", "start", "end", "colorId", "transparency", "eventType",
+        "organizer", "guestsCanModify", "attendees", "extendedProperties",
+      ].sort(),
+    );
+    expect([...tree.get("organizer")!.keys()].sort()).toEqual(["email", "self"]);
+    expect([...tree.get("attendees")!.keys()].sort()).toEqual(
+      ["email", "optional", "resource", "responseStatus", "self"],
+    );
+    // A leaf: the whole extendedProperties object (private + shared) comes back.
+    expect(tree.get("extendedProperties")).toBeNull();
+    expect(tree.has("description")).toBe(false);
+    expect(tree.has("location")).toBe(false);
+  });
+
+  it("window list and incremental list carry fields with the page and sync tokens", async () => {
+    const fetchFn = googleFake(listBody, false);
+    const p = googleProvider(fetchFn);
+    await p.fetchEventsInWindow("2026-05-18T00:00:00Z", "2026-05-25T00:00:00Z");
+    await p.fetchIncrementalChanges("tok-1");
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    for (const call of fetchFn.mock.calls) {
+      const fields = new URL(call[0] as string).searchParams.get("fields");
+      expect(fields).toBe(`nextPageToken,nextSyncToken,items(${GOOGLE_EVENT_ITEM_FIELDS})`);
+      const tree = parseFields(fields!);
+      expect(tree.has("nextPageToken")).toBe(true);
+      expect(tree.has("nextSyncToken")).toBe(true);
+    }
+  });
+
+  it("events.get carries the item field list without the items() wrapper", async () => {
+    const fetchFn = googleFake(FULL_GOOGLE_EVENT, false);
+    await googleProvider(fetchFn).getEvent("full-1");
+    expect(new URL(fetchFn.mock.calls[0]![0] as string).searchParams.get("fields")).toBe(
+      GOOGLE_EVENT_ITEM_FIELDS,
+    );
+  });
+
+  it("maps an event carrying description/location to one with neither key", async () => {
+    const ev = await googleProvider(googleFake(FULL_GOOGLE_EVENT, false)).getEvent("full-1");
+    expect(ev).not.toBeNull();
+    expect(Object.keys(ev!)).not.toContain("description");
+    expect(Object.keys(ev!)).not.toContain("location");
+  });
+
+  it("sufficiency: window list maps identically from the full and the projected response", async () => {
+    const full = await googleProvider(googleFake(listBody, false))
+      .fetchEventsInWindow("2026-05-18T00:00:00Z", "2026-05-25T00:00:00Z");
+    const projected = await googleProvider(googleFake(listBody, true))
+      .fetchEventsInWindow("2026-05-18T00:00:00Z", "2026-05-25T00:00:00Z");
+    expect(full.events.map((e) => e.id)).toEqual(["full-1", "full-2", "gone-1"]);
+    expect(projected).toEqual(full);
+  });
+
+  it("sufficiency: incremental list maps identically from the full and the projected response", async () => {
+    const full = await googleProvider(googleFake(listBody, false)).fetchIncrementalChanges("tok-1");
+    const projected = await googleProvider(googleFake(listBody, true)).fetchIncrementalChanges("tok-1");
+    expect(full.changes.map((c) => c.kind)).toEqual(["upsert", "upsert", "delete"]);
+    expect(projected).toEqual(full);
+  });
+
+  it("sufficiency: events.get maps identically from the full and the projected response", async () => {
+    for (const ev of [FULL_GOOGLE_EVENT, ALL_DAY_GOOGLE_EVENT, CANCELLED_GOOGLE_EVENT]) {
+      const full = await googleProvider(googleFake(ev, false)).getEvent(ev.id);
+      const projected = await googleProvider(googleFake(ev, true)).getEvent(ev.id);
+      expect(projected).toEqual(full);
+    }
   });
 });

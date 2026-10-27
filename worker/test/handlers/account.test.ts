@@ -510,3 +510,67 @@ describe("DELETE /v1/account — agent-confirm clients (decision B)", () => {
     await expectIntact(A);
   });
 });
+
+// Lifecycle mail goes to the latest verified sign-in address (login_email,
+// migration 0046), never the bare subject, which an IdP rename can hand to
+// someone else; NULL falls back to the subject. offboardUser deletes the
+// identity_tokens row, so the address is resolved before it runs.
+describe("DELETE /v1/account — deletion mail recipient (ownerNotificationEmail)", () => {
+  const ISSUER = "https://scheduler.example.com";
+  const GATED = { ...FLAG_ON, ...MAIL_ON, AGENT_CONFIRM_CLIENT_IDS: "c", OAUTH_ISSUER: ISSUER };
+
+  async function seedWithIdentity(loginEmail: string | null) {
+    const headers = await seedUser(A);
+    await storeIdentityTokens(env, A, { refreshToken: "1//r", accessToken: "at", expiresIn: 3600, scope: "s" }, "google", "psub-alice");
+    await env.DB.prepare("UPDATE identity_tokens SET login_email = ? WHERE account_email = ?").bind(loginEmail, A).run();
+    return headers;
+  }
+
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM pending_actions").run();
+  });
+
+  for (const [label, loginEmail, expected] of [
+    ["login_email set", "owner-now@example.com", "owner-now@example.com"],
+    ["login_email NULL", null, A],
+  ] as const) {
+    it(`direct deletion mails ${expected} (${label})`, async () => {
+      const { sends } = spyFetch();
+      const headers = await seedWithIdentity(loginEmail);
+      const res = await del(headers, { confirm: A }, { ...FLAG_ON, ...MAIL_ON });
+      expect(res.status).toBe(200);
+      expect(await count("identity_tokens", "account_email", A)).toBe(0);
+      expect(sends.map((s) => s.to)).toEqual([[expected]]);
+      expect(sends[0]!.subject).toBe("Your Optical account has been deleted");
+    });
+
+    it(`confirmed replay: the confirm link and the deletion mail both go to ${expected} (${label})`, async () => {
+      const { sends } = spyFetch();
+      const notify = new MockNotificationProvider();
+      const root = new Hono<{ Bindings: typeof env; Variables: AppVariables }>();
+      root.use("*", async (c, next) => {
+        c.set("notificationProvider", notify);
+        await next();
+      });
+      mountConfirmRoutes(root);
+      root.route("/v1", app);
+      const headers = await seedWithIdentity(loginEmail);
+      const res = await root.request(
+        "/v1/account",
+        { method: "DELETE", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ confirm: A }) },
+        { ...env, ...GATED },
+      );
+      expect(res.status).toBe(202);
+      expect(notify.sentPollEmails.map((m) => m.to)).toEqual([expected]);
+      const m = /https:\/\/scheduler\.example\.com\/confirm\/([0-9a-f-]+)\?t=([^\s"<]+)/.exec(notify.sentPollEmails[0]!.text)!;
+      const done = await root.request(
+        `/confirm/${m[1]}`,
+        { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: `t=${m[2]}` },
+        { ...env, ...GATED },
+      );
+      expect(done.status).toBe(200);
+      expect(await count("identity_tokens", "account_email", A)).toBe(0);
+      expect(sends.map((s) => s.to)).toEqual([[expected]]);
+    });
+  }
+});

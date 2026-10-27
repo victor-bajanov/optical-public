@@ -160,16 +160,16 @@ def test_dev_target_matches_smoke_lib_constants():
 
 
 # =============================================================================
-# HARNESSES — sanity: all eleven present, with the audited exit/parser/target
+# HARNESSES — sanity: all twelve present, with the audited exit/parser/target
 # facts from the implementation plan.
 # =============================================================================
 
 
-def test_all_eleven_harnesses_registered():
+def test_all_twelve_harnesses_registered():
     assert set(reg.HARNESSES) == {
         "regression-smoke", "reset-smoke-env", "multiuser-smoke", "meeting-smoke",
         "booking-smoke", "config-smoke", "engine-smoke", "feed-smoke",
-        "poll-smoke", "ms-smoke", "timezone-smoke",
+        "poll-smoke", "ms-smoke", "timezone-smoke", "identity-smoke",
     }
 
 
@@ -185,6 +185,7 @@ def test_all_eleven_harnesses_registered():
     ("poll-smoke", "pass012", "dash", False),
     ("ms-smoke", "pass012", "colon", False),
     ("timezone-smoke", "pass01", "dash", False),
+    ("identity-smoke", "pass01", "colon", True),
 ])
 def test_harness_exit_convention_parser_interactive(name, exit_convention, parser, interactive):
     h = reg.HARNESSES[name]
@@ -1324,6 +1325,12 @@ _REQUIRED_ENV_TABLE = [
      # agnostic, only the identity SOURCE (microsoft:a/b) differs.
      {"SCHEDULER_URL", "D1_DATABASE_ID", "A_BEARER", "A_REFRESH", "A_EXPECTED_EMAIL",
       "B_BEARER", "B_REFRESH", "B_EXPECTED_EMAIL"}),
+    ("identity-smoke", "default", "dev",
+     {"SCHEDULER_URL", "D1_DATABASE_ID", "A_BEARER", "A_REFRESH", "A_EXPECTED_EMAIL",
+      "B_BEARER", "B_REFRESH", "B_EXPECTED_EMAIL"}),
+    ("identity-smoke", "microsoft", MICROSOFT_TARGET,
+     {"SCHEDULER_URL", "D1_DATABASE_ID", "A_BEARER", "A_REFRESH", "A_EXPECTED_EMAIL",
+      "B_BEARER", "B_REFRESH", "B_EXPECTED_EMAIL"}),
     ("meeting-smoke", "2-account", "dev",
      {"SCHEDULER_URL", "D1_DATABASE_ID", "B_BEARER", "B_REFRESH", "B_EXPECTED_EMAIL",
       "C_BEARER", "C_REFRESH", "C_EXPECTED_EMAIL"}),
@@ -1389,7 +1396,7 @@ def test_required_env_table_covers_every_harness_mode_combo():
     all_combos = {(h.name, m.name) for h in reg.HARNESSES.values() for m in h.modes}
     table_combos = {(name, mode) for name, mode, _target, _req in _REQUIRED_ENV_TABLE}
     assert table_combos == all_combos
-    assert len(_REQUIRED_ENV_TABLE) == 28
+    assert len(_REQUIRED_ENV_TABLE) == 30
 
 
 @pytest.mark.parametrize("harness_name,mode_name,target,required", _REQUIRED_ENV_TABLE)
@@ -1543,10 +1550,11 @@ def test_multiuser_m7_is_flagged_token_destructive():
 
 def test_no_other_harness_flags_token_destructive_levels():
     # ms-smoke's level 5 is done-category (restores state), not an offboard;
-    # nothing else revokes a token. If a new offboarding level appears, it
-    # must be flagged — this test is the reminder to make that a decision.
+    # nothing else revokes a token except identity-smoke's admin rebind. If a
+    # new offboarding level appears, it must be flagged — this test is the
+    # reminder to make that a decision.
     for name, harness in reg.HARNESSES.items():
-        if name != "multiuser-smoke":
+        if name not in ("multiuser-smoke", "identity-smoke"):
             assert harness.token_destructive_levels == (), name
 
 
@@ -1616,7 +1624,7 @@ def test_multiuser_smoke_token_destructive_prefix_is_b():
 
 def test_no_other_harness_flags_token_destructive_prefixes():
     for name, harness in reg.HARNESSES.items():
-        if name != "multiuser-smoke":
+        if name not in ("multiuser-smoke", "identity-smoke"):
             assert harness.token_destructive_prefixes == (), name
 
 
@@ -1630,6 +1638,39 @@ def test_token_destructive_slots_multiuser_microsoft_mode_is_microsoft_b():
     cfg = full_config()
     h = reg.HARNESSES["multiuser-smoke"]
     assert reg.token_destructive_slots(h, "microsoft", cfg) == ("microsoft:b",)
+
+
+def test_identity_smoke_is_interactive_and_destroys_b():
+    # The admin rebind revokes every token of B, and the harness re-mints B
+    # mid-run in a browser, so it needs the real TTY (interactive) and is
+    # queued after everything else that projects B.
+    h = reg.HARNESSES["identity-smoke"]
+    assert h.interactive is True
+    assert h.levels == ("rebind",)
+    assert h.token_destructive_levels == ("rebind",)
+    assert h.token_destructive_prefixes == ("B",)
+    assert h.needs == ("d1",)
+    assert h.provider_flag == "--provider"
+    modes = {m.name: m for m in h.modes}
+    assert modes["default"].identities == {"A": "google:a", "B": "google:b"}
+    assert modes["default"].provider == "google"
+    assert modes["default"].targets == SHARED_TARGETS
+    assert modes["microsoft"].identities == {"A": "microsoft:a", "B": "microsoft:b"}
+    assert modes["microsoft"].provider == "microsoft"
+    assert modes["microsoft"].targets == (MICROSOFT_TARGET,)
+    cfg = full_config()
+    assert reg.token_destructive_slots(h, "default", cfg) == ("google:b",)
+    assert reg.token_destructive_slots(h, "microsoft", cfg) == ("microsoft:b",)
+
+
+def test_identity_smoke_compose_projects_a_and_b_and_the_provider():
+    cfg = full_config()
+    run = reg.compose_env(reg.HARNESSES["identity-smoke"], "default", "dev",
+                          full_base_env(), full_identities(cfg), cfg)
+    assert run.argv == ("uv", "run", "bin/identity-smoke.py", "--provider", "google")
+    assert run.env["A_BEARER"] == "bearA"
+    assert run.env["B_BEARER"] == "bearB"
+    assert run.env["B_EXPECTED_EMAIL"] == cfg.google["b"]
 
 
 def test_token_destructive_slots_empty_for_a_harness_with_no_destructive_prefixes():

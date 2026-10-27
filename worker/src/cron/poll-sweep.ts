@@ -12,7 +12,9 @@ import type { Env } from "../env";
 import type { NotificationProvider, PollEmail } from "../providers/notification-provider";
 import { defaultNotificationProvider } from "../index-providers";
 import { reserveOutboundMail } from "../mail/outbound-cap";
-import { listSubjects } from "../auth/identity-store";
+import {
+  hasRefreshCredential, IdentityCredentialMissingError, listSubjects, logCredentialMissingSkip,
+} from "../auth/identity-store";
 import {
   listOpenPollsDue,
   listInvitees,
@@ -26,6 +28,7 @@ import { signCapabilityWithEnv } from "../auth/capability";
 import { hashToken } from "../auth/tokens";
 import { hashingKey } from "../auth/crypto-keys";
 import { isActiveMember } from "../auth/membership";
+import { ownerNotificationEmail } from "../db/owner-email";
 
 // T9's booking module (worker/src/polls/booking.ts) is a parallel Wave-2 task
 // and may not exist yet in a given worktree — this file deliberately never
@@ -99,6 +102,10 @@ async function nudgeNonResponders(
   const nonResponders = nonDropped.filter((i) => i.respondedAt === null);
   const respondedCount = nonDropped.length - nonResponders.length;
   const totalCount = nonDropped.length;
+  // Invitees see (and may reply to) this name, so it is the owner's current
+  // address, never the subject (db/owner-email.ts). Read before the
+  // reservation and any token rotation below.
+  const organiserName = await ownerNotificationEmail(env.DB, poll.subject);
   // O9.8: reserve every non-responder's mail BEFORE rotating any token. All
   // or nothing: a refusal throws OutboundMailCapExceeded before any link is
   // touched, so the sweep's per-poll catch leaves the poll un-stamped and
@@ -108,7 +115,7 @@ async function nudgeNonResponders(
     const inviteeUrl = await mintAndStoreInviteeUrl(env, poll, invitee, now);
     const content = renderNudgeEmail({
       pollTitle: poll.title,
-      organiserName: poll.subject,
+      organiserName,
       durationMin: poll.durationMin,
       rangeStart: poll.rangeStart,
       rangeEnd: poll.rangeEnd,
@@ -200,6 +207,15 @@ export async function runPollSweep(env: Env, now: Date, deps: PollSweepDeps): Pr
     // an allow-list is set. Their polls stay open, so re-listing resumes them.
     if (!(await isActiveMember(env, subject, "poll_sweep"))) continue;
     const polls = await listOpenPollsDue(env.DB, subject, nowIso);
+    // An organiser whose credential an admin rebind wiped is idle until the
+    // next sign-in: no mail can go from their mailbox and no calendar read
+    // can rank a slot. Skip before sweepOnePoll, whose nudge path rotates
+    // each invitee's link ahead of the send that would then fail. The polls
+    // stay open and resume at the next tick after a sign-in.
+    if (polls.length > 0 && !(await hasRefreshCredential(env, subject))) {
+      logCredentialMissingSkip("poll_sweep", { polls: polls.length });
+      continue;
+    }
     for (const poll of polls) {
       checked += 1;
       try {
@@ -208,6 +224,11 @@ export async function runPollSweep(env: Env, now: Date, deps: PollSweepDeps): Pr
         if (outcome.nudgedFinal) nudgedFinal += 1;
         if (outcome.nudgedMidpoint) nudgedMidpoint += 1;
       } catch (e) {
+        // A rebind that wiped the credential after the check above.
+        if (e instanceof IdentityCredentialMissingError) {
+          logCredentialMissingSkip("poll_sweep", { pollId: poll.id });
+          continue;
+        }
         failed += 1;
         console.error("poll-sweep: poll failed", { pollId: poll.id, subject, error: String(e) });
       }
